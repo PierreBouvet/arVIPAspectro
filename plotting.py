@@ -601,6 +601,8 @@ def plot_complete_diagnostic_suite(
     opt_params,
     S0_fit,
     M_theta_fit,
+    S0_err=None,
+    M_theta_err=None,
     n_medium=None,
     lambda_vacuum=None,
     V_s=None,
@@ -612,7 +614,7 @@ def plot_complete_diagnostic_suite(
     Generates a 6-panel comprehensive diagnostic figure illustrating:
         1. 2D detector coordinates (x, y) with fitted concentric ellipses & axes.
         2. Spherically symmetric coordinates (x_sph, y_sph) confirming circularity.
-        3. Shift(r_sph) vs theoretical M_theta kinematic fit.
+        3. Shift(r_sph) vs theoretical M_theta kinematic fit with explicit formula.
         4. Linewidth(r_sph) vs r_sph.
         5. Shift(q_vector) dispersion.
         6. Linewidth(q_vector) broadening.
@@ -667,12 +669,52 @@ def plot_complete_diagnostic_suite(
     ax.set_aspect("equal")
     ax.grid(True, linestyle=":", alpha=0.3)
 
-    # Panel 3: Shift(r_sph) & M_theta Kinematic Fit
+    # Panel 3: Shift(r_sph) & M_theta Kinematic Fit with Explicit Formula
     ax = axes[0, 2]
-    ax.scatter(r_sph, shift, c="royalblue", s=8, alpha=0.45, label="Data")
+    ax.scatter(r_sph, shift, c="royalblue", s=8, alpha=0.45, label="Experimental Shift")
     r_arr = np.linspace(0, np.max(r_sph), 200)
     s_model = S0_fit * np.cos(np.arctan(r_arr / M_theta_fit) / 2.0)
-    ax.plot(r_arr, s_model, "r-", lw=2.2, label=rf"Fit: $S_0={S0_fit:.3f}\text{{ GHz}}, M_\theta={M_theta_fit:.0f}\text{{ px}}$")
+    ax.plot(
+        r_arr,
+        s_model,
+        "r-",
+        lw=2.2,
+        label=rf"Kinematic Fit ($S_0={S0_fit:.3f}\text{{ GHz}}, M_\theta={M_theta_fit:.0f}\text{{ px}}$)"
+    )
+
+    # Text box displaying the explicit mathematical expression and fitted parameters
+    if S0_err is not None and np.isfinite(S0_err):
+        s0_text = rf"$S_0 = {S0_fit:.4f} \pm {S0_err:.4f}\text{{ GHz}}$"
+    else:
+        s0_text = rf"$S_0 = {S0_fit:.4f}\text{{ GHz}}$"
+
+    if M_theta_err is not None and np.isfinite(M_theta_err):
+        m_text = rf"$M_\theta = {M_theta_fit:.1f} \pm {M_theta_err:.1f}\text{{ px}}$"
+    else:
+        m_text = rf"$M_\theta = {M_theta_fit:.1f}\text{{ px}}$"
+
+    formula_box = (
+        r"$\mathbf{Kinematic\ Model:}$" + "\n"
+        r"$\mathrm{Shift}(r_{\mathrm{sph}}) = S_0 \cdot \cos\left(\frac{1}{2}\arctan\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$" + "\n"
+        f"{s0_text}\n"
+        f"{m_text}"
+    )
+    ax.text(
+        0.96,
+        0.95,
+        formula_box,
+        transform=ax.transAxes,
+        fontsize=8.5,
+        verticalalignment="top",
+        horizontalalignment="right",
+        bbox=dict(
+            boxstyle="round,pad=0.5",
+            facecolor="white",
+            edgecolor="#cccccc",
+            alpha=0.92,
+        ),
+    )
+
     ax.set_title(r"3. $\mathrm{Shift}(r_{\mathrm{sph}})$ & Kinematic Fit", fontsize=11)
     ax.set_xlabel(r"Spherical Radius $r_{\mathrm{sph}}$ (px)")
     ax.set_ylabel("Shift (GHz)")

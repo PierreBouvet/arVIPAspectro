@@ -28,12 +28,12 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 FIGURE_PREFIX = ''
 SHOW_PLOTS = True
-FORCE_ALL_PROCESS = 1
-FORCE_PLOT_ALL = 1
+FORCE_ALL_PROCESS = 0
+FORCE_PLOT_ALL = 0
 
 # Execution flags per step: (plot_*, stop_*, force_*)
 # Step 2: Laser Denoising
-plot_denoise_laser = FORCE_PLOT_ALL or 1
+plot_denoise_laser = FORCE_PLOT_ALL or 0
 stop_denoise_laser = 0
 force_denoise_laser = FORCE_ALL_PROCESS or 0
 
@@ -71,9 +71,9 @@ plot_Rb_experimental = FORCE_PLOT_ALL or 0
 stop_Rb_experimental = 0
 
 # Step 10: Calibration of VIPA FSR & Rubidium Hyperfine Offset
-plot_Rb_calibration = FORCE_PLOT_ALL or 1
+plot_Rb_calibration = FORCE_PLOT_ALL or 0
 stop_Rb_calibration = 0
-force_Rb_calibration = FORCE_ALL_PROCESS or 1
+force_Rb_calibration = FORCE_ALL_PROCESS or 0
 
 # Step 10B: Calibrated 2D Frequency Map Generation
 plot_freq_map = FORCE_PLOT_ALL or 0
@@ -81,7 +81,7 @@ stop_freq_map = 0
 
 # Step 11: Sample In-Situ Frequency Map Self-Calibration
 PATH_SAMPLE = config.PATH_SAMPLE
-plot_sample_freq_calib = FORCE_PLOT_ALL or 1
+plot_sample_freq_calib = FORCE_PLOT_ALL or 0
 stop_sample_freq_calib = 0
 
 # Step 12 & 13: Sample DHO Peak Fitting & Plotting
@@ -91,7 +91,7 @@ plot_dho_profiles = FORCE_PLOT_ALL or 0
 stop_dho_fit = 0
 
 # Step 14: Acoustic Wavevector (q-vector) & Elliptical Geometry Extraction
-force_q_vector = FORCE_ALL_PROCESS or 0
+force_q_vector = FORCE_ALL_PROCESS or 1
 plot_q_dispersion = FORCE_PLOT_ALL or 1
 plot_q_diagnostics = FORCE_PLOT_ALL or 1
 stop_q_vector = 0
@@ -603,6 +603,8 @@ if plot_q_diagnostics and "x_sph" in q_results:
         opt_params=q_results["opt_params"],
         S0_fit=q_results["Shift_0"],
         M_theta_fit=q_results["M_theta"],
+        S0_err=q_results.get("Shift_0_err"),
+        M_theta_err=q_results.get("M_theta_err"),
         n_medium=config.N_SAMPLE,
         lambda_vacuum=config.lambda_0,
         V_s=q_results.get("V_s"),

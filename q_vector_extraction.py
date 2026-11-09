@@ -108,6 +108,8 @@ def run_q_vector_extraction(
         opt_params=q_results["opt_params"],
         S0_fit=q_results["Shift_0"],
         M_theta_fit=q_results["M_theta"],
+        S0_err=q_results.get("Shift_0_err"),
+        M_theta_err=q_results.get("M_theta_err"),
         n_medium=refractive_index,
         lambda_vacuum=laser_wavelength,
         V_s=q_results["V_s"],
