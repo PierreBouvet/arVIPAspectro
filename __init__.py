@@ -7,6 +7,7 @@ from . import backend
 from . import laser_calib
 from . import Rb_calib
 from . import spectrum_fitting
+from . import q_vector
 from . import plotting
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     'laser_calib',
     'Rb_calib',
     'spectrum_fitting',
+    'q_vector',
     'plotting',
 ]

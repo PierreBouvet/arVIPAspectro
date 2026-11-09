@@ -96,9 +96,21 @@ DHO_MIN_AMP = 30.0                          # Minimum peak amplitude above chord
 SIGMA_Y_BINS = 6.0                          # Smoothing length along vertical bins for in-situ calibration
 
 # ==============================================================================
+# Default Acoustic Wavevector (q-vector) Extraction Parameters
+# ==============================================================================
+N_SAMPLE = 1.59                             # Refractive index of plastic (polystyrene) at 780 nm
+N_WATER = 1.33                              # Refractive index of water at 780 nm
+SHIFT_RANGE_SAMPLE = (9.3, 9.9)             # Filtering range for Brillouin shift (GHz)
+LINEWIDTH_RANGE_SAMPLE = (0.5, 1.2)         # Filtering range for Brillouin linewidth (GHz)
+USE_ERROR_WEIGHTING = True                  # Statistical error-weighting (w_i = 1 / sigma_i)
+ERROR_PERCENTILE_FLOOR = 1.0                # Percentile floor to regularize tiny uncertainties
+AVERAGE_STOKES_ANTISTOKES = True            # Average paired Stokes & Anti-Stokes orders
+INITIAL_M_THETA = 3000.0                    # Initial guess for angular magnification factor M_theta (px)
+
+# ==============================================================================
 # HDF5 Hierarchy Defaults
 # ==============================================================================
 GROUP_INTEREST = 'Brillouin'
 PATH_LASER_REF = 'laser_reference'
 PATH_RB_ABSORPTION = 'Rb_absorption'
-PATH_SAMPLE = 'plastic'
+PATH_SAMPLE = 'plastic_5s'

@@ -461,3 +461,260 @@ def plot_dho_fringe_profiles(shift_clipped, linewidth_clipped,
     if show_plots:
         plt.show()
     plt.close(fig)
+
+
+def plot_q_vector_dispersion(
+    q_vector,
+    shift,
+    linewidth,
+    theta_deg,
+    shift_err=None,
+    linewidth_err=None,
+    Shift_0=None,
+    M_theta=None,
+    n_medium=None,
+    lambda_vacuum=None,
+    V_s=None,
+    out_dir=None,
+    prefix='',
+    show_plots=False,
+):
+    """
+    Displays Shift(q_vector) and Linewidth(q_vector) with dual axes (q in rad/µm and theta in degrees).
+    """
+    q_um = q_vector * 1e-6
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.8), sharey=False)
+
+    # Panel 1: Brillouin Shift(q_vector)
+    ax1 = axes[0]
+    sc1 = ax1.scatter(q_um, shift, c=theta_deg, cmap="viridis", s=14, alpha=0.55, edgecolors="none", label="Experimental Data")
+    cbar1 = plt.colorbar(sc1, ax=ax1, fraction=0.046, pad=0.04)
+    cbar1.set_label(r"Scattering Angle $\theta$ (°)", fontsize=10)
+
+    if V_s is not None:
+        q_model_um = np.linspace(np.min(q_um), np.max(q_um), 200)
+        q_model_si = q_model_um * 1e6
+        shift_model_ghz = (V_s * q_model_si / (2.0 * np.pi)) * 1e-9
+        ax1.plot(q_model_um, shift_model_ghz, "r-", lw=2.2,
+                 label=rf"Linear Dispersion $\Omega = V_s q$ ($V_s = {V_s:.1f}\text{{ m/s}}$)")
+
+    ax1.set_title(r"Brillouin Frequency Shift $\mathrm{Shift}(q)$", fontsize=12, pad=10)
+    ax1.set_xlabel(r"Acoustic Wavevector $q$ ($\mathrm{rad}/\mu\mathrm{m}$)", fontsize=11)
+    ax1.set_ylabel("Brillouin Shift (GHz)", fontsize=11)
+    ax1.grid(True, linestyle=":", alpha=0.35)
+    ax1.legend(loc="lower left", fontsize=9, framealpha=0.9)
+
+    if lambda_vacuum is not None and n_medium is not None:
+        ax1_top = ax1.twiny()
+        k0 = 2.0 * np.pi / lambda_vacuum
+        th_ticks = np.linspace(np.min(theta_deg), np.max(theta_deg), 5)
+        q_ticks_for_th = 2.0 * n_medium * k0 * np.cos(np.deg2rad(th_ticks) / 2.0) * 1e-6
+        ax1_top.set_xlim(ax1.get_xlim())
+        ax1_top.set_xticks(q_ticks_for_th)
+        ax1_top.set_xticklabels([f"{t:.1f}°" for t in th_ticks])
+        ax1_top.set_xlabel(r"Scattering Angle $\theta$", fontsize=10, color="dimgray")
+
+    # Panel 2: Brillouin Linewidth(q_vector) with Weighted Binned Statistics
+    ax2 = axes[1]
+    sc2 = ax2.scatter(q_um, linewidth, c=theta_deg, cmap="magma", s=14, alpha=0.55, edgecolors="none", label="Experimental Linewidth")
+    cbar2 = plt.colorbar(sc2, ax=ax2, fraction=0.046, pad=0.04)
+    cbar2.set_label(r"Scattering Angle $\theta$ (°)", fontsize=10)
+
+    nb_bins = 25
+    bin_edges = np.linspace(np.min(q_um), np.max(q_um), nb_bins + 1)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    bin_lw_mean = np.zeros(nb_bins)
+    bin_lw_err = np.zeros(nb_bins)
+    w_lw = 1.0 / linewidth_err if linewidth_err is not None else np.ones_like(linewidth)
+
+    for b in range(nb_bins):
+        in_b = (q_um >= bin_edges[b]) & (q_um < bin_edges[b + 1])
+        if np.sum(in_b) > 3:
+            wb = w_lw[in_b]
+            lwb = linewidth[in_b]
+            mean_wb = np.sum(wb * lwb) / np.sum(wb)
+            bin_lw_mean[b] = mean_wb
+            v1 = np.sum(wb)
+            v2 = np.sum(wb**2)
+            if v1**2 > v2:
+                var_wb = (v1 / (v1**2 - v2)) * np.sum(wb * (lwb - mean_wb) ** 2)
+                bin_lw_err[b] = np.sqrt(max(0.0, var_wb) / np.sum(in_b))
+            else:
+                bin_lw_err[b] = np.std(lwb) / np.sqrt(np.sum(in_b))
+        else:
+            bin_lw_mean[b] = np.nan
+            bin_lw_err[b] = np.nan
+
+    valid_bins = np.isfinite(bin_lw_mean)
+    ax2.errorbar(
+        bin_centers[valid_bins],
+        bin_lw_mean[valid_bins],
+        yerr=bin_lw_err[valid_bins],
+        fmt="o-",
+        color="crimson",
+        lw=1.8,
+        markersize=4.5,
+        capsize=3,
+        label=r"Error-Weighted Mean $\pm 1\mathrm{SE}$",
+    )
+
+    ax2.set_title(r"Brillouin Linewidth $\mathrm{Linewidth}(q)$", fontsize=12, pad=10)
+    ax2.set_xlabel(r"Acoustic Wavevector $q$ ($\mathrm{rad}/\mu\mathrm{m}$)", fontsize=11)
+    ax2.set_ylabel("Brillouin Linewidth FWHM (GHz)", fontsize=11)
+    ax2.grid(True, linestyle=":", alpha=0.35)
+    ax2.legend(loc="upper left", fontsize=9, framealpha=0.9)
+
+    if lambda_vacuum is not None and n_medium is not None:
+        ax2_top = ax2.twiny()
+        ax2_top.set_xlim(ax2.get_xlim())
+        ax2_top.set_xticks(q_ticks_for_th)
+        ax2_top.set_xticklabels([f"{t:.1f}°" for t in th_ticks])
+        ax2_top.set_xlabel(r"Scattering Angle $\theta$", fontsize=10, color="dimgray")
+
+    if lambda_vacuum is not None and n_medium is not None:
+        plt.suptitle(
+            rf"Angle-Resolved BLS Acoustic Dispersion — $\lambda={lambda_vacuum*1e9:.2f}\text{{ nm}}, n={n_medium:.2f}$",
+            fontsize=13, y=0.99
+        )
+    plt.tight_layout()
+
+    if out_dir is not None:
+        save_path = os.path.join(out_dir, f"{prefix}14 - Shift and linewidth vs q_vector.png")
+        fig.savefig(save_path, dpi=250, bbox_inches="tight")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_complete_diagnostic_suite(
+    x,
+    y,
+    shift,
+    linewidth,
+    shift_err,
+    linewidth_err,
+    x_sph,
+    y_sph,
+    r_sph,
+    q_vector,
+    theta_deg,
+    opt_params,
+    S0_fit,
+    M_theta_fit,
+    n_medium=None,
+    lambda_vacuum=None,
+    V_s=None,
+    out_dir=None,
+    prefix='',
+    show_plots=False,
+):
+    """
+    Generates a 6-panel comprehensive diagnostic figure illustrating:
+        1. 2D detector coordinates (x, y) with fitted concentric ellipses & axes.
+        2. Spherically symmetric coordinates (x_sph, y_sph) confirming circularity.
+        3. Shift(r_sph) vs theoretical M_theta kinematic fit.
+        4. Linewidth(r_sph) vs r_sph.
+        5. Shift(q_vector) dispersion.
+        6. Linewidth(q_vector) broadening.
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10.5))
+
+    xc = opt_params["xc"]
+    yc = opt_params["yc"]
+    phi = opt_params["phi_rad"]
+    gamma = opt_params["gamma"]
+
+    # Panel 1: Detector Space with Fitted Concentric Ellipses
+    ax = axes[0, 0]
+    sc = ax.scatter(x, y, c=shift, cmap="coolwarm", s=8, alpha=0.55)
+    plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="Shift (GHz)")
+
+    th_dense = np.linspace(0, 2 * np.pi, 200)
+    for r_level in [400, 800, 1200, 1600]:
+        x_ell = r_level * np.cos(th_dense)
+        y_ell = (gamma * r_level) * np.sin(th_dense)
+        x_rot = xc + x_ell * np.cos(phi) - y_ell * np.sin(phi)
+        y_rot = yc + x_ell * np.sin(phi) + y_ell * np.cos(phi)
+        ax.plot(x_rot, y_rot, "k--", lw=1.2, alpha=0.7)
+
+    L_axis = 1000.0
+    ax.plot([xc - L_axis * np.cos(phi), xc + L_axis * np.cos(phi)],
+            [yc - L_axis * np.sin(phi), yc + L_axis * np.sin(phi)],
+            "b-", lw=1.8, label=f"Principal Axis 1 (θ={np.degrees(phi):.1f}°)")
+    ax.plot([xc + L_axis * np.sin(phi), xc - L_axis * np.sin(phi)],
+            [yc - L_axis * np.cos(phi), yc + L_axis * np.cos(phi)],
+            "b:", lw=1.5, label="Principal Axis 2")
+    ax.plot(xc, yc, "r+", markersize=14, markeredgewidth=2.2, label=f"Center ({xc:.0f}, {yc:.0f})")
+    ax.set_title("1. Detector Coordinates & Ellipses", fontsize=11)
+    ax.set_xlabel("Detector x (px)")
+    ax.set_ylabel("Detector y (px)")
+    ax.set_aspect("equal")
+    ax.invert_yaxis()
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+    # Panel 2: Spherical Symmetry
+    ax = axes[0, 1]
+    sc = ax.scatter(x_sph, y_sph, c=shift, cmap="coolwarm", s=8, alpha=0.55)
+    plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="Shift (GHz)")
+    for r_level in [400, 800, 1200, 1600]:
+        circ = plt.Circle((0, 0), r_level, color="k", fill=False, linestyle="--", lw=1.2, alpha=0.7)
+        ax.add_patch(circ)
+    ax.plot(0, 0, "r+", markersize=14, markeredgewidth=2.2)
+    ax.set_title(f"2. Transformed Coordinates (γ={gamma:.3f})", fontsize=11)
+    ax.set_xlabel(r"$x_{\mathrm{sph}}$ (px)")
+    ax.set_ylabel(r"$y_{\mathrm{sph}}$ (px)")
+    ax.set_aspect("equal")
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+    # Panel 3: Shift(r_sph) & M_theta Kinematic Fit
+    ax = axes[0, 2]
+    ax.scatter(r_sph, shift, c="royalblue", s=8, alpha=0.45, label="Data")
+    r_arr = np.linspace(0, np.max(r_sph), 200)
+    s_model = S0_fit * np.cos(np.arctan(r_arr / M_theta_fit) / 2.0)
+    ax.plot(r_arr, s_model, "r-", lw=2.2, label=rf"Fit: $S_0={S0_fit:.3f}\text{{ GHz}}, M_\theta={M_theta_fit:.0f}\text{{ px}}$")
+    ax.set_title(r"3. $\mathrm{Shift}(r_{\mathrm{sph}})$ & Kinematic Fit", fontsize=11)
+    ax.set_xlabel(r"Spherical Radius $r_{\mathrm{sph}}$ (px)")
+    ax.set_ylabel("Shift (GHz)")
+    ax.legend(loc="lower left", fontsize=8)
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+    # Panel 4: Linewidth(r_sph)
+    ax = axes[1, 0]
+    ax.scatter(r_sph, linewidth, c="seagreen", s=8, alpha=0.45)
+    ax.set_title(r"4. $\mathrm{Linewidth}(r_{\mathrm{sph}})$", fontsize=11)
+    ax.set_xlabel(r"Spherical Radius $r_{\mathrm{sph}}$ (px)")
+    ax.set_ylabel("Linewidth (GHz)")
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+    # Panel 5: Shift(q)
+    ax = axes[1, 1]
+    q_um = q_vector * 1e-6
+    ax.scatter(q_um, shift, c=theta_deg, cmap="viridis", s=10, alpha=0.55)
+    if V_s is not None:
+        q_lin = np.linspace(np.min(q_um), np.max(q_um), 200)
+        ax.plot(q_lin, (V_s * q_lin * 1e6 / (2.0 * np.pi)) * 1e-9, "r-", lw=2.0,
+                label=rf"$V_s = {V_s:.1f}\text{{ m/s}}$")
+        ax.legend(loc="lower left", fontsize=8)
+    ax.set_title(r"5. $\mathrm{Shift}(q)$ Acoustic Dispersion", fontsize=11)
+    ax.set_xlabel(r"$q$ ($\mathrm{rad}/\mu\mathrm{m}$)")
+    ax.set_ylabel("Shift (GHz)")
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+    # Panel 6: Linewidth(q)
+    ax = axes[1, 2]
+    ax.scatter(q_um, linewidth, c=theta_deg, cmap="magma", s=10, alpha=0.55)
+    ax.set_title(r"6. $\mathrm{Linewidth}(q)$ Broadening", fontsize=11)
+    ax.set_xlabel(r"$q$ ($\mathrm{rad}/\mu\mathrm{m}$)")
+    ax.set_ylabel("Linewidth (GHz)")
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+    plt.suptitle("Complete 2D Elliptical Geometry & Acoustic Wavevector Diagnostics", fontsize=14, y=0.995)
+    plt.tight_layout()
+
+    if out_dir is not None:
+        save_path = os.path.join(out_dir, f"{prefix}14B - Complete elliptical qvector diagnostics.png")
+        fig.savefig(save_path, dpi=250, bbox_inches="tight")
+    if show_plots:
+        plt.show()
+    plt.close(fig)

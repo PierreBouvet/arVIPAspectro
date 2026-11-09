@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import scipy.ndimage as ndimage
 from scipy.special import wofz
+from scipy.optimize import minimize, curve_fit
 from HDF5_BLS import Wrapper
 from HDF5_BLS.errors import WrapperError_Overwrite
 
@@ -735,3 +736,357 @@ def fit_dho_batched(
     if verbose:
         print(f"Vectorized DHO fitting completed in {elapsed:.3f} s ({np.sum(good)}/{N_tot} valid peaks across {n_orders} orders).")
     return shift_rel, shift_unwrapped, lw_out, shift_err_out, lw_err_out, x_coords_out, y_coords_out
+
+
+# ==============================================================================
+# 2D Coaxial Ellipses & Acoustic Wavevector (q-vector) Geometry
+# ==============================================================================
+
+def eval_coaxial_surface(x, y, xc, yc, phi_rad):
+    """
+    Transforms (x, y) into centered coordinates (Xp, Yp) rotated by phi_rad,
+    and returns the design matrix [1, Xp**2, Yp**2] for concentric coaxial quadrics.
+    """
+    dx = x - xc
+    dy = y - yc
+    ct = np.cos(phi_rad)
+    st = np.sin(phi_rad)
+    Xp = dx * ct + dy * st
+    Yp = -dx * st + dy * ct
+    A = np.column_stack([np.ones_like(Xp), Xp**2, Yp**2])
+    return Xp, Yp, A
+
+
+def fit_concentric_ellipses_coaxial(
+    x,
+    y,
+    shift,
+    linewidth,
+    shift_err=None,
+    linewidth_err=None,
+    initial_guess=None,
+):
+    """
+    Fits 2D concentric ellipses with shared director axes (coaxial center xc, yc
+    and principal rotation angle phi) simultaneously to both Shift(x, y) and
+    Linewidth(x, y) quadratic surfaces using Weighted Least Squares (WLS):
+        Shift(X', Y')     = S0  + a_S * X'^2  + b_S * Y'^2
+        Linewidth(X', Y') = LW0 + a_LW * X'^2 + b_LW * Y'^2
+    """
+    w_s = 1.0 / np.asarray(shift_err, dtype=np.float64) if shift_err is not None else np.ones_like(shift, dtype=np.float64)
+    w_lw = 1.0 / np.asarray(linewidth_err, dtype=np.float64) if linewidth_err is not None else np.ones_like(linewidth, dtype=np.float64)
+
+    mean_w_s = np.sum(w_s**2 * shift) / np.sum(w_s**2)
+    chi2_0_s = float(np.sum((w_s * (shift - mean_w_s)) ** 2))
+
+    mean_w_lw = np.sum(w_lw**2 * linewidth) / np.sum(w_lw**2)
+    chi2_0_lw = float(np.sum((w_lw * (linewidth - mean_w_lw)) ** 2))
+
+    if initial_guess is None:
+        xc_init = float(np.average(x, weights=w_s))
+        yc_init = float(np.average(y, weights=w_s))
+        phi_init = float(np.deg2rad(-70.0))
+    else:
+        xc_init, yc_init, phi_init = initial_guess
+
+    def _eval_weighted_solution(xc, yc, phi):
+        _, _, A = eval_coaxial_surface(x, y, xc, yc, phi)
+        Aw_s = w_s[:, None] * A
+        zw_s = w_s * shift
+        cs, _, _, _ = np.linalg.lstsq(Aw_s, zw_s, rcond=None)
+        chi2_s = np.sum((zw_s - Aw_s @ cs) ** 2)
+
+        Aw_lw = w_lw[:, None] * A
+        zw_lw = w_lw * linewidth
+        clw, _, _, _ = np.linalg.lstsq(Aw_lw, zw_lw, rcond=None)
+        chi2_lw = np.sum((zw_lw - Aw_lw @ clw) ** 2)
+
+        return cs, clw, chi2_s, chi2_lw
+
+    def _joint_weighted_cost(params):
+        xc, yc, phi = params
+        _, _, chi2_s, chi2_lw = _eval_weighted_solution(xc, yc, phi)
+        return float(chi2_s / chi2_0_s + chi2_lw / chi2_0_lw)
+
+    opt_result = minimize(
+        _joint_weighted_cost,
+        x0=np.array([xc_init, yc_init, phi_init]),
+        method="Nelder-Mead",
+        options={"maxiter": 4000, "xatol": 1e-4, "fatol": 1e-5},
+    )
+
+    xc_opt, yc_opt, phi_opt = opt_result.x
+    cs_opt, clw_opt, _, _ = _eval_weighted_solution(xc_opt, yc_opt, phi_opt)
+
+    S0, a_s, b_s = cs_opt
+    LW0, a_lw, b_lw = clw_opt
+
+    gamma_s = np.sqrt(abs(a_s / b_s)) if b_s != 0 else 1.0
+    gamma_lw = np.sqrt(abs(a_lw / b_lw)) if b_lw != 0 else 1.0
+    gamma_mean = float(0.5 * (gamma_s + gamma_lw))
+
+    return {
+        "xc": float(xc_opt),
+        "yc": float(yc_opt),
+        "phi_rad": float(phi_opt),
+        "phi_deg": float(np.degrees(phi_opt)),
+        "gamma_shift": float(gamma_s),
+        "gamma_linewidth": float(gamma_lw),
+        "gamma": gamma_mean,
+        "coeffs_shift": cs_opt,
+        "coeffs_linewidth": clw_opt,
+        "chi2_0_s": chi2_0_s,
+        "chi2_0_lw": chi2_0_lw,
+    }
+
+
+def optimize_elliptical_symmetry_variance(
+    x,
+    y,
+    shift,
+    linewidth,
+    shift_err,
+    linewidth_err,
+    initial_params,
+):
+    """
+    Refines 2D concentric ellipse parameters (xc, yc, phi, gamma) by minimizing
+    the error-weighted residual variance around 1D radial profiles.
+    """
+    w_s = 1.0 / np.asarray(shift_err, dtype=np.float64) if shift_err is not None else np.ones_like(shift, dtype=np.float64)
+    w_lw = 1.0 / np.asarray(linewidth_err, dtype=np.float64) if linewidth_err is not None else np.ones_like(linewidth, dtype=np.float64)
+
+    chi2_0_s = float(initial_params.get("chi2_0_s", np.sum((w_s * (shift - np.mean(shift))) ** 2)))
+    chi2_0_lw = float(initial_params.get("chi2_0_lw", np.sum((w_lw * (linewidth - np.mean(linewidth))) ** 2)))
+
+    xc0 = float(initial_params["xc"])
+    yc0 = float(initial_params["yc"])
+    phi0 = float(initial_params["phi_rad"])
+    gamma0 = float(initial_params["gamma"])
+
+    p0 = np.array([xc0, yc0, phi0, gamma0])
+    R0 = 1000.0
+
+    def _weighted_radial_variance_cost(params):
+        xc, yc, phi, gamma = params
+        if gamma <= 0.2 or gamma >= 4.0:
+            return 1e10
+
+        dx = x - xc
+        dy = y - yc
+        ct = np.cos(phi)
+        st = np.sin(phi)
+        Xp = dx * ct + dy * st
+        Yp = -dx * st + dy * ct
+
+        r_sph2 = Xp**2 + (Yp / gamma)**2
+        u = r_sph2 / (R0**2)
+        A_rad = np.column_stack([np.ones_like(u), u, u**2])
+
+        Aw_s = w_s[:, None] * A_rad
+        zw_s = w_s * shift
+        c_s, _, _, _ = np.linalg.lstsq(Aw_s, zw_s, rcond=None)
+        chi2_res_s = np.sum((zw_s - Aw_s @ c_s) ** 2)
+
+        Aw_lw = w_lw[:, None] * A_rad
+        zw_lw = w_lw * linewidth
+        c_lw, _, _, _ = np.linalg.lstsq(Aw_lw, zw_lw, rcond=None)
+        chi2_res_lw = np.sum((zw_lw - Aw_lw @ c_lw) ** 2)
+
+        return float(chi2_res_s / chi2_0_s + chi2_res_lw / chi2_0_lw)
+
+    bounds = [
+        (xc0 - 250.0, xc0 + 250.0),
+        (yc0 - 250.0, yc0 + 250.0),
+        (phi0 - np.deg2rad(25.0), phi0 + np.deg2rad(25.0)),
+        (max(0.3, gamma0 - 0.8), min(3.5, gamma0 + 0.8)),
+    ]
+
+    opt_result = minimize(
+        _weighted_radial_variance_cost,
+        x0=p0,
+        bounds=bounds,
+        method="L-BFGS-B",
+        options={"maxiter": 3000, "ftol": 1e-7},
+    )
+
+    xc_ref, yc_ref, phi_ref, gamma_ref = opt_result.x
+    initial_cost = _weighted_radial_variance_cost(p0)
+    final_cost = float(opt_result.fun)
+    improvement = (initial_cost - final_cost) / initial_cost * 100.0
+
+    return {
+        "xc": float(xc_ref),
+        "yc": float(yc_ref),
+        "phi_rad": float(phi_ref),
+        "phi_deg": float(np.degrees(phi_ref)),
+        "gamma": float(gamma_ref),
+        "initial_cost": initial_cost,
+        "final_cost": final_cost,
+        "improvement_pct": improvement,
+    }
+
+
+def transform_to_spherical_coordinates(x, y, xc, yc, phi_rad, gamma):
+    """
+    Transforms detector coordinates (x, y) into spherical coordinates (x_sph, y_sph, r_sph)
+    where Shift and Linewidth exhibit circular/spherical symmetry:
+        X' =  (x - xc) * cos(phi) + (y - yc) * sin(phi)
+        Y' = -(x - xc) * sin(phi) + (y - yc) * cos(phi)
+        x_sph = X'
+        y_sph = Y' / gamma
+        r_sph = sqrt(x_sph**2 + y_sph**2)
+    """
+    dx = x - xc
+    dy = y - yc
+    ct = np.cos(phi_rad)
+    st = np.sin(phi_rad)
+    Xp = dx * ct + dy * st
+    Yp = -dx * st + dy * ct
+
+    x_sph = Xp
+    y_sph = Yp / gamma
+    r_sph = np.sqrt(x_sph**2 + y_sph**2)
+    return x_sph, y_sph, r_sph
+
+
+def fit_magnification_factor_M_theta(r_sph, shift, shift_err=None, initial_M_theta=3000.0):
+    """
+    Fits the angular magnification factor M_theta and normal backscattering shift Shift(0):
+        Shift(r_sph) = Shift(0) * cos(arctan(r_sph / M_theta) / 2)
+    weighted by experimental errors (sigma = shift_err).
+    """
+    def _shift_vs_r_sph_model(r, S0, M):
+        return S0 * np.cos(np.arctan(r / M) / 2.0)
+
+    S0_guess = float(np.percentile(shift, 98))
+    p0 = [S0_guess, initial_M_theta]
+    bounds = ([0.0, 100.0], [50.0, 100000.0])
+
+    use_sig = shift_err is not None and not np.all(shift_err == 1.0)
+    popt, pcov = curve_fit(
+        _shift_vs_r_sph_model,
+        r_sph,
+        shift,
+        p0=p0,
+        sigma=shift_err if use_sig else None,
+        absolute_sigma=use_sig,
+        bounds=bounds,
+    )
+    S0_fit, M_theta_fit = popt
+    perr = np.sqrt(np.diag(pcov))
+
+    return float(S0_fit), float(M_theta_fit), (float(perr[0]), float(perr[1]))
+
+
+def compute_theta_and_q_vector(r_sph, M_theta, n_medium, lambda_vacuum, Shift_0=None):
+    """
+    Deduces scattering angle theta, acoustic wavevector magnitude q_vector, and longitudinal sound velocity V_s:
+        theta    = np.arctan(r_sph / M_theta)
+        q_vector = 2 * n * (2 * np.pi / lambda) * np.cos(theta / 2)
+        V_s      = (lambda * Shift_0) / (2 * n)
+    """
+    theta = np.arctan(r_sph / M_theta)
+    theta_deg = np.degrees(theta)
+
+    k0 = 2.0 * np.pi / lambda_vacuum
+    q_vector = 2.0 * n_medium * k0 * np.cos(theta / 2.0)
+    q_vector_um = q_vector * 1e-6
+
+    results = {
+        "theta": theta,
+        "theta_deg": theta_deg,
+        "q_vector": q_vector,
+        "q_vector_um": q_vector_um,
+    }
+
+    if Shift_0 is not None:
+        V_s = (lambda_vacuum * (Shift_0 * 1e9)) / (2.0 * n_medium)
+        results["V_s"] = float(V_s)
+
+    return results
+
+
+def filter_and_prepare_q_vector_data(
+    x_raw,
+    y_raw,
+    shift_raw,
+    linewidth_raw,
+    shift_err_raw=None,
+    linewidth_err_raw=None,
+    average_stokes_antistokes=True,
+    shift_range=(None, None),
+    linewidth_range=(None, None),
+    error_percentile_floor=1.0,
+):
+    """
+    Cleans, filters, averages Stokes/Anti-Stokes orders, and flattens arrays for q-vector fitting.
+    """
+    has_errors = (shift_err_raw is not None) and (linewidth_err_raw is not None)
+    if not has_errors:
+        shift_err_raw = np.ones_like(shift_raw)
+        linewidth_err_raw = np.ones_like(linewidth_raw)
+
+    if average_stokes_antistokes and shift_raw.ndim == 2 and shift_raw.shape[1] > 2 and (shift_raw.shape[1] % 2 == 0):
+        shift_proc = 0.5 * (shift_raw[:, 0::2] + shift_raw[:, 1::2])
+        linewidth_proc = 0.5 * (linewidth_raw[:, 0::2] + linewidth_raw[:, 1::2])
+        x_coords_proc = 0.5 * (x_raw[:, 0::2] + x_raw[:, 1::2])
+        y_coords_proc = 0.5 * (y_raw[:, 0::2] + y_raw[:, 1::2])
+
+        if has_errors:
+            shift_err_proc = 0.5 * np.sqrt(shift_err_raw[:, 0::2] ** 2 + shift_err_raw[:, 1::2] ** 2)
+            linewidth_err_proc = 0.5 * np.sqrt(linewidth_err_raw[:, 0::2] ** 2 + linewidth_err_raw[:, 1::2] ** 2)
+        else:
+            shift_err_proc = np.ones_like(shift_proc)
+            linewidth_err_proc = np.ones_like(linewidth_proc)
+    else:
+        shift_proc = shift_raw
+        linewidth_proc = linewidth_raw
+        x_coords_proc = x_raw
+        y_coords_proc = y_raw
+        shift_err_proc = shift_err_raw
+        linewidth_err_proc = linewidth_err_raw
+
+    mask = (
+        np.isfinite(shift_proc)
+        & np.isfinite(linewidth_proc)
+        & np.isfinite(x_coords_proc)
+        & np.isfinite(y_coords_proc)
+        & np.isfinite(shift_err_proc)
+        & np.isfinite(linewidth_err_proc)
+        & (shift_proc > 0)
+        & (linewidth_proc > 0)
+        & (shift_err_proc > 0)
+        & (linewidth_err_proc > 0)
+    )
+
+    s_min, s_max = shift_range
+    if s_min is not None:
+        mask &= (shift_proc >= s_min)
+    if s_max is not None:
+        mask &= (shift_proc <= s_max)
+
+    lw_min, lw_max = linewidth_range
+    if lw_min is not None:
+        mask &= (linewidth_proc >= lw_min)
+    if lw_max is not None:
+        mask &= (linewidth_proc <= lw_max)
+
+    n_valid = int(np.sum(mask))
+    if n_valid == 0:
+        raise ValueError("No valid data points remaining after filtering for q-vector extraction.")
+
+    x_flat = x_coords_proc[mask].flatten()
+    y_flat = y_coords_proc[mask].flatten()
+    shift_flat = shift_proc[mask].flatten()
+    linewidth_flat = linewidth_proc[mask].flatten()
+    shift_err_flat = shift_err_proc[mask].flatten()
+    linewidth_err_flat = linewidth_err_proc[mask].flatten()
+
+    if has_errors and error_percentile_floor > 0:
+        p_floor_s = float(np.percentile(shift_err_flat, error_percentile_floor))
+        p_floor_lw = float(np.percentile(linewidth_err_flat, error_percentile_floor))
+        shift_err_flat = np.maximum(shift_err_flat, p_floor_s)
+        linewidth_err_flat = np.maximum(linewidth_err_flat, p_floor_lw)
+
+    return x_flat, y_flat, shift_flat, linewidth_flat, shift_err_flat, linewidth_err_flat, has_errors

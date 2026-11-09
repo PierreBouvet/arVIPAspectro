@@ -12,6 +12,7 @@ import backend as bck
 import laser_calib
 import Rb_calib
 import spectrum_fitting
+import q_vector
 import plotting
 
 
@@ -89,13 +90,18 @@ plot_dho_overview = FORCE_PLOT_ALL or 1
 plot_dho_profiles = FORCE_PLOT_ALL or 0
 stop_dho_fit = 0
 
+# Step 14: Acoustic Wavevector (q-vector) & Elliptical Geometry Extraction
+force_q_vector = FORCE_ALL_PROCESS or 0
+plot_q_dispersion = FORCE_PLOT_ALL or 1
+plot_q_diagnostics = FORCE_PLOT_ALL or 1
+stop_q_vector = 0
+
 
 # ==============================================================================
 # 01 - Open / Create HDF5 Wrapper
 # ==============================================================================
 wrapper = bck.create_wrapper(DATA_DIR, TARGET_FILE, exclude_dir=[FIGURE_DIRECTORY_NAME])
 print('Step 1 - Opened / created H5 file.')
-
 
 # ==============================================================================
 # 02 - Monochromatic Laser Reference Image & Denoising
@@ -519,6 +525,93 @@ if plot_dho_profiles:
     )
 
 if stop_dho_fit:
+    sys.exit(0)
+
+
+# ==============================================================================
+# 14 - Acoustic Wavevector (q-vector) & Elliptical Dispersion Extraction
+# ==============================================================================
+cached_q = None
+if not force_q_vector:
+    cached_q = q_vector.retrieve_q_vector_results(
+        wrapper=wrapper,
+        path_sample=path_h5_sample,
+        bin_val_h=config.BIN_VAL_H,
+        bin_val_w=config.BIN_VAL_W
+    )
+
+if cached_q is not None:
+    q_results = cached_q
+    print(f"Step 14 - Retrieved cached q-vector results for {PATH_SAMPLE} from H5 file.")
+else:
+    q_results = q_vector.extract_q_vector(
+        data_source=dho_results,
+        path_sample=path_h5_sample,
+        wrapper=wrapper,
+        bin_val_h=config.BIN_VAL_H,
+        bin_val_w=config.BIN_VAL_W,
+        refractive_index=config.N_SAMPLE,
+        laser_wavelength=config.lambda_0,
+        use_errors=config.USE_ERROR_WEIGHTING,
+        error_percentile_floor=config.ERROR_PERCENTILE_FLOOR,
+        average_pairs=config.AVERAGE_STOKES_ANTISTOKES,
+        shift_bounds=config.SHIFT_RANGE_SAMPLE,
+        linewidth_bounds=config.LINEWIDTH_RANGE_SAMPLE,
+        initial_M_theta=config.INITIAL_M_THETA,
+        verbose=True
+    )
+    q_vector.save_q_vector_results(
+        wrapper=wrapper,
+        path_sample=path_h5_sample,
+        bin_val_h=config.BIN_VAL_H,
+        bin_val_w=config.BIN_VAL_W,
+        q_results=q_results
+    )
+    print(f"Step 14 - Saved q-vector datasets and attributes for {PATH_SAMPLE} in H5 file.")
+
+if plot_q_dispersion:
+    plotting.plot_q_vector_dispersion(
+        q_vector=q_results["q_vector"],
+        shift=q_results["shift"],
+        linewidth=q_results["linewidth"],
+        theta_deg=q_results["theta_deg"],
+        shift_err=q_results.get("shift_err"),
+        linewidth_err=q_results.get("linewidth_err"),
+        Shift_0=q_results.get("Shift_0"),
+        M_theta=q_results.get("M_theta"),
+        n_medium=config.N_SAMPLE,
+        lambda_vacuum=config.lambda_0,
+        V_s=q_results.get("V_s"),
+        out_dir=OUT_DIR,
+        prefix=FIGURE_PREFIX,
+        show_plots=SHOW_PLOTS
+    )
+
+if plot_q_diagnostics and "x_sph" in q_results:
+    plotting.plot_complete_diagnostic_suite(
+        x=q_results["x_coords"],
+        y=q_results["y_coords"],
+        shift=q_results["shift"],
+        linewidth=q_results["linewidth"],
+        shift_err=q_results.get("shift_err"),
+        linewidth_err=q_results.get("linewidth_err"),
+        x_sph=q_results["x_sph"],
+        y_sph=q_results["y_sph"],
+        r_sph=q_results["r_sph"],
+        q_vector=q_results["q_vector"],
+        theta_deg=q_results["theta_deg"],
+        opt_params=q_results["opt_params"],
+        S0_fit=q_results["Shift_0"],
+        M_theta_fit=q_results["M_theta"],
+        n_medium=config.N_SAMPLE,
+        lambda_vacuum=config.lambda_0,
+        V_s=q_results.get("V_s"),
+        out_dir=OUT_DIR,
+        prefix=FIGURE_PREFIX,
+        show_plots=SHOW_PLOTS
+    )
+
+if stop_q_vector:
     sys.exit(0)
 
 print("\n--- Pipeline completed successfully! ---")
