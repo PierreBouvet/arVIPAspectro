@@ -777,11 +777,16 @@ def plot_complete_diagnostic_suite(
         ax.plot(q_lin_um, shift_model, "r-", lw=2.2, label=line_label)
 
         # Text box with speed of sound expression and propagated error
+        if V_s_err is not None and np.isfinite(V_s_err):
+            vs_formula_line = r"$V_s = \frac{\lambda_0 S_0}{2n} \pm \sigma_{V_s}$"
+        else:
+            vs_formula_line = r"$V_s = \frac{\lambda_0 S_0}{2n}$"
+
         dispersion_box = (
             r"$\mathbf{Speed\ of\ Sound:}$" + "\n"
-            r"$\Omega(q) = V_s \cdot q \iff \mathrm{Shift} = \frac{V_s}{2\pi} q$" + "\n"
+            r"$\Omega(q) = V_s \cdot q \quad \Leftrightarrow \quad \mathrm{Shift}(q) = \frac{V_s}{2\pi} q$" + "\n"
             f"{vs_val_text}\n"
-            r"$V_s = \frac{\lambda_0 S_0}{2n}$" + (r" $\pm \sigma_{V_s}(S_0, M_\theta)$" if (V_s_err is not None and np.isfinite(V_s_err)) else "")
+            f"{vs_formula_line}"
         )
         ax.text(
             0.05,
