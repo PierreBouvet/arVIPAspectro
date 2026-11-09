@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data files & HDF5
+*.h5
+*.dat
+*.npy
+*.npz
+
+# Mac OS
+.DS_Store
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Output figures
+figures/
+*.png
+*.pdf
