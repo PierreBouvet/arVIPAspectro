@@ -85,8 +85,11 @@ def extract_q_vector(
     )
 
     if verbose:
+        std_s_sample = float(np.std(shift_flat))
+        std_lw_sample = float(np.std(linewidth_flat))
         print(f"  • Retained {len(x_flat):,} valid data points after filtering.")
         print(f"  • Error-Weighting Active: {has_errors}")
+        print(f"  • Balancing Scales (std): Shift std = {std_s_sample:.4f} GHz, Linewidth std = {std_lw_sample:.4f} GHz")
 
     # 3. Fit 2D concentric coaxial ellipses with error weighting
     coaxial_fit = bck.fit_concentric_ellipses_coaxial(

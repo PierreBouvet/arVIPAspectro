@@ -772,15 +772,21 @@ def fit_concentric_ellipses_coaxial(
     Linewidth(x, y) quadratic surfaces using Weighted Least Squares (WLS):
         Shift(X', Y')     = S0  + a_S * X'^2  + b_S * Y'^2
         Linewidth(X', Y') = LW0 + a_LW * X'^2 + b_LW * Y'^2
+
+    Points are weighted by their standard errors (w_i = 1 / sigma_i), and the
+    joint cost function is balanced by the overall sample variance (std^2) of
+    Shift and Linewidth across the dataset.
     """
     w_s = 1.0 / np.asarray(shift_err, dtype=np.float64) if shift_err is not None else np.ones_like(shift, dtype=np.float64)
     w_lw = 1.0 / np.asarray(linewidth_err, dtype=np.float64) if linewidth_err is not None else np.ones_like(linewidth, dtype=np.float64)
 
-    mean_w_s = np.sum(w_s**2 * shift) / np.sum(w_s**2)
-    chi2_0_s = float(np.sum((w_s * (shift - mean_w_s)) ** 2))
-
-    mean_w_lw = np.sum(w_lw**2 * linewidth) / np.sum(w_lw**2)
-    chi2_0_lw = float(np.sum((w_lw * (linewidth - mean_w_lw)) ** 2))
+    # Overall dataset sample variances (std^2) for global normalization
+    var_s_scale = float(np.var(shift))
+    var_lw_scale = float(np.var(linewidth))
+    if var_s_scale <= 0:
+        var_s_scale = 1.0
+    if var_lw_scale <= 0:
+        var_lw_scale = 1.0
 
     if initial_guess is None:
         xc_init = float(np.average(x, weights=w_s))
@@ -806,7 +812,7 @@ def fit_concentric_ellipses_coaxial(
     def _joint_weighted_cost(params):
         xc, yc, phi = params
         _, _, chi2_s, chi2_lw = _eval_weighted_solution(xc, yc, phi)
-        return float(chi2_s / chi2_0_s + chi2_lw / chi2_0_lw)
+        return float(chi2_s / var_s_scale + chi2_lw / var_lw_scale)
 
     opt_result = minimize(
         _joint_weighted_cost,
@@ -835,8 +841,8 @@ def fit_concentric_ellipses_coaxial(
         "gamma": gamma_mean,
         "coeffs_shift": cs_opt,
         "coeffs_linewidth": clw_opt,
-        "chi2_0_s": chi2_0_s,
-        "chi2_0_lw": chi2_0_lw,
+        "var_s_scale": var_s_scale,
+        "var_lw_scale": var_lw_scale,
     }
 
 
@@ -856,8 +862,12 @@ def optimize_elliptical_symmetry_variance(
     w_s = 1.0 / np.asarray(shift_err, dtype=np.float64) if shift_err is not None else np.ones_like(shift, dtype=np.float64)
     w_lw = 1.0 / np.asarray(linewidth_err, dtype=np.float64) if linewidth_err is not None else np.ones_like(linewidth, dtype=np.float64)
 
-    chi2_0_s = float(initial_params.get("chi2_0_s", np.sum((w_s * (shift - np.mean(shift))) ** 2)))
-    chi2_0_lw = float(initial_params.get("chi2_0_lw", np.sum((w_lw * (linewidth - np.mean(linewidth))) ** 2)))
+    var_s_scale = float(initial_params.get("var_s_scale", np.var(shift)))
+    var_lw_scale = float(initial_params.get("var_lw_scale", np.var(linewidth)))
+    if var_s_scale <= 0:
+        var_s_scale = 1.0
+    if var_lw_scale <= 0:
+        var_lw_scale = 1.0
 
     xc0 = float(initial_params["xc"])
     yc0 = float(initial_params["yc"])
@@ -893,7 +903,7 @@ def optimize_elliptical_symmetry_variance(
         c_lw, _, _, _ = np.linalg.lstsq(Aw_lw, zw_lw, rcond=None)
         chi2_res_lw = np.sum((zw_lw - Aw_lw @ c_lw) ** 2)
 
-        return float(chi2_res_s / chi2_0_s + chi2_res_lw / chi2_0_lw)
+        return float(chi2_res_s / var_s_scale + chi2_res_lw / var_lw_scale)
 
     bounds = [
         (xc0 - 250.0, xc0 + 250.0),
@@ -924,6 +934,8 @@ def optimize_elliptical_symmetry_variance(
         "initial_cost": initial_cost,
         "final_cost": final_cost,
         "improvement_pct": improvement,
+        "var_s_scale": var_s_scale,
+        "var_lw_scale": var_lw_scale,
     }
 
 
@@ -1015,17 +1027,23 @@ def filter_and_prepare_q_vector_data(
     shift_err_raw=None,
     linewidth_err_raw=None,
     average_stokes_antistokes=True,
+    errors_are_variances=True,
     shift_range=(None, None),
     linewidth_range=(None, None),
     error_percentile_floor=1.0,
 ):
     """
     Cleans, filters, averages Stokes/Anti-Stokes orders, and flattens arrays for q-vector fitting.
+    Converts fit variances to standard deviations sigma = sqrt(variance) so point weights are w_i = 1 / sigma_i.
     """
     has_errors = (shift_err_raw is not None) and (linewidth_err_raw is not None)
     if not has_errors:
         shift_err_raw = np.ones_like(shift_raw)
         linewidth_err_raw = np.ones_like(linewidth_raw)
+    elif errors_are_variances:
+        # Convert parameter variances from LM covariance diagonal to standard deviations sigma
+        shift_err_raw = np.sqrt(np.maximum(shift_err_raw, 0.0))
+        linewidth_err_raw = np.sqrt(np.maximum(linewidth_err_raw, 0.0))
 
     if average_stokes_antistokes and shift_raw.ndim == 2 and shift_raw.shape[1] > 2 and (shift_raw.shape[1] % 2 == 0):
         shift_proc = 0.5 * (shift_raw[:, 0::2] + shift_raw[:, 1::2])
@@ -1034,6 +1052,7 @@ def filter_and_prepare_q_vector_data(
         y_coords_proc = 0.5 * (y_raw[:, 0::2] + y_raw[:, 1::2])
 
         if has_errors:
+            # Gaussian uncertainty propagation: sigma_avg = 0.5 * sqrt(sigma_1^2 + sigma_2^2)
             shift_err_proc = 0.5 * np.sqrt(shift_err_raw[:, 0::2] ** 2 + shift_err_raw[:, 1::2] ** 2)
             linewidth_err_proc = 0.5 * np.sqrt(linewidth_err_raw[:, 0::2] ** 2 + linewidth_err_raw[:, 1::2] ** 2)
         else:
