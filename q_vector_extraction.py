@@ -88,6 +88,7 @@ def run_q_vector_extraction(
         n_medium=refractive_index,
         lambda_vacuum=laser_wavelength,
         V_s=q_results["V_s"],
+        V_s_err=q_results.get("V_s_err"),
         out_dir=out_dir if save_plots else None,
         show_plots=show_plots,
     )
@@ -113,6 +114,7 @@ def run_q_vector_extraction(
         n_medium=refractive_index,
         lambda_vacuum=laser_wavelength,
         V_s=q_results["V_s"],
+        V_s_err=q_results.get("V_s_err"),
         out_dir=out_dir if save_plots else None,
         show_plots=show_plots,
     )

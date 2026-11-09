@@ -962,11 +962,21 @@ def transform_to_spherical_coordinates(x, y, xc, yc, phi_rad, gamma):
     return x_sph, y_sph, r_sph
 
 
-def fit_magnification_factor_M_theta(r_sph, shift, shift_err=None, initial_M_theta=3000.0):
+def fit_magnification_factor_M_theta(
+    r_sph,
+    shift,
+    shift_err=None,
+    initial_M_theta=3000.0,
+    return_covariance=False,
+):
     """
     Fits the angular magnification factor M_theta and normal backscattering shift Shift(0):
         Shift(r_sph) = Shift(0) * cos(arctan(r_sph / M_theta) / 2)
     weighted by experimental errors (sigma = shift_err).
+
+    Returns:
+        (S0_fit, M_theta_fit, (S0_err, M_theta_err)) if return_covariance=False
+        (S0_fit, M_theta_fit, (S0_err, M_theta_err), pcov) if return_covariance=True
     """
     def _shift_vs_r_sph_model(r, S0, M):
         return S0 * np.cos(np.arctan(r / M) / 2.0)
@@ -988,12 +998,26 @@ def fit_magnification_factor_M_theta(r_sph, shift, shift_err=None, initial_M_the
     S0_fit, M_theta_fit = popt
     perr = np.sqrt(np.diag(pcov))
 
+    if return_covariance:
+        return float(S0_fit), float(M_theta_fit), (float(perr[0]), float(perr[1])), pcov
     return float(S0_fit), float(M_theta_fit), (float(perr[0]), float(perr[1]))
 
 
-def compute_theta_and_q_vector(r_sph, M_theta, n_medium, lambda_vacuum, Shift_0=None):
+def compute_theta_and_q_vector(
+    r_sph,
+    M_theta,
+    n_medium,
+    lambda_vacuum,
+    Shift_0=None,
+    Shift_0_err=None,
+    M_theta_err=None,
+    pcov_kinematic=None,
+    shift_exp=None,
+    shift_err=None,
+):
     """
-    Deduces scattering angle theta, acoustic wavevector magnitude q_vector, and longitudinal sound velocity V_s:
+    Deduces scattering angle theta, acoustic wavevector magnitude q_vector, and longitudinal sound velocity V_s
+    with error propagation from Shift_0 and M_theta:
         theta    = np.arctan(r_sph / M_theta)
         q_vector = 2 * n * (2 * np.pi / lambda) * np.cos(theta / 2)
         V_s      = (lambda * Shift_0) / (2 * n)
@@ -1015,6 +1039,49 @@ def compute_theta_and_q_vector(r_sph, M_theta, n_medium, lambda_vacuum, Shift_0=
     if Shift_0 is not None:
         V_s = (lambda_vacuum * (Shift_0 * 1e9)) / (2.0 * n_medium)
         results["V_s"] = float(V_s)
+
+        # Uncertainty propagation:
+        # 1. Partial derivative wrt Shift_0: dVs / dS0 = lambda_vacuum * 1e9 / (2 * n_medium)
+        dVs_dS0 = (lambda_vacuum * 1e9) / (2.0 * n_medium)
+
+        # 2. Partial derivative wrt M_theta via linear dispersion slope:
+        #    Omega(q) = V_s * q  =>  V_s = 2*pi * sum(w * q * Shift*1e9) / sum(w * q^2)
+        #    where q(M_theta) depends on M_theta.
+        dVs_dM = 0.0
+        if shift_exp is not None and len(shift_exp) == len(r_sph):
+            w = 1.0 / (shift_err**2) if (shift_err is not None and not np.all(shift_err == 1.0)) else np.ones_like(shift_exp)
+            valid = np.isfinite(shift_exp) & np.isfinite(r_sph) & np.isfinite(w)
+            if np.sum(valid) > 2:
+                r_v = r_sph[valid]
+                s_v = shift_exp[valid] * 1e9
+                w_v = w[valid]
+                th_v = theta[valid]
+                q_v = q_vector[valid]
+
+                dq_dM = (2.0 * np.pi * n_medium / lambda_vacuum) * np.sin(th_v / 2.0) * (r_v / (M_theta**2 + r_v**2))
+                N = np.sum(w_v * q_v * s_v)
+                D = np.sum(w_v * q_v**2)
+                N_prime = np.sum(w_v * dq_dM * s_v)
+                D_prime = 2.0 * np.sum(w_v * q_v * dq_dM)
+
+                if D > 0:
+                    dVs_dM = 2.0 * np.pi * (N_prime * D - N * D_prime) / (D**2)
+
+        # Combined variance from (Shift_0, M_theta):
+        if pcov_kinematic is not None and getattr(pcov_kinematic, 'shape', None) == (2, 2):
+            var_S0 = float(pcov_kinematic[0, 0])
+            var_M = float(pcov_kinematic[1, 1])
+            cov_S0_M = float(pcov_kinematic[0, 1])
+            var_Vs = (dVs_dS0**2) * var_S0 + (dVs_dM**2) * var_M + 2.0 * dVs_dS0 * dVs_dM * cov_S0_M
+        else:
+            sig_S0 = Shift_0_err if Shift_0_err is not None else 0.0
+            sig_M = M_theta_err if M_theta_err is not None else 0.0
+            var_Vs = (dVs_dS0 * sig_S0)**2 + (dVs_dM * sig_M)**2
+
+        V_s_err = float(np.sqrt(max(0.0, var_Vs))) if var_Vs > 0 else None
+        results["V_s_err"] = V_s_err
+        results["dVs_dS0"] = float(dVs_dS0)
+        results["dVs_dM_theta"] = float(dVs_dM)
 
     return results
 

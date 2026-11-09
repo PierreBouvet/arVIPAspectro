@@ -475,6 +475,7 @@ def plot_q_vector_dispersion(
     n_medium=None,
     lambda_vacuum=None,
     V_s=None,
+    V_s_err=None,
     out_dir=None,
     prefix='',
     show_plots=False,
@@ -495,8 +496,23 @@ def plot_q_vector_dispersion(
         q_model_um = np.linspace(np.min(q_um), np.max(q_um), 200)
         q_model_si = q_model_um * 1e6
         shift_model_ghz = (V_s * q_model_si / (2.0 * np.pi)) * 1e-9
-        ax1.plot(q_model_um, shift_model_ghz, "r-", lw=2.2,
-                 label=rf"Linear Dispersion $\Omega = V_s q$ ($V_s = {V_s:.1f}\text{{ m/s}}$)")
+
+        if V_s_err is not None and np.isfinite(V_s_err):
+            shift_model_low = ((V_s - V_s_err) * q_model_si / (2.0 * np.pi)) * 1e-9
+            shift_model_high = ((V_s + V_s_err) * q_model_si / (2.0 * np.pi)) * 1e-9
+            ax1.fill_between(
+                q_model_um,
+                shift_model_low,
+                shift_model_high,
+                color="red",
+                alpha=0.18,
+                label=r"$\pm 1\sigma$ Dispersion Band",
+            )
+            line_lbl = rf"Linear Dispersion $\Omega = V_s q$ ($V_s = {V_s:.1f} \pm {V_s_err:.1f}\text{{ m/s}}$)"
+        else:
+            line_lbl = rf"Linear Dispersion $\Omega = V_s q$ ($V_s = {V_s:.1f}\text{{ m/s}}$)"
+
+        ax1.plot(q_model_um, shift_model_ghz, "r-", lw=2.2, label=line_lbl)
 
     ax1.set_title(r"Brillouin Frequency Shift $\mathrm{Shift}(q)$", fontsize=12, pad=10)
     ax1.set_xlabel(r"Acoustic Wavevector $q$ ($\mathrm{rad}/\mu\mathrm{m}$)", fontsize=11)
@@ -606,6 +622,7 @@ def plot_complete_diagnostic_suite(
     n_medium=None,
     lambda_vacuum=None,
     V_s=None,
+    V_s_err=None,
     out_dir=None,
     prefix='',
     show_plots=False,
@@ -729,17 +746,63 @@ def plot_complete_diagnostic_suite(
     ax.set_ylabel("Linewidth (GHz)")
     ax.grid(True, linestyle=":", alpha=0.3)
 
-    # Panel 5: Shift(q)
+    # Panel 5: Shift(q) Acoustic Dispersion with Propagated Uncertainty
     ax = axes[1, 1]
     q_um = q_vector * 1e-6
-    ax.scatter(q_um, shift, c=theta_deg, cmap="viridis", s=10, alpha=0.55)
+    sc5 = ax.scatter(q_um, shift, c=theta_deg, cmap="viridis", s=10, alpha=0.55, label="Experimental Data")
+    plt.colorbar(sc5, ax=ax, fraction=0.046, pad=0.04, label=r"Angle $\theta$ (°)")
+
     if V_s is not None:
-        q_lin = np.linspace(np.min(q_um), np.max(q_um), 200)
-        ax.plot(q_lin, (V_s * q_lin * 1e6 / (2.0 * np.pi)) * 1e-9, "r-", lw=2.0,
-                label=rf"$V_s = {V_s:.1f}\text{{ m/s}}$")
-        ax.legend(loc="lower left", fontsize=8)
+        q_lin_um = np.linspace(np.min(q_um), np.max(q_um), 200)
+        q_lin_si = q_lin_um * 1e6
+        shift_model = (V_s * q_lin_si / (2.0 * np.pi)) * 1e-9
+
+        if V_s_err is not None and np.isfinite(V_s_err):
+            shift_model_low = ((V_s - V_s_err) * q_lin_si / (2.0 * np.pi)) * 1e-9
+            shift_model_high = ((V_s + V_s_err) * q_lin_si / (2.0 * np.pi)) * 1e-9
+            ax.fill_between(
+                q_lin_um,
+                shift_model_low,
+                shift_model_high,
+                color="red",
+                alpha=0.18,
+                label=r"$\pm 1\sigma$ Dispersion Band",
+            )
+            line_label = rf"Linear Fit: $V_s = {V_s:.1f} \pm {V_s_err:.1f}\text{{ m/s}}$"
+            vs_val_text = rf"$V_s = {V_s:.1f} \pm {V_s_err:.1f}\text{{ m/s}}$"
+        else:
+            line_label = rf"Linear Fit: $V_s = {V_s:.1f}\text{{ m/s}}$"
+            vs_val_text = rf"$V_s = {V_s:.1f}\text{{ m/s}}$"
+
+        ax.plot(q_lin_um, shift_model, "r-", lw=2.2, label=line_label)
+
+        # Text box with speed of sound expression and propagated error
+        dispersion_box = (
+            r"$\mathbf{Speed\ of\ Sound:}$" + "\n"
+            r"$\Omega(q) = V_s \cdot q \iff \mathrm{Shift} = \frac{V_s}{2\pi} q$" + "\n"
+            f"{vs_val_text}\n"
+            r"$V_s = \frac{\lambda_0 S_0}{2n}$" + (r" $\pm \sigma_{V_s}(S_0, M_\theta)$" if (V_s_err is not None and np.isfinite(V_s_err)) else "")
+        )
+        ax.text(
+            0.05,
+            0.95,
+            dispersion_box,
+            transform=ax.transAxes,
+            fontsize=8.5,
+            verticalalignment="top",
+            horizontalalignment="left",
+            bbox=dict(
+                boxstyle="round,pad=0.5",
+                facecolor="white",
+                edgecolor="#cccccc",
+                alpha=0.92,
+            ),
+        )
+
+        ax.legend(loc="lower right", fontsize=8)
+
     ax.set_title(r"5. $\mathrm{Shift}(q)$ Acoustic Dispersion", fontsize=11)
-    ax.set_xlabel(r"$q$ ($\mathrm{rad}/\mu\mathrm{m}$)")
+    ax.set_xlabel(r"Acoustic Wavevector $q$ ($\mathrm{rad}/\mu\mathrm{m}$)")
     ax.set_ylabel("Shift (GHz)")
     ax.grid(True, linestyle=":", alpha=0.3)
 

@@ -123,20 +123,26 @@ def extract_q_vector(
     )
 
     # 6. Fit angular magnification factor M_theta
-    S0_fit, M_theta_fit, (S0_err, M_theta_err) = bck.fit_magnification_factor_M_theta(
+    S0_fit, M_theta_fit, (S0_err, M_theta_err), pcov_fit = bck.fit_magnification_factor_M_theta(
         r_sph=r_sph,
         shift=shift_flat,
         shift_err=shift_err_flat if has_errors else None,
         initial_M_theta=initial_M_theta,
+        return_covariance=True,
     )
 
-    # 7. Deduce theta and q_vector
+    # 7. Deduce theta and q_vector with full error propagation from (S0, M_theta)
     q_results = bck.compute_theta_and_q_vector(
         r_sph=r_sph,
         M_theta=M_theta_fit,
         n_medium=refractive_index,
         lambda_vacuum=laser_wavelength,
         Shift_0=S0_fit,
+        Shift_0_err=S0_err,
+        M_theta_err=M_theta_err,
+        pcov_kinematic=pcov_fit,
+        shift_exp=shift_flat,
+        shift_err=shift_err_flat if has_errors else None,
     )
 
     results = {
@@ -159,6 +165,7 @@ def extract_q_vector(
         "Shift_0": S0_fit,
         "Shift_0_err": S0_err,
         "V_s": q_results["V_s"],
+        "V_s_err": q_results.get("V_s_err"),
         "opt_params": opt_params,
         "coaxial_fit": coaxial_fit,
     }
@@ -169,7 +176,10 @@ def extract_q_vector(
         print(f"  • Aspect Ratio γ         : {opt_params['gamma']:.4f}")
         print(f"  • Normal Shift S(0)      : {S0_fit:.4f} ± {S0_err:.4f} GHz")
         print(f"  • Magnification M_theta  : {M_theta_fit:.1f} ± {M_theta_err:.1f} px")
-        print(f"  • Acoustic Velocity V_s  : {q_results['V_s']:.2f} m/s")
+        if q_results.get("V_s_err") is not None:
+            print(f"  • Acoustic Velocity V_s  : {q_results['V_s']:.2f} ± {q_results['V_s_err']:.2f} m/s")
+        else:
+            print(f"  • Acoustic Velocity V_s  : {q_results['V_s']:.2f} m/s")
         print("=" * 80 + "\n")
 
     return results
@@ -207,8 +217,11 @@ def save_q_vector_results(wrapper, path_sample, bin_val_h, bin_val_w, q_results)
     opt = q_results["opt_params"]
     attributes = {
         "M_theta": float(q_results["M_theta"]),
+        "M_theta_err": float(q_results.get("M_theta_err", np.nan)),
         "Shift_0": float(q_results["Shift_0"]),
+        "Shift_0_err": float(q_results.get("Shift_0_err", np.nan)),
         "V_s": float(q_results["V_s"]),
+        "V_s_err": float(q_results.get("V_s_err", np.nan)),
         "xc_ellipse": float(opt["xc"]),
         "yc_ellipse": float(opt["yc"]),
         "phi_ellipse_deg": float(opt["phi_deg"]),
@@ -239,8 +252,11 @@ def retrieve_q_vector_results(wrapper, path_sample, bin_val_h, bin_val_w):
             "theta_deg": np.degrees(theta),
             "r_sph": r_sph,
             "M_theta": float(attrs.get("M_theta", np.nan)),
+            "M_theta_err": float(attrs.get("M_theta_err", np.nan)),
             "Shift_0": float(attrs.get("Shift_0", np.nan)),
+            "Shift_0_err": float(attrs.get("Shift_0_err", np.nan)),
             "V_s": float(attrs.get("V_s", np.nan)),
+            "V_s_err": float(attrs.get("V_s_err", np.nan)),
             "opt_params": {
                 "xc": float(attrs.get("xc_ellipse", np.nan)),
                 "yc": float(attrs.get("yc_ellipse", np.nan)),

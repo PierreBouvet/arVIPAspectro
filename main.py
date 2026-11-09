@@ -582,6 +582,7 @@ if plot_q_dispersion:
         n_medium=config.N_SAMPLE,
         lambda_vacuum=config.lambda_0,
         V_s=q_results.get("V_s"),
+        V_s_err=q_results.get("V_s_err"),
         out_dir=OUT_DIR,
         prefix=FIGURE_PREFIX,
         show_plots=SHOW_PLOTS
@@ -608,6 +609,7 @@ if plot_q_diagnostics and "x_sph" in q_results:
         n_medium=config.N_SAMPLE,
         lambda_vacuum=config.lambda_0,
         V_s=q_results.get("V_s"),
+        V_s_err=q_results.get("V_s_err"),
         out_dir=OUT_DIR,
         prefix=FIGURE_PREFIX,
         show_plots=SHOW_PLOTS
