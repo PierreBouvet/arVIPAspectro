@@ -3,6 +3,7 @@ Core mathematical, physical, and signal/image processing functions for VIPA Bril
 """
 
 import os
+import time
 import cv2
 import numpy as np
 import scipy.ndimage as ndimage
@@ -519,3 +520,218 @@ def fold_spectrum_across_orders(phi_order, spectrum, fsr, delta_nu_offset, f_gri
     avg_one_order = np.nanmean(order_spectra, axis=0) if len(order_spectra) > 0 else np.full_like(f_grid, np.nan)
 
     return order_spectra, orders_used, avg_one_order
+
+
+# ==============================================================================
+# Spectral Binning & Vectorized DHO Fitting Algorithms
+# ==============================================================================
+
+def bin_2d_array(arr, bin_h=4, bin_w=2):
+    """
+    Spatially bins a 2D array by averaging over blocks of size (bin_h, bin_w).
+    """
+    h, w = arr.shape
+    new_h, new_w = h // bin_h, w // bin_w
+    return arr[:new_h * bin_h, :new_w * bin_w].reshape(new_h, bin_h, new_w, bin_w).mean(axis=(1, 3))
+
+
+def compute_order_averaged_variance(var_arr):
+    """
+    Computes the variance of the order average 0.5 * (AS + S).
+    For independent random variables, Var(0.5*(X + Y)) = 0.25 * (Var(X) + Var(Y)).
+    If only one branch is finite, returns that branch's variance.
+    """
+    v_as = var_arr[:, 0::2]
+    v_st = var_arr[:, 1::2]
+    both = np.isfinite(v_as) & np.isfinite(v_st)
+    as_only = np.isfinite(v_as) & ~np.isfinite(v_st)
+    st_only = ~np.isfinite(v_as) & np.isfinite(v_st)
+    v_avg = np.full_like(v_as, np.nan)
+    v_avg[both] = 0.25 * (v_as[both] + v_st[both])
+    v_avg[as_only] = v_as[as_only]
+    v_avg[st_only] = v_st[st_only]
+    return v_avg
+
+
+def fit_dho_batched(
+    freq_bin_in,
+    data_bin_in,
+    xx_bin_in,
+    yy_bin_in,
+    fsr_val,
+    n_orders=None,
+    ds_init=None,
+    shift_tol=None,
+    gamma_init=None,
+    gamma_bounds=None,
+    hw_px=12,
+    min_amp=30.0,
+    verbose=True,
+):
+    """
+    Vectorized Batched Levenberg-Marquardt DHO Fitter with Analytic Jacobian.
+    Includes local linear chord baseline levelling across each (2*hw_px + 1)-bin
+    window so skewed background tails from adjacent orders do not pull nu_0.
+    Dynamically determines n_orders and acoustic parameters if not specified.
+    """
+    if ds_init is None:
+        ds_init = config.EXPECTED_BRILLOUIN_SHIFT
+    if shift_tol is None:
+        shift_tol = config.BRILLOUIN_SHIFT_TOLERANCE
+    if gamma_init is None:
+        gamma_init = config.EXPECTED_LINEWIDTH
+    if gamma_bounds is None:
+        gamma_bounds = config.LINEWIDTH_BOUNDS
+
+    t_start = time.time()
+    n_rows, n_cols = freq_bin_in.shape
+    if n_orders is None:
+        if config.N_ORDERS_SAMPLE is not None:
+            n_orders = config.N_ORDERS_SAMPLE
+        else:
+            yc_idx = n_rows // 2
+            f_mid = np.nanmean(freq_bin_in[max(0, yc_idx - 25) : min(n_rows, yc_idx + 25), :], axis=0)
+            n_orders = min(11, max(int(np.floor(np.nanmax(f_mid) / fsr_val)), 1))
+    M = 2 * hw_px + 1
+    offsets = np.arange(-hw_px, hw_px + 1)[None, :]
+
+    N_tot = n_rows * 2 * n_orders
+    nu_batch = np.zeros((N_tot, M), dtype=np.float64)
+    y_batch = np.zeros((N_tot, M), dtype=np.float64)
+    valid_win = np.zeros(N_tot, dtype=bool)
+    row_idx_arr = np.zeros(N_tot, dtype=np.int32)
+    col_idx_arr = np.zeros(N_tot, dtype=np.int32)
+    k_order_arr = np.zeros(N_tot, dtype=np.int32)
+    sign_arr = np.zeros(N_tot, dtype=np.float64)
+
+    idx = 0
+    rows_arange = np.arange(n_rows)
+    for k_idx in range(n_orders):
+        k_order = k_idx + 1
+        for side_idx, sign in enumerate([-1.0, +1.0]):
+            col_out = 2 * k_idx + side_idx
+            target_f = k_order * fsr_val + sign * ds_init
+            c_idx = np.argmin(np.abs(freq_bin_in - target_f), axis=1)
+            ok = (c_idx >= hw_px + 5) & (c_idx < n_cols - hw_px - 5)
+            cols_2d = np.clip(c_idx[:, None] + offsets, 0, n_cols - 1)
+            sl = slice(idx, idx + n_rows)
+            nu_batch[sl] = np.abs(freq_bin_in[rows_arange[:, None], cols_2d] - k_order * fsr_val)
+            y_win = data_bin_in[rows_arange[:, None], cols_2d]
+            # Subtract local linear chord baseline between the two window edges
+            y_left = np.mean(y_win[:, :2], axis=1, keepdims=True)
+            y_right = np.mean(y_win[:, -2:], axis=1, keepdims=True)
+            tau = np.linspace(0.0, 1.0, M)[None, :]
+            chord = y_left + (y_right - y_left) * tau
+            y_batch[sl] = y_win - chord
+            valid_win[sl] = ok
+            row_idx_arr[sl] = rows_arange
+            col_idx_arr[sl] = col_out
+            k_order_arr[sl] = k_order
+            sign_arr[sl] = sign
+            idx += n_rows
+
+    b0 = np.percentile(y_batch, 15, axis=1)
+    a0 = np.max(y_batch, axis=1) - b0
+    valid_win &= (a0 >= min_amp)
+
+    v_idx = np.where(valid_win)[0]
+    nu_v = nu_batch[v_idx]
+    y_v = y_batch[v_idx]
+    Nv = len(v_idx)
+
+    b = b0[v_idx].copy()
+    a = a0[v_idx].copy()
+    nu0_min_init = max(0.5, ds_init - shift_tol)
+    nu0_max_init = ds_init + shift_tol
+    nu0 = np.clip(nu_v[np.arange(Nv), np.argmax(y_v, axis=1)], nu0_min_init, nu0_max_init)
+    gamma = np.full(Nv, gamma_init, dtype=np.float64)
+    lam = np.full(Nv, 1e-2, dtype=np.float64)
+    diag_idx = np.arange(4)
+
+    nu0_min_step = max(0.2, ds_init - 1.25 * shift_tol)
+    nu0_max_step = ds_init + 1.25 * shift_tol
+    gam_min_step = max(0.05, gamma_bounds[0] * 0.7)
+    gam_max_step = gamma_bounds[1] * 1.3
+
+    for _ in range(18):
+        nu2 = nu_v * nu_v
+        nu02 = (nu0 * nu0)[:, None]
+        gn = gamma[:, None] * nu_v
+        gn0 = (gamma * nu0)[:, None]
+        D = (nu2 - nu02) ** 2 + gn**2
+        D2 = D * D
+        L = (gn0 * gn0) / D
+        r = y_v - (b[:, None] + a[:, None] * L)
+        cost = np.sum(r * r, axis=1)
+
+        J = np.empty((Nv, M, 4), dtype=np.float64)
+        J[:, :, 0] = 1.0
+        J[:, :, 1] = L
+        J[:, :, 2] = (a * gamma**2)[:, None] * (2.0 * nu0[:, None] * D + 4.0 * (nu0**3)[:, None] * (nu2 - nu02)) / D2
+        J[:, :, 3] = (a * nu0**2)[:, None] * (2.0 * gamma[:, None] * (nu2 - nu02) ** 2) / D2
+
+        JTJ = np.einsum('nmi,nmj->nij', J, J)
+        JTr = np.einsum('nmi,nm->ni', J, r)
+        JTJ_d = JTJ.copy()
+        JTJ_d[:, diag_idx, diag_idx] += lam[:, None] * (np.diagonal(JTJ, axis1=1, axis2=2) + 1e-6)
+        dp = np.linalg.solve(JTJ_d, JTr[:, :, None])[:, :, 0]
+
+        b_n = np.clip(b + dp[:, 0], -500.0, 5000.0)
+        a_n = np.clip(a + dp[:, 1], 15.0, 100000.0)
+        nu0_n = np.clip(nu0 + dp[:, 2], nu0_min_step, nu0_max_step)
+        gam_n = np.clip(gamma + dp[:, 3], gam_min_step, gam_max_step)
+
+        D_n = (nu2 - (nu0_n * nu0_n)[:, None]) ** 2 + (gam_n[:, None] * nu_v) ** 2
+        f_n = b_n[:, None] + a_n[:, None] * ((gam_n * nu0_n)[:, None] ** 2) / D_n
+        cost_n = np.sum((y_v - f_n) ** 2, axis=1)
+
+        acc = cost_n < cost
+        b = np.where(acc, b_n, b)
+        a = np.where(acc, a_n, a)
+        nu0 = np.where(acc, nu0_n, nu0)
+        gamma = np.where(acc, gam_n, gamma)
+        lam = np.where(acc, np.maximum(lam * 0.3, 1e-7), np.minimum(lam * 5.0, 1e4))
+
+    s2 = cost / max(M - 4, 1)
+    cov = np.linalg.inv(JTJ + 1e-9 * np.eye(4)[None, :, :]) * s2[:, None, None]
+    var_nu0 = np.maximum(cov[:, 2, 2], 0.0)
+    var_gamma = np.maximum(cov[:, 3, 3], 0.0)
+    perr_nu0 = np.sqrt(var_nu0)
+    perr_gamma = np.sqrt(var_gamma)
+
+    good = (
+        (perr_nu0 < 0.15)
+        & (perr_gamma < 0.40)
+        & (nu0 >= ds_init - shift_tol)
+        & (nu0 <= ds_init + shift_tol)
+        & (gamma >= gamma_bounds[0])
+        & (gamma <= gamma_bounds[1])
+    )
+
+    shift_rel = np.full((n_rows, 2 * n_orders), np.nan)
+    shift_unwrapped = np.full((n_rows, 2 * n_orders), np.nan)
+    lw_out = np.full((n_rows, 2 * n_orders), np.nan)
+    shift_err_out = np.full((n_rows, 2 * n_orders), np.nan)
+    lw_err_out = np.full((n_rows, 2 * n_orders), np.nan)
+    x_coords_out = np.full((n_rows, 2 * n_orders), np.nan)
+    y_coords_out = np.full((n_rows, 2 * n_orders), np.nan)
+
+    for j in np.where(good)[0]:
+        g_i = v_idx[j]
+        r_i = row_idx_arr[g_i]
+        c_i = col_idx_arr[g_i]
+        k_o = k_order_arr[g_i]
+        sgn = sign_arr[g_i]
+        tf = k_o * fsr_val + sgn * nu0[j]
+        shift_rel[r_i, c_i] = nu0[j]
+        shift_unwrapped[r_i, c_i] = tf
+        lw_out[r_i, c_i] = gamma[j]
+        shift_err_out[r_i, c_i] = var_nu0[j]
+        lw_err_out[r_i, c_i] = var_gamma[j]
+        x_coords_out[r_i, c_i] = np.interp(tf, freq_bin_in[r_i], xx_bin_in[r_i])
+        y_coords_out[r_i, c_i] = yy_bin_in[r_i, 0]
+
+    elapsed = time.time() - t_start
+    if verbose:
+        print(f"Vectorized DHO fitting completed in {elapsed:.3f} s ({np.sum(good)}/{N_tot} valid peaks across {n_orders} orders).")
+    return shift_rel, shift_unwrapped, lw_out, shift_err_out, lw_err_out, x_coords_out, y_coords_out

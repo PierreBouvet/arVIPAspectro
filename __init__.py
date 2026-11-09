@@ -6,6 +6,7 @@ from . import config
 from . import backend
 from . import laser_calib
 from . import Rb_calib
+from . import spectrum_fitting
 from . import plotting
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     'backend',
     'laser_calib',
     'Rb_calib',
+    'spectrum_fitting',
     'plotting',
 ]

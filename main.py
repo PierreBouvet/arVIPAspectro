@@ -11,6 +11,7 @@ import config
 import backend as bck
 import laser_calib
 import Rb_calib
+import spectrum_fitting
 import plotting
 
 
@@ -26,8 +27,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 FIGURE_PREFIX = ''
 SHOW_PLOTS = True
-FORCE_ALL_PROCESS = 0
-FORCE_PLOT_ALL = 0
+FORCE_ALL_PROCESS = 1
+FORCE_PLOT_ALL = 1
 
 # Execution flags per step: (plot_*, stop_*, force_*)
 # Step 2: Laser Denoising
@@ -76,6 +77,17 @@ force_Rb_calibration = FORCE_ALL_PROCESS or 1
 # Step 10B: Calibrated 2D Frequency Map Generation
 plot_freq_map = FORCE_PLOT_ALL or 0
 stop_freq_map = 0
+
+# Step 11: Sample In-Situ Frequency Map Self-Calibration
+PATH_SAMPLE = config.PATH_SAMPLE
+plot_sample_freq_calib = FORCE_PLOT_ALL or 1
+stop_sample_freq_calib = 0
+
+# Step 12 & 13: Sample DHO Peak Fitting & Plotting
+force_dho_fit = FORCE_ALL_PROCESS or 0
+plot_dho_overview = FORCE_PLOT_ALL or 1
+plot_dho_profiles = FORCE_PLOT_ALL or 0
+stop_dho_fit = 0
 
 
 # ==============================================================================
@@ -389,4 +401,124 @@ if plot_freq_map:
 if stop_freq_map:
     sys.exit(0)
 
-print("\n--- Calibration pipeline completed successfully! ---")
+
+# ==============================================================================
+# 11 - Load Sample & Calibrate Sample Frequency Map In-Situ
+# ==============================================================================
+path_h5_sample = f'{config.GROUP_INTEREST}/{PATH_SAMPLE}'
+data_sample = wrapper[f'{path_h5_sample}/image'].astype(np.float64)
+yy, xx = np.indices(data_sample.shape, dtype=np.float64)
+
+freq_corrected, df_coarse, dz_map_2d, dinst_disp_map, bls_peaks, avg_data_sample, freq_avg_data_sample = (
+    spectrum_fitting.calibrate_sample_frequency_map(
+        freq_map_base=freq_map,
+        data_clean_in=data_sample,
+        xx_in=xx,
+        yy_in=yy,
+        fsr_val=fsr_results['FSR_cal'],
+        y0_center=y0_fit,
+        bin_val_h=config.BIN_VAL_H,
+        bin_val_w=config.BIN_VAL_W,
+        expected_shift=config.EXPECTED_BRILLOUIN_SHIFT,
+        shift_tol=config.BRILLOUIN_SHIFT_TOLERANCE,
+    )
+)
+print(f"Step 11 - In-situ calibrated 2D frequency map for {PATH_SAMPLE}: coarse df = {df_coarse*1e3:+.2f} MHz | "
+      f"2D zero-offset RMS = {np.std(dz_map_2d)*1e3:.1f} MHz | higher-order dispersion RMS = {np.std(dinst_disp_map)*1e3:.1f} MHz")
+
+if plot_sample_freq_calib:
+    plotting.plot_sample_baseline_and_windows(
+        data_sample, freq_avg_data_sample, avg_data_sample,
+        bls_peaks, dinst_disp_map, path_h5_sample,
+        OUT_DIR, FIGURE_PREFIX, SHOW_PLOTS
+    )
+
+if stop_sample_freq_calib:
+    sys.exit(0)
+
+
+# ==============================================================================
+# 12 - Bin Data & Fit Brillouin Spectra with DHO
+# ==============================================================================
+cached_fit = None
+if not force_dho_fit:
+    cached_fit = spectrum_fitting.retrieve_sample_dho_fit(
+        wrapper, path_h5_sample,
+        bin_val_h=config.BIN_VAL_H,
+        bin_val_w=config.BIN_VAL_W
+    )
+
+if cached_fit is not None:
+    dho_results = cached_fit
+    print(f"Step 12 - Retrieved cached {config.BIN_VAL_H}x{config.BIN_VAL_W} binned DHO fit for {PATH_SAMPLE} from H5 file.")
+else:
+    dho_results = spectrum_fitting.fit_sample_dho(
+        data_sample=data_sample,
+        freq_corrected=freq_corrected,
+        xx=xx,
+        yy=yy,
+        fsr_val=fsr_results['FSR_cal'],
+        bin_val_h=config.BIN_VAL_H,
+        bin_val_w=config.BIN_VAL_W,
+        ds_init=config.EXPECTED_BRILLOUIN_SHIFT,
+        shift_tol=config.BRILLOUIN_SHIFT_TOLERANCE,
+        gamma_init=config.EXPECTED_LINEWIDTH,
+        gamma_bounds=config.LINEWIDTH_BOUNDS,
+        verbose=True
+    )
+    print(f"Step 12 - Fitted {dho_results['n_fringes']} orders with vectorized DHO for {PATH_SAMPLE} "
+          f"({config.BIN_VAL_H}x{config.BIN_VAL_W} binning).")
+    print(f"\t Stokes vs Anti-Stokes splitting RMS: {dho_results['stokes_antistokes_rms_mhz']:.2f} MHz")
+
+    # Step 15: Save Treated Data
+    spectrum_fitting.save_treated_data(
+        wrapper=wrapper,
+        path_sample=path_h5_sample,
+        bin_val_h=config.BIN_VAL_H,
+        bin_val_w=config.BIN_VAL_W,
+        shift_rel=dho_results['shift_clipped'],
+        shift_err=dho_results['shift_error'],
+        lw_rel=dho_results['linewidth_clipped'],
+        lw_err=dho_results['linewidth_error'],
+        x_coords=dho_results['x_coords'],
+        y_coords=dho_results['y_coords']
+    )
+    print(f"Step 15 - Saved treated {config.BIN_VAL_H}x{config.BIN_VAL_W} data for {PATH_SAMPLE} in H5 file.")
+
+
+# ==============================================================================
+# 13 - Plot Extracted Brillouin Shift & Linewidth
+# ==============================================================================
+if plot_dho_overview:
+    plotting.plot_dho_overview(
+        shift_clipped=dho_results['shift_clipped'],
+        shift_clipped_averaged=dho_results['shift_clipped_averaged'],
+        linewidth_clipped=dho_results['linewidth_clipped'],
+        linewidth_clipped_averaged=dho_results['linewidth_clipped_averaged'],
+        x_coords=dho_results['x_coords'],
+        y_coords=dho_results['y_coords'],
+        x_coords_averaged=dho_results['x_coords_averaged'],
+        y_coords_averaged=dho_results['y_coords_averaged'],
+        path_sample=path_h5_sample,
+        out_dir=OUT_DIR,
+        prefix=FIGURE_PREFIX,
+        show_plots=SHOW_PLOTS
+    )
+
+if plot_dho_profiles:
+    plotting.plot_dho_fringe_profiles(
+        shift_clipped=dho_results['shift_clipped'],
+        linewidth_clipped=dho_results['linewidth_clipped'],
+        shift_clipped_averaged=dho_results['shift_clipped_averaged'],
+        linewidth_clipped_averaged=dho_results['linewidth_clipped_averaged'],
+        y_coords_averaged=dho_results['y_coords_averaged'],
+        path_sample=path_h5_sample,
+        out_dir=OUT_DIR,
+        prefix=FIGURE_PREFIX,
+        show_plots=SHOW_PLOTS
+    )
+
+if stop_dho_fit:
+    sys.exit(0)
+
+print("\n--- Pipeline completed successfully! ---")

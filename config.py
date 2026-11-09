@@ -82,6 +82,20 @@ FIT_WINDOW_GHZ = 10.0                       # Fitting window around Rb D2 center
 RB_LOCK_OFFSET_GHZ = 1.323                  # 85Rb F=2 absorption line offset from D2 center (GHz)
 
 # ==============================================================================
+# Default Sample Spectrum Fitting (DHO) Parameters
+# ==============================================================================
+BIN_VAL_H = 4                               # Vertical spatial binning factor (pixels per bin)
+BIN_VAL_W = 2                               # Horizontal spatial binning factor (pixels per bin)
+EXPECTED_BRILLOUIN_SHIFT = 9.7              # Expected Brillouin shift nu_B in GHz (e.g. 9.7 for plastic)
+BRILLOUIN_SHIFT_TOLERANCE = 3.0             # Search half-window around expected shift in GHz
+EXPECTED_LINEWIDTH = 0.8                    # Expected Brillouin linewidth Gamma_B in GHz
+LINEWIDTH_BOUNDS = (0.4, 1.3)               # Acceptable linewidth range (min, max) in GHz
+N_ORDERS_SAMPLE = None                      # Number of Brillouin orders to fit (None = automatic detection)
+DHO_HW_PX = 12                              # Fitting half-window width in binned pixels
+DHO_MIN_AMP = 30.0                          # Minimum peak amplitude above chord baseline
+SIGMA_Y_BINS = 6.0                          # Smoothing length along vertical bins for in-situ calibration
+
+# ==============================================================================
 # HDF5 Hierarchy Defaults
 # ==============================================================================
 GROUP_INTEREST = 'Brillouin'

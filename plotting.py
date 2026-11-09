@@ -313,3 +313,151 @@ def plot_frequency_map(freq_map, out_dir, prefix='', show_plots=False):
     if show_plots:
         plt.show()
     plt.close(fig)
+
+
+def plot_sample_baseline_and_windows(data_sample, freq_avg_data_sample, avg_data_sample,
+                                     bls_peaks, dinst_disp_map, path_sample,
+                                     out_dir, prefix='', show_plots=False):
+    """
+    Plots sample interferogram, central row-averaged spectrum with Anti-Stokes/Stokes windows,
+    and 2D higher-order dispersion distortion correction.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(19, 5))
+    im = axes[0].imshow(np.clip(data_sample, 0, np.percentile(data_sample, 98)), cmap='inferno', aspect='auto')
+    sample_name = os.path.basename(path_sample)
+    axes[0].set_title(f'Sample Interferogram ({sample_name})')
+    axes[0].set_xlabel('Pixel x')
+    axes[0].set_ylabel('Pixel y')
+    plt.colorbar(im, ax=axes[0], label='Counts')
+
+    axes[1].plot(freq_avg_data_sample, avg_data_sample, color='tab:blue', lw=1.2, label='Central profile')
+    for idx_p, p in enumerate(bls_peaks[:3]):
+        axes[1].axvline(p[0], color='tab:green', linestyle='--', alpha=0.7, label='Anti-Stokes' if idx_p == 0 else None)
+        axes[1].axvline(p[1], color='tab:red', linestyle='--', alpha=0.7, label='Stokes' if idx_p == 0 else None)
+    axes[1].set_xlim(15, 110)
+    axes[1].set_title('Calibrated Central Spectrum & Brillouin Windows')
+    axes[1].set_xlabel('Calibrated Frequency (GHz)')
+    axes[1].set_ylabel('Intensity (counts)')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    im_corr = axes[2].imshow(dinst_disp_map * 1e3, cmap='RdBu_r', vmin=-150, vmax=150, aspect='auto')
+    axes[2].set_title(r'2D Higher-Order Dispersion Correction $\Delta\nu_{\mathrm{inst}}(x, y)$ (MHz)')
+    axes[2].set_xlabel('Pixel x')
+    axes[2].set_ylabel('Pixel y')
+    plt.colorbar(im_corr, ax=axes[2], label='Dispersion Distortion Removed (MHz)')
+
+    plt.tight_layout()
+    save_path = os.path.join(out_dir, f'{prefix}11 - {sample_name} baseline and windows.png')
+    plt.savefig(save_path, dpi=200)
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_dho_overview(shift_clipped, shift_clipped_averaged,
+                      linewidth_clipped, linewidth_clipped_averaged,
+                      x_coords, y_coords, x_coords_averaged, y_coords_averaged,
+                      path_sample, out_dir, prefix='', show_plots=False):
+    """
+    2x2 overview plot of extracted Brillouin shift and linewidth across the detector.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    sample_name = os.path.basename(path_sample)
+
+    # 1. 2D Scatter Shift
+    sc0 = axes[0, 0].scatter(x_coords.ravel(), y_coords.ravel(), c=shift_clipped.ravel(),
+                             cmap='plasma', s=3, alpha=0.6)
+    axes[0, 0].set_title(f'Brillouin Shift $\\Delta\\nu_B$ on Detector ({sample_name})')
+    axes[0, 0].set_xlabel('Pixel x')
+    axes[0, 0].set_ylabel('Pixel y')
+    axes[0, 0].invert_yaxis()
+    plt.colorbar(sc0, ax=axes[0, 0], label='Shift (GHz)')
+
+    # 2. Shift Profiles vs y
+    n_orders = shift_clipped_averaged.shape[1]
+    for k in range(n_orders):
+        valid = np.isfinite(shift_clipped_averaged[:, k])
+        if np.any(valid):
+            axes[0, 1].plot(y_coords_averaged[valid, k], shift_clipped_averaged[valid, k],
+                            lw=1.2, label=f'Order {k+1}')
+    axes[0, 1].set_title('Order-Averaged Brillouin Shift vs Detector Height y')
+    axes[0, 1].set_xlabel('Pixel y')
+    axes[0, 1].set_ylabel('Shift (GHz)')
+    axes[0, 1].grid(True, alpha=0.3)
+    if n_orders <= 10:
+        axes[0, 1].legend(fontsize=8, ncol=2)
+
+    # 3. 2D Scatter Linewidth
+    sc1 = axes[1, 0].scatter(x_coords.ravel(), y_coords.ravel(), c=linewidth_clipped.ravel(),
+                             cmap='viridis', s=3, alpha=0.6)
+    axes[1, 0].set_title(f'Brillouin Linewidth $\\Gamma_B$ on Detector ({sample_name})')
+    axes[1, 0].set_xlabel('Pixel x')
+    axes[1, 0].set_ylabel('Pixel y')
+    axes[1, 0].invert_yaxis()
+    plt.colorbar(sc1, ax=axes[1, 0], label='Linewidth (GHz)')
+
+    # 4. Linewidth Profiles vs y
+    for k in range(n_orders):
+        valid = np.isfinite(linewidth_clipped_averaged[:, k])
+        if np.any(valid):
+            axes[1, 1].plot(y_coords_averaged[valid, k], linewidth_clipped_averaged[valid, k],
+                            lw=1.2, label=f'Order {k+1}')
+    axes[1, 1].set_title('Order-Averaged Brillouin Linewidth vs Detector Height y')
+    axes[1, 1].set_xlabel('Pixel y')
+    axes[1, 1].set_ylabel('Linewidth (GHz)')
+    axes[1, 1].grid(True, alpha=0.3)
+    if n_orders <= 10:
+        axes[1, 1].legend(fontsize=8, ncol=2)
+
+    plt.tight_layout()
+    save_path = os.path.join(out_dir, f'{prefix}13 - {sample_name} DHO shift and linewidth overview.png')
+    plt.savefig(save_path, dpi=200)
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_dho_fringe_profiles(shift_clipped, linewidth_clipped,
+                             shift_clipped_averaged, linewidth_clipped_averaged,
+                             y_coords_averaged, path_sample,
+                             out_dir, prefix='', show_plots=False):
+    """
+    Per-fringe comparison plot: Anti-Stokes vs Stokes vs Order-Averaged.
+    """
+    sample_name = os.path.basename(path_sample)
+    n_orders = shift_clipped_averaged.shape[1]
+    n_cols = min(5, n_orders)
+    n_rows = int(np.ceil(n_orders / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows), squeeze=False)
+    for k in range(n_orders):
+        r, c = divmod(k, n_cols)
+        ax = axes[r, c]
+        y_k = y_coords_averaged[:, k]
+
+        s_as = shift_clipped[:, 2 * k]
+        s_st = shift_clipped[:, 2 * k + 1]
+        s_avg = shift_clipped_averaged[:, k]
+
+        ax.plot(y_k, s_as, 'g.', markersize=2, alpha=0.5, label='Anti-Stokes')
+        ax.plot(y_k, s_st, 'r.', markersize=2, alpha=0.5, label='Stokes')
+        ax.plot(y_k, s_avg, 'b-', lw=1.2, label='Order Avg')
+        ax.set_title(f'Order {k+1}')
+        ax.set_xlabel('Pixel y')
+        ax.set_ylabel('Shift (GHz)')
+        ax.grid(True, alpha=0.3)
+        if k == 0:
+            ax.legend(fontsize=7)
+
+    # Hide unused subplots
+    for k in range(n_orders, n_rows * n_cols):
+        r, c = divmod(k, n_cols)
+        axes[r, c].axis('off')
+
+    plt.tight_layout()
+    save_path = os.path.join(out_dir, f'{prefix}13B - {sample_name} per-fringe breakdown.png')
+    plt.savefig(save_path, dpi=200)
+    if show_plots:
+        plt.show()
+    plt.close(fig)
