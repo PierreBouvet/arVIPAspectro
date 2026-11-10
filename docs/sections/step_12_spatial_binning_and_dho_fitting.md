@@ -21,7 +21,7 @@
    - Evaluates the exact DHO model function:
      $$I_{\mathrm{DHO}}(\nu_{\mathrm{rel}}; b, a, \nu_0, \Gamma_B) = b + a \frac{(\Gamma_B \nu_0)^2}{(\nu_{\mathrm{rel}}^2 - \nu_0^2)^2 + (\Gamma_B \nu_{\mathrm{rel}})^2}$$
    - Evaluates the analytic Jacobian $\mathbf{J} \in \mathbb{R}^{N_{\mathrm{peaks}} \times M \times 4}$ containing exact partial derivatives $[\partial_b I, \partial_a I, \partial_a I, \partial_{\nu_0} I, \partial_{\Gamma_B} I]$.
-   - Solves the damped normal equations $\big(\mathbf{J}^T \mathbf{J} + \lambda \operatorname{diag}(\mathbf{J}^T \mathbf{J})\big) \Delta\mathbf{p} = \mathbf{J}^T \mathbf{r}$ across all peaks simultaneously using `np.einsum` and batched linear algebra.
+   - Solves the damped normal equations $\big(\mathbf{J}^T \mathbf{J} + \lambda \text{diag}(\mathbf{J}^T \mathbf{J})\big) \Delta\mathbf{p} = \mathbf{J}^T \mathbf{r}$ across all peaks simultaneously using `np.einsum` and batched linear algebra.
    - Converges in $\sim 18$ iterations in **$< 0.5\text{ seconds}$** on standard multi-core CPUs.
 4. **Sub-Pixel Coordinate Interpolation**:
    Interpolates the physical camera coordinates $(x, y)$ corresponding to the fitted peak frequency center $\nu_0$ using monotonic 1D cubic splines along each binned row.

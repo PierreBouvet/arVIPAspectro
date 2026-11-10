@@ -624,7 +624,7 @@ To fit Brillouin peaks across the entire detector image without spatial interpol
 - **Calibrated 2D Frequency Map**:
   $$\nu_{\mathrm{map}}(x, y) = \big(\phi_{\mathrm{order}}(x, y) - \xi_{\mathrm{elastic}}\big) \cdot \mathrm{FSR}_{\mathrm{cal}}$$
 - **Order Boundary Definition**:
-  $$k_{\mathrm{ord}}(x, y) = \operatorname{round}\left( \frac{\nu_{\mathrm{map}}(x, y)}{\mathrm{FSR}_{\mathrm{cal}}} \right)$$
+  $$k_{\mathrm{ord}}(x, y) = \text{round}\left( \frac{\nu_{\mathrm{map}}(x, y)}{\mathrm{FSR}_{\mathrm{cal}}} \right)$$
 
 ---
 
@@ -653,7 +653,7 @@ The self-calibration operates in two sequential stages:
    $$\Delta\nu_S = \Delta\nu_{\mathrm{true}} + \delta\nu_{\mathrm{zero}}, \qquad \Delta\nu_{AS} = \Delta\nu_{\mathrm{true}} - \delta\nu_{\mathrm{zero}} \implies \delta\nu_{\mathrm{mid}} = \frac{\Delta\nu_S - \Delta\nu_{AS}}{2}$$
 2. Runs a fast initial DHO fit on $4 \times 2$ binned data to measure the local midpoint $\delta\nu_{\mathrm{mid}}(y, k)$ across all visible orders $k \in \{1, \dots, 10\}$.
 3. Fits a smooth 2D 3rd-order polynomial base plus Gaussian-filtered spline ($\sigma_y = 6\text{ bins}$) along vertical rows to model $\delta\nu_{\mathrm{zero}}(y, k)$.
-4. Subtracts $\delta\nu_{\mathrm{zero}}(y, k)$ from each order $k_{\mathrm{ord}} = \operatorname{clip}(\operatorname{round}(\nu_{\mathrm{init}}/\mathrm{FSR}), 1, 10)$.
+4. Subtracts $\delta\nu_{\mathrm{zero}}(y, k)$ from each order $k_{\mathrm{ord}} = \text{clip}(\text{round}(\nu_{\mathrm{init}}/\mathrm{FSR}), 1, 10)$.
 
 ### Stage 2 — Higher-Order Dispersion Jacobian Scale $\alpha_{\mathrm{disp}}(y, k_{\mathrm{ord}})$
 1. Decomposes the order-averaged Brillouin shift $\Delta\nu_{\mathrm{avg}}(y, k) = \frac{1}{2}(\Delta\nu_S + \Delta\nu_{AS})$ into:
@@ -719,7 +719,7 @@ Because Brillouin scattering generates Stokes and Anti-Stokes phonons of strictl
    - Evaluates the exact DHO model function:
      $$I_{\mathrm{DHO}}(\nu_{\mathrm{rel}}; b, a, \nu_0, \Gamma_B) = b + a \frac{(\Gamma_B \nu_0)^2}{(\nu_{\mathrm{rel}}^2 - \nu_0^2)^2 + (\Gamma_B \nu_{\mathrm{rel}})^2}$$
    - Evaluates the analytic Jacobian $\mathbf{J} \in \mathbb{R}^{N_{\mathrm{peaks}} \times M \times 4}$ containing exact partial derivatives $[\partial_b I, \partial_a I, \partial_a I, \partial_{\nu_0} I, \partial_{\Gamma_B} I]$.
-   - Solves the damped normal equations $\big(\mathbf{J}^T \mathbf{J} + \lambda \operatorname{diag}(\mathbf{J}^T \mathbf{J})\big) \Delta\mathbf{p} = \mathbf{J}^T \mathbf{r}$ across all peaks simultaneously using `np.einsum` and batched linear algebra.
+   - Solves the damped normal equations $\big(\mathbf{J}^T \mathbf{J} + \lambda \text{diag}(\mathbf{J}^T \mathbf{J})\big) \Delta\mathbf{p} = \mathbf{J}^T \mathbf{r}$ across all peaks simultaneously using `np.einsum` and batched linear algebra.
    - Converges in $\sim 18$ iterations in **$< 0.5\text{ seconds}$** on standard multi-core CPUs.
 4. **Sub-Pixel Coordinate Interpolation**:
    Interpolates the physical camera coordinates $(x, y)$ corresponding to the fitted peak frequency center $\nu_0$ using monotonic 1D cubic splines along each binned row.

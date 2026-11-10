@@ -15,7 +15,7 @@ The self-calibration operates in two sequential stages:
    $$\Delta\nu_S = \Delta\nu_{\mathrm{true}} + \delta\nu_{\mathrm{zero}}, \qquad \Delta\nu_{AS} = \Delta\nu_{\mathrm{true}} - \delta\nu_{\mathrm{zero}} \implies \delta\nu_{\mathrm{mid}} = \frac{\Delta\nu_S - \Delta\nu_{AS}}{2}$$
 2. Runs a fast initial DHO fit on $4 \times 2$ binned data to measure the local midpoint $\delta\nu_{\mathrm{mid}}(y, k)$ across all visible orders $k \in \{1, \dots, 10\}$.
 3. Fits a smooth 2D 3rd-order polynomial base plus Gaussian-filtered spline ($\sigma_y = 6\text{ bins}$) along vertical rows to model $\delta\nu_{\mathrm{zero}}(y, k)$.
-4. Subtracts $\delta\nu_{\mathrm{zero}}(y, k)$ from each order $k_{\mathrm{ord}} = \operatorname{clip}(\operatorname{round}(\nu_{\mathrm{init}}/\mathrm{FSR}), 1, 10)$.
+4. Subtracts $\delta\nu_{\mathrm{zero}}(y, k)$ from each order $k_{\mathrm{ord}} = \text{clip}(\text{round}(\nu_{\mathrm{init}}/\mathrm{FSR}), 1, 10)$.
 
 ### Stage 2 — Higher-Order Dispersion Jacobian Scale $\alpha_{\mathrm{disp}}(y, k_{\mathrm{ord}})$
 1. Decomposes the order-averaged Brillouin shift $\Delta\nu_{\mathrm{avg}}(y, k) = \frac{1}{2}(\Delta\nu_S + \Delta\nu_{AS})$ into:

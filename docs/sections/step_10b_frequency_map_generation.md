@@ -34,7 +34,7 @@ To fit Brillouin peaks across the entire detector image without spatial interpol
 - **Calibrated 2D Frequency Map**:
   $$\nu_{\mathrm{map}}(x, y) = \big(\phi_{\mathrm{order}}(x, y) - \xi_{\mathrm{elastic}}\big) \cdot \mathrm{FSR}_{\mathrm{cal}}$$
 - **Order Boundary Definition**:
-  $$k_{\mathrm{ord}}(x, y) = \operatorname{round}\left( \frac{\nu_{\mathrm{map}}(x, y)}{\mathrm{FSR}_{\mathrm{cal}}} \right)$$
+  $$k_{\mathrm{ord}}(x, y) = \text{round}\left( \frac{\nu_{\mathrm{map}}(x, y)}{\mathrm{FSR}_{\mathrm{cal}}} \right)$$
 
 ---
 
