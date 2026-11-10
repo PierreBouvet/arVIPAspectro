@@ -7,8 +7,12 @@ import numpy as np
 import scipy.ndimage as ndimage
 from scipy.optimize import minimize_scalar
 
-import config
-import backend as bck
+try:
+    from . import config
+    from . import backend as bck
+except ImportError:
+    import config
+    import backend as bck
 
 
 # ==============================================================================

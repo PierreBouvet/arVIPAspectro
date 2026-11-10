@@ -86,8 +86,9 @@ RB_LOCK_OFFSET_GHZ = 1.323                  # 85Rb F=2 absorption line offset fr
 # ==============================================================================
 BIN_VAL_H = 4                               # Vertical spatial binning factor (pixels per bin)
 BIN_VAL_W = 2                               # Horizontal spatial binning factor (pixels per bin)
-EXPECTED_BRILLOUIN_SHIFT = 9.7              # Expected Brillouin shift nu_B in GHz (e.g. 9.7 for plastic)
-BRILLOUIN_SHIFT_TOLERANCE = 3.0             # Search half-window around expected shift in GHz
+# EXPECTED_BRILLOUIN_SHIFT = 9.7              # Expected Brillouin shift nu_B in GHz (e.g. 9.7 for plastic)
+EXPECTED_BRILLOUIN_SHIFT = 5.1              # Expected Brillouin shift nu_B in GHz (e.g. 9.7 for plastic)
+BRILLOUIN_SHIFT_TOLERANCE = 2.0             # Search half-window around expected shift in GHz
 EXPECTED_LINEWIDTH = 0.8                    # Expected Brillouin linewidth Gamma_B in GHz
 LINEWIDTH_BOUNDS = (0.4, 1.3)               # Acceptable linewidth range (min, max) in GHz
 N_ORDERS_SAMPLE = None                      # Number of Brillouin orders to fit (None = automatic detection)
@@ -98,9 +99,10 @@ SIGMA_Y_BINS = 6.0                          # Smoothing length along vertical bi
 # ==============================================================================
 # Default Acoustic Wavevector (q-vector) Extraction Parameters
 # ==============================================================================
-N_SAMPLE = 1.59                             # Refractive index of plastic (polystyrene) at 780 nm
-N_WATER = 1.33                              # Refractive index of water at 780 nm
-SHIFT_RANGE_SAMPLE = (9.3, 9.9)             # Filtering range for Brillouin shift (GHz)
+# N_SAMPLE = 1.59                             # Refractive index of plastic (polystyrene) at 780 nm
+N_SAMPLE = 1.33                              # Refractive index of water at 780 nm
+# SHIFT_RANGE_SAMPLE = (9.3, 9.9)             # Filtering range for Brillouin shift (GHz)
+SHIFT_RANGE_SAMPLE = (4.8, 5.3)             # Filtering range for Brillouin shift (GHz)
 LINEWIDTH_RANGE_SAMPLE = (0.5, 1.2)         # Filtering range for Brillouin linewidth (GHz)
 USE_ERROR_WEIGHTING = True                  # Statistical error-weighting (w_i = 1 / sigma_i)
 ERROR_PERCENTILE_FLOOR = 1.0                # Percentile floor to regularize tiny uncertainties
@@ -108,9 +110,9 @@ AVERAGE_STOKES_ANTISTOKES = True            # Average paired Stokes & Anti-Stoke
 INITIAL_M_THETA = 3000.0                    # Initial guess for angular magnification factor M_theta (px)
 
 # ==============================================================================
-# HDF5 Hierarchy Defaults
+# HDF5 Hierarchy
 # ==============================================================================
 GROUP_INTEREST = 'Brillouin'
 PATH_LASER_REF = 'laser_reference'
 PATH_RB_ABSORPTION = 'Rb_absorption'
-PATH_SAMPLE = 'plastic_5s'
+PATH_SAMPLE = 'water_5s'

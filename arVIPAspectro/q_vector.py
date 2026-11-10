@@ -7,8 +7,12 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 import numpy as np
 
-import config
-import backend as bck
+try:
+    from . import config
+    from . import backend as bck
+except ImportError:
+    import config
+    import backend as bck
 
 
 # ==============================================================================

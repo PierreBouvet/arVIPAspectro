@@ -12,7 +12,10 @@ from scipy.optimize import minimize, curve_fit
 from HDF5_BLS import Wrapper
 from HDF5_BLS.errors import WrapperError_Overwrite
 
-import config
+try:
+    from . import config
+except ImportError:
+    import config
 
 
 # ==============================================================================

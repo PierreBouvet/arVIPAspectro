@@ -12,10 +12,16 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 import numpy as np
 
-import config
-import backend as bck
-import q_vector
-import plotting
+try:
+    from . import config
+    from . import backend as bck
+    from . import q_vector
+    from . import plotting
+except ImportError:
+    import config
+    import backend as bck
+    import q_vector
+    import plotting
 
 
 def run_q_vector_extraction(

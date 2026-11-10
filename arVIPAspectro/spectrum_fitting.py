@@ -7,8 +7,12 @@ and HDF5 treated data persistence.
 import numpy as np
 import scipy.ndimage as ndimage
 
-import config
-import backend as bck
+try:
+    from . import config
+    from . import backend as bck
+except ImportError:
+    import config
+    import backend as bck
 
 
 # ==============================================================================

@@ -5,15 +5,22 @@ Executes laser reference calibration and Rubidium absorption calibration steps s
 
 import os
 import sys
+
+# Ensure package directory is on path if main.py is run directly
+_pkg_root = os.path.dirname(os.path.abspath(__file__))
+if _pkg_root not in sys.path:
+    sys.path.insert(0, _pkg_root)
+
 import numpy as np
 
-import config
-import backend as bck
-import laser_calib
-import Rb_calib
-import spectrum_fitting
-import q_vector
-import plotting
+import arVIPAspectro as ar
+from arVIPAspectro import config
+from arVIPAspectro import backend as bck
+from arVIPAspectro import laser_calib
+from arVIPAspectro import Rb_calib
+from arVIPAspectro import spectrum_fitting
+from arVIPAspectro import q_vector
+from arVIPAspectro import plotting
 
 
 # ==============================================================================
@@ -28,8 +35,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 FIGURE_PREFIX = ''
 SHOW_PLOTS = True
-FORCE_ALL_PROCESS = 0
-FORCE_PLOT_ALL = 0
+FORCE_ALL_PROCESS = 1
+FORCE_PLOT_ALL = 1
 
 # Execution flags per step: (plot_*, stop_*, force_*)
 # Step 2: Laser Denoising

@@ -7,8 +7,12 @@ import numpy as np
 from scipy.signal import find_peaks
 from scipy.optimize import least_squares
 
-import config
-import backend as bck
+try:
+    from . import config
+    from . import backend as bck
+except ImportError:
+    import config
+    import backend as bck
 
 
 # ==============================================================================
