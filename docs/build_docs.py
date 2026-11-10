@@ -108,6 +108,10 @@ def build_documentation(docs_dir: Path = None, output_filename: str = "README.md
     git_hash = get_git_commit_hash(docs_dir.parent)
 
     master_content = [
+        '<p align="center">',
+        '  <img src="../_static/icon.jpg" alt="arVIPAspectro Icon" width="160">',
+        "</p>",
+        "",
         "# arVIPAspectro — Complete Pipeline Documentation & Theory Guide",
         "",
         f"> **Automated Build**: Generated on `{timestamp}` (Commit `{git_hash}`).",

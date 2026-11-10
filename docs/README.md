@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="../_static/icon.jpg" alt="arVIPAspectro Icon" width="160">
+</p>
+
 # arVIPAspectro — Complete Pipeline Documentation & Theory Guide
 
-> **Automated Build**: Generated on `2026-11-10 10:19:30` (Commit `591157d`).
+> **Automated Build**: Generated on `2026-11-10 11:03:33` (Commit `4a2443d`).
 > This document is automatically compiled from individual step modules in [`sections/`](sections/).
 > To regenerate, run `python build_docs.py`.
 

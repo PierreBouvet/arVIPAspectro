@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="_static/icon.jpg" alt="arVIPAspectro Icon" width="180">
+</p>
+
 # arVIPAspectro
 
 **arVIPAspectro** is a high-precision Python package for calibrating, analyzing, and extracting physical acoustic parameters from Angle-Resolved Virtually Imaged Phased Array (ar-VIPA) Brillouin Light Scattering (BLS) spectrometers.
@@ -18,6 +22,13 @@ arVIPAspectro/
 │   ├── q_vector.py                   # Step 14: 2D concentric coaxial ellipse & q-dispersion
 │   ├── q_vector_extraction.py        # Step 14: Standalone wrapper & CLI runner
 │   └── plotting.py                   # Comprehensive diagnostic plotting suite (Figs 2 to 14B)
+├── _static/                          # Project assets and branding icon
+├── docs/                             # Complete pipeline documentation and mathematical theory
+├── local_codes/                      # Modular partial processing scripts (git-ignored)
+│   ├── calib_laser.py                # Steps 1–6 (laser reference calibration)
+│   ├── calib_Rb.py                   # Steps 7–10B (Rubidium absorption & 2D frequency map)
+│   ├── peak_fit.py                   # Steps 11–13 (autonomous DHO peak fitting)
+│   └── analysis_results.py           # Steps 14–15 (q-vector & speed of sound extraction)
 ├── main.py                           # Top-level pipeline orchestrator script
 ├── pyproject.toml                    # Modern PEP 517/621 package metadata
 └── README.md
