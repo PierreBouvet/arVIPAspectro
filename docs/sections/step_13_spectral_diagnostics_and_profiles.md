@@ -39,6 +39,6 @@ In an ideal angle-resolved BLS spectrometer:
 ## Code Implementation
 - **Function**: `plot_fringe_shift_and_linewidth_overview(...)`
 - **Function**: `plot_per_fringe_breakdown(...)`
-- **Module**: [`arVIPAspectro/plotting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/plotting.py#L380-L465)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L488-L515)
+- **Module**: [`arVIPAspectro/plotting.py`](file:/arVIPAspectro/plotting.py#L380-L465)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L488-L515)
 - **Diagnostic Plots**: Figure 13 (`13 - <sample> shift and linewidth values.png`) and Figure 13B (`13B - <sample> per-fringe breakdown.png`)

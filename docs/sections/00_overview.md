@@ -61,6 +61,6 @@ The VIPA spectrometer enables single-shot angle-resolved spectroscopy by utilizi
 ---
 
 ## Code Implementation
-- **Master Orchestrator**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py)
-- **Library Package**: [`arVIPAspectro/arVIPAspectro/`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro)
-- **Configuration & Constants**: [`arVIPAspectro/arVIPAspectro/config.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/config.py)
+- **Master Orchestrator**: [`arVIPAspectro/main.py`](file:/main.py)
+- **Library Package**: [`arVIPAspectro/arVIPAspectro/`](file:/arVIPAspectro)
+- **Configuration & Constants**: [`arVIPAspectro/arVIPAspectro/config.py`](file:/arVIPAspectro/config.py)

@@ -1,6 +1,6 @@
 # arVIPAspectro — Complete Pipeline Documentation & Theory Guide
 
-> **Automated Build**: Generated on `2026-11-10 10:07:01` (Commit `d68eb53`).
+> **Automated Build**: Generated on `2026-11-10 10:19:30` (Commit `591157d`).
 > This document is automatically compiled from individual step modules in [`sections/`](sections/).
 > To regenerate, run `python build_docs.py`.
 
@@ -91,9 +91,9 @@ The VIPA spectrometer enables single-shot angle-resolved spectroscopy by utilizi
 ---
 
 ## Code Implementation
-- **Master Orchestrator**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py)
-- **Library Package**: [`arVIPAspectro/arVIPAspectro/`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro)
-- **Configuration & Constants**: [`arVIPAspectro/arVIPAspectro/config.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/config.py)
+- **Master Orchestrator**: [`arVIPAspectro/main.py`](file:/main.py)
+- **Library Package**: [`arVIPAspectro/arVIPAspectro/`](file:/arVIPAspectro)
+- **Configuration & Constants**: [`arVIPAspectro/arVIPAspectro/config.py`](file:/arVIPAspectro/config.py)
 
 ---
 
@@ -116,8 +116,8 @@ The VIPA spectrometer enables single-shot angle-resolved spectroscopy by utilizi
 
 ## Code Implementation
 - **Function**: `create_wrapper(directory, name='Measures.h5', exclude_dir=None)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L22-L55)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L115-L125)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L22-L55)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L115-L125)
 - **Relation to Algorithm**: Step 1 establishes the root wrapper object passed sequentially to all subsequent calibration and fitting steps.
 
 ---
@@ -145,10 +145,7 @@ The VIPA spectrometer enables single-shot angle-resolved spectroscopy by utilizi
 ---
 
 ## Physical Rationale
-The VIPA etalon has a partial internal reflection coating ($R \approx 95\%$) on its exit face and a highly reflective coating ($R \approx 100\%$) on its front face. Diffuse scattering from imperfect optical polishing, dust, and non-interfering reflections generates an intense, non-uniform pedestal under the interference fringes. Failing to subtract this background causes:
-- Centroid shifts toward the background gradient.
-- Erroneous peak width estimation.
-- Degradation of the gnomonic coordinate fit.
+The detector captures light coming from different phenomena: the laser light being spatio-spectrally dispersed by the spectrometer of course but also noise arising from autofluorescence from the Rubidium cell, parasistic light being reflected on the anti-reflection coated surfaces, ... The role of this step is to capture how the spectrometer disperses spectrally a signal in a qualitative manner, by observing its response to a monochromatic light. This beam being extremely spectrally tight (lower than 1 MHz), we expect (and see) a response of the spectrometer that is essentially composed of narrow lines. These these lines being much narrower than the noise, to improve their identification, we remove any artifacts larger than a few hundreds of MHz. This filtering drastically the quality of the obtained frequency map and sometimes even allows it altogether.
 
 ---
 
@@ -169,8 +166,8 @@ The VIPA etalon has a partial internal reflection coating ($R \approx 95\%$) on 
 ## Code Implementation
 - **Function**: `extract_baseline_image_morphology(image, scale=9, ksize=9, ksize_blur=11)`
 - **Function**: `denoise_image(wrapper, path_group, name_dataset, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L58-L108)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L18-L36), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L130-L155)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L58-L108)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L18-L36), invoked in [`arVIPAspectro/main.py`](file:/main.py#L130-L155)
 - **Diagnostic Plot**: Figure 2 (`2 - Denoise laser reference.png`)
 
 ---
@@ -217,8 +214,8 @@ The monochromatic laser beam transmits through the VIPA etalon at discrete angle
 
 ## Code Implementation
 - **Function**: `extract_fringes(image, image_raw, y_center=750, distance=100, var=5, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L110-L208)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L38-L70), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L158-L180)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L110-L208)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L38-L70), invoked in [`arVIPAspectro/main.py`](file:/main.py#L158-L180)
 - **Diagnostic Plot**: Figure 3 (`3 - Extract fringe laser reference.png`)
 
 ---
@@ -270,8 +267,8 @@ At the VIPA dispersion scale ($\sim 0.5\text{ GHz/px}$), an uncertainty of $0.5\
 
 ## Code Implementation
 - **Function**: `subpixel_center_coordinates_and_interpolate_zeros(data_fringes, image, image_raw, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L210-L295)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L72-L100), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L183-L208)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L210-L295)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L72-L100), invoked in [`arVIPAspectro/main.py`](file:/main.py#L183-L208)
 - **Diagnostic Plot**: Figure 4 (`4 - Refine fringe laser reference.png`)
 
 ---
@@ -327,8 +324,8 @@ The interference condition of a Fabry-Pérot or VIPA etalon depends on the inter
 ## Code Implementation
 - **Function**: `_geom_residuals_px(params, data_fringes, f_px, ...)`
 - **Function**: `fit_gnomonic_geometry(data_fringes, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L300-L380)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L102-L175), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L211-L245)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L300-L380)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L102-L175), invoked in [`arVIPAspectro/main.py`](file:/main.py#L211-L245)
 - **Diagnostic Plot**: Figure 5 (`5 - Fit laser reference geometry.png`)
 
 ---
@@ -382,8 +379,8 @@ The 2D Anamorphic Order Surface achieves **$0.00\text{ MHz}$ inter-order bias** 
 ## Code Implementation
 - **Function**: `fit_anamorphic_order_surface(g_vals, y_vals, orders, order_deg=4)`
 - **Function**: `eval_anamorphic_order_surface(g_grid, y_grid, c_matrix, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L385-L450)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L177-L235), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L248-L280)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L385-L450)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L177-L235), invoked in [`arVIPAspectro/main.py`](file:/main.py#L248-L280)
 - **Diagnostic Plot**: Figure 6 (`6 - Order vs g laser reference.png`)
 
 ---
@@ -441,8 +438,8 @@ Unlike optical cavity lengths that drift with ambient temperature, humidity, and
 ## Code Implementation
 - **Function**: `rubidium_absorption_spectrum(T_C, L_cm, ...)`
 - **Function**: `create_rubidium_reference_table(...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L480-L560)
-- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/Rb_calib.py#L18-L90), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L283-L305)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L480-L560)
+- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:/arVIPAspectro/Rb_calib.py#L18-L90), invoked in [`arVIPAspectro/main.py`](file:/main.py#L283-L305)
 - **Diagnostic Plot**: Figure 7 (`7 - Theoretical Rubidium Spectrum.png`)
 
 ---
@@ -482,8 +479,8 @@ When the broad laser beam passes through the heated Rubidium vapor cell ($70^\ci
 
 ## Code Implementation
 - **Function**: `denoise_image(wrapper, 'Rb_absorption', ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L90-L108)
-- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/Rb_calib.py#L92-L140), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L308-L330)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L90-L108)
+- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:/arVIPAspectro/Rb_calib.py#L92-L140), invoked in [`arVIPAspectro/main.py`](file:/main.py#L308-L330)
 - **Diagnostic Plot**: Figure 8 (`8 - Denoise rubidium absorption.png`)
 
 ---
@@ -527,8 +524,8 @@ Because the VIPA interference fringes are curved in 2D space, integrating vertic
 
 ## Code Implementation
 - **Function**: `extract_profiles_2d(image, xc, yc, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L565-L620)
-- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/Rb_calib.py#L142-L195), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L333-L355)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L565-L620)
+- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:/arVIPAspectro/Rb_calib.py#L142-L195), invoked in [`arVIPAspectro/main.py`](file:/main.py#L333-L355)
 - **Diagnostic Plot**: Figure 9 (`9 - Radial profile rubidium absorption.png`)
 
 ---
@@ -581,8 +578,8 @@ The manufacturer's nominal FSR specification ($\sim 30\text{ GHz}$) is only appr
 
 ## Code Implementation
 - **Function**: `calibrate_vipa_fsr_with_rubidium(profile_1d, T_Rb, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L625-L710)
-- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/Rb_calib.py#L197-L265), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L358-L380)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L625-L710)
+- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:/arVIPAspectro/Rb_calib.py#L197-L265), invoked in [`arVIPAspectro/main.py`](file:/main.py#L358-L380)
 - **Diagnostic Plot**: Figure 10 (`10 - Calibrate FSR and offset.png`)
 
 ---
@@ -629,8 +626,8 @@ To fit Brillouin peaks across the entire detector image without spatial interpol
 
 ## Code Implementation
 - **Function**: `eval_anamorphic_order_surface(...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L420-L460)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L383-L415)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L420-L460)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L383-L415)
 - **Diagnostic Plot**: Figure 10B (`10B - Frequency map.png`)
 
 ---
@@ -689,8 +686,8 @@ Because Brillouin scattering generates Stokes and Anti-Stokes phonons of strictl
 
 ## Code Implementation
 - **Function**: `calibrate_sample_frequency_map(freq_map_base, data_clean_in, ...)`
-- **Module**: [`arVIPAspectro/spectrum_fitting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/spectrum_fitting.py#L18-L150)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L418-L445)
+- **Module**: [`arVIPAspectro/spectrum_fitting.py`](file:/arVIPAspectro/spectrum_fitting.py#L18-L150)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L418-L445)
 - **Diagnostic Plot**: Figure 11 (`11 - In-situ frequency map calibration.png`)
 
 ---
@@ -751,8 +748,8 @@ Fitting an empirical Gaussian or symmetric Lorentzian systematically biases the 
 ## Code Implementation
 - **Function**: `fit_dho_batched(nu_cube, I_cube, p0_mat, ...)`
 - **Function**: `fit_sample_dho_peaks(data_sample_clean, freq_corr, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L715-L870) and [`arVIPAspectro/spectrum_fitting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/spectrum_fitting.py#L152-L310)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L448-L485)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L715-L870) and [`arVIPAspectro/spectrum_fitting.py`](file:/arVIPAspectro/spectrum_fitting.py#L152-L310)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L448-L485)
 
 ---
 
@@ -797,8 +794,8 @@ In an ideal angle-resolved BLS spectrometer:
 ## Code Implementation
 - **Function**: `plot_fringe_shift_and_linewidth_overview(...)`
 - **Function**: `plot_per_fringe_breakdown(...)`
-- **Module**: [`arVIPAspectro/plotting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/plotting.py#L380-L465)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L488-L515)
+- **Module**: [`arVIPAspectro/plotting.py`](file:/arVIPAspectro/plotting.py#L380-L465)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L488-L515)
 - **Diagnostic Plots**: Figure 13 (`13 - <sample> shift and linewidth values.png`) and Figure 13B (`13B - <sample> per-fringe breakdown.png`)
 
 ---
@@ -878,15 +875,15 @@ Recovering the aspect ratio $\gamma$ restores isotropic spherical symmetry ($r_{
 ---
 
 ## Code Implementation
-- **Pipeline Function**: `extract_q_vector(...)` in [`arVIPAspectro/q_vector.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/q_vector.py#L18-L177)
+- **Pipeline Function**: `extract_q_vector(...)` in [`arVIPAspectro/q_vector.py`](file:/arVIPAspectro/q_vector.py#L18-L177)
 - **Core Solvers**:
-  - `fit_concentric_ellipses_coaxial`: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L900-L960)
-  - `optimize_elliptical_symmetry_variance`: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L962-L1010)
-  - `fit_magnification_factor_M_theta`: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L1012-L1050)
-  - `compute_theta_and_q_vector`: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L1052-L1145)
+  - `fit_concentric_ellipses_coaxial`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L900-L960)
+  - `optimize_elliptical_symmetry_variance`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L962-L1010)
+  - `fit_magnification_factor_M_theta`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L1012-L1050)
+  - `compute_theta_and_q_vector`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L1052-L1145)
 - **Diagnostic Plots**:
-  - Figure 14: `plot_q_vector_dispersion` ([`arVIPAspectro/plotting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/plotting.py#L466-L587))
-  - Figure 14B: `plot_complete_diagnostic_suite` ([`arVIPAspectro/plotting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/plotting.py#L589-L825))
+  - Figure 14: `plot_q_vector_dispersion` ([`arVIPAspectro/plotting.py`](file:/arVIPAspectro/plotting.py#L466-L587))
+  - Figure 14B: `plot_complete_diagnostic_suite` ([`arVIPAspectro/plotting.py`](file:/arVIPAspectro/plotting.py#L589-L825))
 
 ---
 
@@ -928,8 +925,8 @@ Angle-resolved Brillouin experiments often span multiple samples, temperatures, 
 ## Code Implementation
 - **Function**: `save_q_vector_results(wrapper, path_sample, bin_val_h, bin_val_w, q_results)`
 - **Function**: `retrieve_q_vector_results(wrapper, path_sample, bin_val_h, bin_val_w)`
-- **Module**: [`arVIPAspectro/q_vector.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/q_vector.py#L205-L270)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L565-L572)
+- **Module**: [`arVIPAspectro/q_vector.py`](file:/arVIPAspectro/q_vector.py#L205-L270)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L565-L572)
 
 ---
 

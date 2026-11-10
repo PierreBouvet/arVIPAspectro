@@ -17,6 +17,6 @@
 
 ## Code Implementation
 - **Function**: `create_wrapper(directory, name='Measures.h5', exclude_dir=None)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L22-L55)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L115-L125)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L22-L55)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L115-L125)
 - **Relation to Algorithm**: Step 1 establishes the root wrapper object passed sequentially to all subsequent calibration and fitting steps.

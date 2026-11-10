@@ -40,6 +40,6 @@ The monochromatic laser beam transmits through the VIPA etalon at discrete angle
 
 ## Code Implementation
 - **Function**: `extract_fringes(image, image_raw, y_center=750, distance=100, var=5, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L110-L208)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L38-L70), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L158-L180)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L110-L208)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L38-L70), invoked in [`arVIPAspectro/main.py`](file:/main.py#L158-L180)
 - **Diagnostic Plot**: Figure 3 (`3 - Extract fringe laser reference.png`)

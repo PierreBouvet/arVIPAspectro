@@ -45,6 +45,6 @@ At the VIPA dispersion scale ($\sim 0.5\text{ GHz/px}$), an uncertainty of $0.5\
 
 ## Code Implementation
 - **Function**: `subpixel_center_coordinates_and_interpolate_zeros(data_fringes, image, image_raw, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L210-L295)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L72-L100), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L183-L208)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L210-L295)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L72-L100), invoked in [`arVIPAspectro/main.py`](file:/main.py#L183-L208)
 - **Diagnostic Plot**: Figure 4 (`4 - Refine fringe laser reference.png`)

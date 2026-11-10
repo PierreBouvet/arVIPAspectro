@@ -51,6 +51,6 @@ Unlike optical cavity lengths that drift with ambient temperature, humidity, and
 ## Code Implementation
 - **Function**: `rubidium_absorption_spectrum(T_C, L_cm, ...)`
 - **Function**: `create_rubidium_reference_table(...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L480-L560)
-- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/Rb_calib.py#L18-L90), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L283-L305)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L480-L560)
+- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:/arVIPAspectro/Rb_calib.py#L18-L90), invoked in [`arVIPAspectro/main.py`](file:/main.py#L283-L305)
 - **Diagnostic Plot**: Figure 7 (`7 - Theoretical Rubidium Spectrum.png`)

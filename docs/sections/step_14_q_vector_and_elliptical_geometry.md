@@ -73,12 +73,12 @@ Recovering the aspect ratio $\gamma$ restores isotropic spherical symmetry ($r_{
 ---
 
 ## Code Implementation
-- **Pipeline Function**: `extract_q_vector(...)` in [`arVIPAspectro/q_vector.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/q_vector.py#L18-L177)
+- **Pipeline Function**: `extract_q_vector(...)` in [`arVIPAspectro/q_vector.py`](file:/arVIPAspectro/q_vector.py#L18-L177)
 - **Core Solvers**:
-  - `fit_concentric_ellipses_coaxial`: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L900-L960)
-  - `optimize_elliptical_symmetry_variance`: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L962-L1010)
-  - `fit_magnification_factor_M_theta`: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L1012-L1050)
-  - `compute_theta_and_q_vector`: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L1052-L1145)
+  - `fit_concentric_ellipses_coaxial`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L900-L960)
+  - `optimize_elliptical_symmetry_variance`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L962-L1010)
+  - `fit_magnification_factor_M_theta`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L1012-L1050)
+  - `compute_theta_and_q_vector`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L1052-L1145)
 - **Diagnostic Plots**:
-  - Figure 14: `plot_q_vector_dispersion` ([`arVIPAspectro/plotting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/plotting.py#L466-L587))
-  - Figure 14B: `plot_complete_diagnostic_suite` ([`arVIPAspectro/plotting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/plotting.py#L589-L825))
+  - Figure 14: `plot_q_vector_dispersion` ([`arVIPAspectro/plotting.py`](file:/arVIPAspectro/plotting.py#L466-L587))
+  - Figure 14B: `plot_complete_diagnostic_suite` ([`arVIPAspectro/plotting.py`](file:/arVIPAspectro/plotting.py#L589-L825))

@@ -33,6 +33,6 @@ When the broad laser beam passes through the heated Rubidium vapor cell ($70^\ci
 
 ## Code Implementation
 - **Function**: `denoise_image(wrapper, 'Rb_absorption', ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L90-L108)
-- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/Rb_calib.py#L92-L140), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L308-L330)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L90-L108)
+- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:/arVIPAspectro/Rb_calib.py#L92-L140), invoked in [`arVIPAspectro/main.py`](file:/main.py#L308-L330)
 - **Diagnostic Plot**: Figure 8 (`8 - Denoise rubidium absorption.png`)

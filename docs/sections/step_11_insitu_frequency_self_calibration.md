@@ -52,6 +52,6 @@ Because Brillouin scattering generates Stokes and Anti-Stokes phonons of strictl
 
 ## Code Implementation
 - **Function**: `calibrate_sample_frequency_map(freq_map_base, data_clean_in, ...)`
-- **Module**: [`arVIPAspectro/spectrum_fitting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/spectrum_fitting.py#L18-L150)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L418-L445)
+- **Module**: [`arVIPAspectro/spectrum_fitting.py`](file:/arVIPAspectro/spectrum_fitting.py#L18-L150)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L418-L445)
 - **Diagnostic Plot**: Figure 11 (`11 - In-situ frequency map calibration.png`)

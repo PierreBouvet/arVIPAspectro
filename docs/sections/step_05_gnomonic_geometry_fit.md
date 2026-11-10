@@ -49,6 +49,6 @@ The interference condition of a Fabry-Pérot or VIPA etalon depends on the inter
 ## Code Implementation
 - **Function**: `_geom_residuals_px(params, data_fringes, f_px, ...)`
 - **Function**: `fit_gnomonic_geometry(data_fringes, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L300-L380)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L102-L175), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L211-L245)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L300-L380)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L102-L175), invoked in [`arVIPAspectro/main.py`](file:/main.py#L211-L245)
 - **Diagnostic Plot**: Figure 5 (`5 - Fit laser reference geometry.png`)

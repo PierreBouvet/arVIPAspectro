@@ -46,6 +46,6 @@ The manufacturer's nominal FSR specification ($\sim 30\text{ GHz}$) is only appr
 
 ## Code Implementation
 - **Function**: `calibrate_vipa_fsr_with_rubidium(profile_1d, T_Rb, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L625-L710)
-- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/Rb_calib.py#L197-L265), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L358-L380)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L625-L710)
+- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:/arVIPAspectro/Rb_calib.py#L197-L265), invoked in [`arVIPAspectro/main.py`](file:/main.py#L358-L380)
 - **Diagnostic Plot**: Figure 10 (`10 - Calibrate FSR and offset.png`)

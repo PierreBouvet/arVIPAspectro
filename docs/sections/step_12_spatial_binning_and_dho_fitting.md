@@ -54,5 +54,5 @@ Fitting an empirical Gaussian or symmetric Lorentzian systematically biases the 
 ## Code Implementation
 - **Function**: `fit_dho_batched(nu_cube, I_cube, p0_mat, ...)`
 - **Function**: `fit_sample_dho_peaks(data_sample_clean, freq_corr, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L715-L870) and [`arVIPAspectro/spectrum_fitting.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/spectrum_fitting.py#L152-L310)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L448-L485)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L715-L870) and [`arVIPAspectro/spectrum_fitting.py`](file:/arVIPAspectro/spectrum_fitting.py#L152-L310)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L448-L485)

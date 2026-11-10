@@ -21,10 +21,7 @@
 ---
 
 ## Physical Rationale
-The VIPA etalon has a partial internal reflection coating ($R \approx 95\%$) on its exit face and a highly reflective coating ($R \approx 100\%$) on its front face. Diffuse scattering from imperfect optical polishing, dust, and non-interfering reflections generates an intense, non-uniform pedestal under the interference fringes. Failing to subtract this background causes:
-- Centroid shifts toward the background gradient.
-- Erroneous peak width estimation.
-- Degradation of the gnomonic coordinate fit.
+The detector captures light coming from different phenomena: the laser light being spatio-spectrally dispersed by the spectrometer of course but also noise arising from autofluorescence from the Rubidium cell, parasistic light being reflected on the anti-reflection coated surfaces, ... The role of this step is to capture how the spectrometer disperses spectrally a signal in a qualitative manner, by observing its response to a monochromatic light. This beam being extremely spectrally tight (lower than 1 MHz), we expect (and see) a response of the spectrometer that is essentially composed of narrow lines. These these lines being much narrower than the noise, to improve their identification, we remove any artifacts larger than a few hundreds of MHz. This filtering drastically the quality of the obtained frequency map and sometimes even allows it altogether.
 
 ---
 
@@ -45,6 +42,6 @@ The VIPA etalon has a partial internal reflection coating ($R \approx 95\%$) on 
 ## Code Implementation
 - **Function**: `extract_baseline_image_morphology(image, scale=9, ksize=9, ksize_blur=11)`
 - **Function**: `denoise_image(wrapper, path_group, name_dataset, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L58-L108)
-- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/laser_calib.py#L18-L36), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L130-L155)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L58-L108)
+- **Pipeline Call**: [`arVIPAspectro/laser_calib.py`](file:/arVIPAspectro/laser_calib.py#L18-L36), invoked in [`arVIPAspectro/main.py`](file:/main.py#L130-L155)
 - **Diagnostic Plot**: Figure 2 (`2 - Denoise laser reference.png`)

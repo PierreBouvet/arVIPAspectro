@@ -36,5 +36,5 @@ Angle-resolved Brillouin experiments often span multiple samples, temperatures, 
 ## Code Implementation
 - **Function**: `save_q_vector_results(wrapper, path_sample, bin_val_h, bin_val_w, q_results)`
 - **Function**: `retrieve_q_vector_results(wrapper, path_sample, bin_val_h, bin_val_w)`
-- **Module**: [`arVIPAspectro/q_vector.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/q_vector.py#L205-L270)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L565-L572)
+- **Module**: [`arVIPAspectro/q_vector.py`](file:/arVIPAspectro/q_vector.py#L205-L270)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L565-L572)

@@ -40,6 +40,6 @@ To fit Brillouin peaks across the entire detector image without spatial interpol
 
 ## Code Implementation
 - **Function**: `eval_anamorphic_order_surface(...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L420-L460)
-- **Pipeline Call**: [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L383-L415)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L420-L460)
+- **Pipeline Call**: [`arVIPAspectro/main.py`](file:/main.py#L383-L415)
 - **Diagnostic Plot**: Figure 10B (`10B - Frequency map.png`)

@@ -37,6 +37,6 @@ Because the VIPA interference fringes are curved in 2D space, integrating vertic
 
 ## Code Implementation
 - **Function**: `extract_profiles_2d(image, xc, yc, ...)`
-- **Module**: [`arVIPAspectro/backend.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/backend.py#L565-L620)
-- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/arVIPAspectro/Rb_calib.py#L142-L195), invoked in [`arVIPAspectro/main.py`](file:///Users/pierrebouvet/Documents/Code/Treatment/ar_BLS/AI%20codes/arVIPAspectro/main.py#L333-L355)
+- **Module**: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L565-L620)
+- **Pipeline Call**: [`arVIPAspectro/Rb_calib.py`](file:/arVIPAspectro/Rb_calib.py#L142-L195), invoked in [`arVIPAspectro/main.py`](file:/main.py#L333-L355)
 - **Diagnostic Plot**: Figure 9 (`9 - Radial profile rubidium absorption.png`)
