@@ -269,3 +269,23 @@ def compute_and_save_frequency_map(wrapper, path_group, img_shape, x0_fit, y0_fi
     wrapper.add_attributes(attributes, parent_group=path_group, overwrite=True)
 
     return freq_map, phi_order_map, xi_elastic_rb85
+
+
+def retrieve_frequency_map(wrapper, path_group):
+    """
+    Retrieves the 2D calibrated frequency map and associated calibration attributes from HDF5.
+    """
+    children = wrapper.get_children_elements(path_group)
+    if 'Frequency' not in children:
+        return None, None
+
+    attributes = wrapper.get_attributes(path_group)
+    if 'FSR' not in attributes or 'y0_fit' not in attributes:
+        return None, None
+
+    try:
+        freq_map = wrapper[f'{path_group}/Frequency'].astype(np.float64)
+        return freq_map, attributes
+    except Exception:
+        return None, None
+

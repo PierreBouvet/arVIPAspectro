@@ -230,6 +230,7 @@ calib_results = laser_calib.calibrate_anamorphic_order_surface(
     deg=4,
     lower_order_study=lower_order_study
 )
+laser_calib.save_anamorphic_surface_calibration(wrapper, path_h5_laser, calib_results)
 
 print(f"Step 6 - 2D Anamorphic Surface RMS: {calib_results['rms_raw_mhz']:.2f} MHz raw | "
       f"{calib_results['rms_smooth_mhz']:.2f} MHz smoothed.")

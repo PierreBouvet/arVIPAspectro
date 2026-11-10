@@ -307,3 +307,66 @@ def calibrate_anamorphic_order_surface(wrapper, path_group,
         results['err_quad_mhz'] = (q_pred_quad - all_k_laser) * fsr_vipa * 1e3
 
     return results
+
+
+def save_anamorphic_surface_calibration(wrapper, path_group, calib_results):
+    """
+    Persists 2D anamorphic polynomial order surface coefficients and normalization constants into HDF5.
+    """
+    wrapper.add_other(
+        data=calib_results['c_2d_order'],
+        parent_group=path_group,
+        name='c_2d_order',
+        overwrite=True
+    )
+    wrapper.add_other(
+        data=calib_results['g_bar'],
+        parent_group=path_group,
+        name='g_bar',
+        overwrite=True
+    )
+    wrapper.add_other(
+        data=calib_results['q_orders'],
+        parent_group=path_group,
+        name='q_orders',
+        overwrite=True
+    )
+    attributes = {
+        'g_mean_ref': float(calib_results['g_mean_ref']),
+        'g_std_ref': float(calib_results['g_std_ref']),
+        'L_y': float(calib_results['L_y']),
+        'rms_raw_mhz': float(calib_results['rms_raw_mhz']),
+        'rms_smooth_mhz': float(calib_results['rms_smooth_mhz']),
+    }
+    wrapper.add_attributes(attributes=attributes, parent_group=path_group, overwrite=True)
+
+
+def retrieve_anamorphic_surface_calibration(wrapper, path_group):
+    """
+    Retrieves 2D anamorphic polynomial order surface coefficients and normalization constants from HDF5.
+    """
+    children = wrapper.get_children_elements(path_group)
+    if 'c_2d_order' not in children or 'g_bar' not in children or 'q_orders' not in children:
+        return None
+
+    attributes = wrapper.get_attributes(path_group)
+    if 'g_mean_ref' not in attributes or 'g_std_ref' not in attributes or 'L_y' not in attributes:
+        return None
+
+    try:
+        c_2d_order = wrapper[f'{path_group}/c_2d_order'].astype(np.float64)
+        g_bar = wrapper[f'{path_group}/g_bar'].astype(np.float64)
+        q_orders = wrapper[f'{path_group}/q_orders'].astype(np.float64)
+        return {
+            'c_2d_order': c_2d_order,
+            'g_bar': g_bar,
+            'q_orders': q_orders,
+            'g_mean_ref': float(attributes['g_mean_ref']),
+            'g_std_ref': float(attributes['g_std_ref']),
+            'L_y': float(attributes['L_y']),
+            'rms_raw_mhz': float(attributes.get('rms_raw_mhz', np.nan)),
+            'rms_smooth_mhz': float(attributes.get('rms_smooth_mhz', np.nan)),
+        }
+    except Exception:
+        return None
+

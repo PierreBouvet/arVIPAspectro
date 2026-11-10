@@ -23,3 +23,6 @@ ENV/
 figures/
 *.png
 *.pdf
+
+# Local processing scripts
+
