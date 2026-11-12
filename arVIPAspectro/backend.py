@@ -266,9 +266,9 @@ def direction_cosine(x, y, x0, y0, f, phi):
 
 def g_function(u, n_r):
     """
-    Internal refraction geometric factor g(u) = sqrt(u^2 + n_r^2 - 1).
+    Internal refraction geometric factor g(u) = sqrt(u^2 + n_r^2 - 1)/n_r.
     """
-    return np.sqrt(np.asarray(u, float)**2 + n_r**2 - 1.0)
+    return np.sqrt(np.asarray(u, float)**2 + n_r**2 - 1.0)/n_r
 
 
 def g_from_xy(x, y, x0, y0, f, phi, n_r):

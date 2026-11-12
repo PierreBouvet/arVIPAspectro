@@ -14,8 +14,17 @@
 2. **VIPA Tilt Rotation & Internal Refraction**:
    With the VIPA normal $\hat{\mathbf{n}}$ tilted by angle $\phi \approx 2.6^\circ$ in the horizontal $xz$-plane ($\hat{\mathbf{n}} = (-\sin\phi, 0, \cos\phi)^T$), the external directional cosine is:
    $$u(x, y; x_0, y_0) = \hat{\mathbf{k}} \cdot \hat{\mathbf{n}} = \frac{f \cos\phi - (x - x_0)\sin\phi}{\sqrt{f^2 + (x - x_0)^2 + (y - y_0)^2}}$$
-   By Snell's law, the cosine of the internal propagation angle $\theta_{\mathrm{int}}$ inside fused silica ($n_r$) is:
-   $$g(x, y; x_0, y_0) = \cos\theta_{\mathrm{int}} = \sqrt{u(x, y; x_0, y_0)^2 + n_r^2 - 1}$$
+   By Snell's law, the cosine of the internal propagation angle $\theta_{\mathrm{int}}$ inside fused silica (of refractive index $n^\prime$) as function of the propagation in the surrounding medium (of refractive index $n$) is:
+   $$n^\prime \sin\theta_{\mathrm{int}} = n \sin \theta_{\mathrm{ext}}$$
+   <!-- $$(n^\prime)^2 (1-\cos^2\theta_{\mathrm{int}}) = n^2 (1 - \cos \theta_{\mathrm{ext}})$$
+   $$(n^\prime)^2 (1-\cos^2\theta_{\mathrm{int}}) = n^2 (1 - u(x, y; x_0, y_0)^2)$$
+   $$(n^\prime)^2-(n^\prime)^2\cos^2\theta_{\mathrm{int}} =  n^2 - n^2u(x, y; x_0, y_0)^2$$
+   $$(n^\prime)^2\cos^2\theta_{\mathrm{int}} = n^2u(x, y; x_0, y_0)^2-n^2+(n^\prime)^2$$
+   $$(n_r)^2\cos^2\theta_{\mathrm{int}} = u(x, y; x_0, y_0)^2-1+(n_r)^2$$ -->
+  which, setting $n_r = n^\prime/n$ writes:
+   $$n_r\cos\theta_{\mathrm{int}} = \sqrt{u(x, y; x_0, y_0)^2-1+n_r^2}$$
+  leading to the definition of $g$, the directional cosine inside the etalon:
+   $$g(x, y; x_0, y_0) = \cos\theta_{\mathrm{int}} = \frac{\sqrt{u(x, y; x_0, y_0)^2 + n_r^2 - 1}}{n_r}$$
 3. **Levenberg-Marquardt Optimization**:
    Because the laser is strictly monochromatic, all points on a given fringe order $q$ must correspond to the exact same internal interference angle $\cos\theta_{\mathrm{int}} = \bar{g}_q$. The optical axis $(x_0, y_0)$ is obtained by minimizing the intra-fringe residual variance across all 11 orders simultaneously:
    $$\min_{x_0, y_0} \sum_{q=0}^{10} \sum_{i \in \mathcal{F}_q} \Big[ 10^5 \cdot \big(g(x_i, y_i; x_0, y_0) - \bar{g}_q\big) \Big]^2$$
