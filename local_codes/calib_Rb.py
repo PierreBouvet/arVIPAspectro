@@ -33,16 +33,37 @@ from arVIPAspectro import plotting
 # Paths & Execution Configuration
 # ==============================================================================
 
-DATA_DIR = '/Volumes/LAUDATE/Data/260916 - arBLS/261105'
+DATA_DIR = '/Volumes/LAUDATE/Data/260916 - arBLS/261110'
 TARGET_FILE = 'Measures.h5'
 FIGURE_DIRECTORY_NAME = 'figures'
 OUT_DIR = os.path.join(DATA_DIR, FIGURE_DIRECTORY_NAME)
 os.makedirs(OUT_DIR, exist_ok=True)
 
 FIGURE_PREFIX = ''
-SHOW_PLOTS = True
+SHOW_PLOTS = False
 FORCE_ALL_PROCESS = 1
 FORCE_PLOT_ALL = 1
+
+# ==============================================================================
+# HDF5 Hierarchy Defaults
+# ==============================================================================
+GROUP_INTEREST = 'Brillouin'
+PATH_LASER_REF = 'laser_reference'
+PATH_RB_ABSORPTION = 'Rb_absorption'
+
+# ==============================================================================
+# Rubidium Calibration Parameters (Steps 7 to 10B)
+# ==============================================================================
+T_CELL = 70.0                               # Temperature of Rubidium cell (Celsius)
+L_CELL = 0.07                               # Path length of Rubidium vapor cell (m)
+
+SCALE_RB = 9                                # Downsampling factor for Rb morphological baseline
+KSIZE_STRUCTURING_ELEMENTS_RB = 3           # Structuring element size for Rb baseline
+KSIZE_BLUR_RB = 11                          # Gaussian blur kernel size for Rb baseline
+
+DELTA_NU_LASER_OFFSET = -2.0                 # Initial coarse laser offset guess (GHz)
+FIT_WINDOW_GHZ = 10.0                       # Fitting window around Rb D2 center (GHz)
+RB_LOCK_OFFSET_GHZ = 1.323                  # 85Rb F=2 absorption line offset from D2 center (GHz)
 
 # Execution flags per step: (plot_*, stop_*, force_*)
 # Step 7: Theoretical Rubidium Spectrum Model
@@ -72,7 +93,7 @@ stop_freq_map = 0
 # Open HDF5 Container & Check Prerequisite Laser Calibration (Steps 1-6)
 # ==============================================================================
 wrapper = bck.create_wrapper(DATA_DIR, TARGET_FILE, exclude_dir=[FIGURE_DIRECTORY_NAME])
-path_h5_laser = f'{config.GROUP_INTEREST}/{config.PATH_LASER_REF}'
+path_h5_laser = f'{GROUP_INTEREST}/{PATH_LASER_REF}'
 
 if 'x0_fit_circular' not in wrapper.get_attributes(path_h5_laser):
     sys.exit(
@@ -97,7 +118,7 @@ print(f"Loaded laser calibration: optical axis ({x0_fit:.2f}, {y0_fit:.2f}) px |
 # 07 - Theoretical Natural Rubidium D2 Absorption Spectrum Model
 # ==============================================================================
 det_table_MHz, trans_table, trans_fast = Rb_calib.create_rubidium_reference_table(
-    T_cell=config.T_CELL, L_cell=config.L_CELL
+    T_cell=T_CELL, L_cell=L_CELL
 )
 print('Step 7 - Created theoretical reference table for Rubidium D2 absorption.')
 
@@ -111,7 +132,7 @@ if stop_Rb_absorption:
 # ==============================================================================
 # 08 - Rubidium Absorption Image Denoising
 # ==============================================================================
-path_h5_rb = f'{config.GROUP_INTEREST}/{config.PATH_RB_ABSORPTION}'
+path_h5_rb = f'{GROUP_INTEREST}/{PATH_RB_ABSORPTION}'
 data_absorption_raw = wrapper[f'{path_h5_rb}/image'].astype(np.float64)
 
 if not force_denoise_Rb and 'image_corrected' in wrapper.get_children_elements(path_h5_rb):
@@ -120,9 +141,9 @@ if not force_denoise_Rb and 'image_corrected' in wrapper.get_children_elements(p
 else:
     data_absorption, baseline_absorption = Rb_calib.denoise_rb(
         wrapper, path_h5_rb, data_absorption_raw,
-        scale=config.SCALE_RB,
-        ksize_structuring_elements=config.KSIZE_STRUCTURING_ELEMENTS_RB,
-        ksize_blur=config.KSIZE_BLUR_RB
+        scale=SCALE_RB,
+        ksize_structuring_elements=KSIZE_STRUCTURING_ELEMENTS_RB,
+        ksize_blur=KSIZE_BLUR_RB
     )
     print('Step 8 - Denoised Rubidium absorption spectrum and stored it in H5 file.')
 
@@ -176,8 +197,8 @@ if not force_Rb_calibration and 'FSR' in rb_attrs:
         avg_spectrum_radius,
         trans_fast,
         nu_0=config.nu_0,
-        fit_window_ghz=config.FIT_WINDOW_GHZ,
-        delta_nu_laser_offset=config.DELTA_NU_LASER_OFFSET
+        fit_window_ghz=FIT_WINDOW_GHZ,
+        delta_nu_laser_offset=DELTA_NU_LASER_OFFSET
     )
     print(f"Step 10 - Retrieved calibrated FSR = {fsr_results['FSR_cal']:.4f} GHz, "
           f"delta_nu = {fsr_results['delta_nu_opt']:.3f} GHz from H5 file.")
@@ -190,8 +211,8 @@ else:
         avg_spectrum_radius,
         trans_fast,
         nu_0=config.nu_0,
-        fit_window_ghz=config.FIT_WINDOW_GHZ,
-        delta_nu_laser_offset=config.DELTA_NU_LASER_OFFSET
+        fit_window_ghz=FIT_WINDOW_GHZ,
+        delta_nu_laser_offset=DELTA_NU_LASER_OFFSET
     )
     print(f"Step 10 - Calibrated VIPA FSR = {fsr_results['FSR_cal']:.4f} GHz, "
           f"delta_nu = {fsr_results['delta_nu_opt']:.3f} GHz and saved in H5 file.")
@@ -234,7 +255,7 @@ freq_map, phi_order_map, xi_elastic = Rb_calib.compute_and_save_frequency_map(
     L_y=calib_results['L_y'],
     FSR_cal=fsr_results['FSR_cal'],
     delta_nu_opt=fsr_results['delta_nu_opt'],
-    rb_lock_offset_ghz=config.RB_LOCK_OFFSET_GHZ,
+    rb_lock_offset_ghz=RB_LOCK_OFFSET_GHZ,
     f_px=config.F_PX_DEFAULT,
     phi_rad=config.VIPA_TILT_ANGLE,
     n_r=config.N_FUSED_SILICA_780

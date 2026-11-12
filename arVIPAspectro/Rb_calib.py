@@ -19,7 +19,7 @@ except ImportError:
 # Step 7: Theoretical Rubidium D2 Absorption Spectrum Model
 # ==============================================================================
 
-def create_rubidium_reference_table(T_cell=config.T_CELL, L_cell=config.L_CELL,
+def create_rubidium_reference_table(T_cell=70.0, L_cell=0.07,
                                     det_min_MHz=-35e3, det_max_MHz=35e3, n_points=70001):
     """
     Computes a high-resolution theoretical natural Rubidium D2 transmission lookup table
@@ -51,9 +51,9 @@ def retrieve_denoised_rb(wrapper, path_group, name='image_corrected'):
 
 
 def denoise_rb(wrapper, path_group, data_absorption_raw,
-               scale=config.SCALE_RB,
-               ksize_structuring_elements=config.KSIZE_STRUCTURING_ELEMENTS_RB,
-               ksize_blur=config.KSIZE_BLUR_RB):
+               scale=9,
+               ksize_structuring_elements=3,
+               ksize_blur=11):
     """
     Denoises the Rubidium absorption figure using morphological opening,
     saves 'image_corrected' to HDF5, and returns (data_absorption, baseline_absorption).
@@ -111,8 +111,8 @@ def extract_radial_absorption_profile(data_absorption, xc_gnom, yc_gnom, y0_fit,
 
 def retrieve_fsr_calibration(wrapper, path_group, g_bar, q_orders, phi_order_r,
                              avg_spectrum_radius, trans_fast,
-                             nu_0=config.nu_0, fit_window_ghz=config.FIT_WINDOW_GHZ,
-                             delta_nu_laser_offset=config.DELTA_NU_LASER_OFFSET):
+                             nu_0=config.nu_0, fit_window_ghz=10.0,
+                             delta_nu_laser_offset=0.0):
     """
     Retrieves calibrated FSR and delta_nu from HDF5 attributes and reconstructs folded spectrum data.
     """
@@ -159,8 +159,8 @@ def retrieve_fsr_calibration(wrapper, path_group, g_bar, q_orders, phi_order_r,
 
 def calibrate_fsr_and_offset(wrapper, path_group, g_bar, q_orders, phi_order_r,
                              avg_spectrum_radius, trans_fast,
-                             nu_0=config.nu_0, fit_window_ghz=config.FIT_WINDOW_GHZ,
-                             delta_nu_laser_offset=config.DELTA_NU_LASER_OFFSET):
+                             nu_0=config.nu_0, fit_window_ghz=10.0,
+                             delta_nu_laser_offset=0.0):
     """
     Calibrates the absolute Free Spectral Range (FSR) and frequency offset by matching
     coherently folded multi-order absorption spectra with the theoretical Rb D2 model.
@@ -236,7 +236,7 @@ def calibrate_fsr_and_offset(wrapper, path_group, g_bar, q_orders, phi_order_r,
 
 def compute_and_save_frequency_map(wrapper, path_group, img_shape, x0_fit, y0_fit, xc_gnom, yc_gnom,
                                    c_2d_order, g_mean_ref, g_std_ref, L_y, FSR_cal, delta_nu_opt,
-                                   rb_lock_offset_ghz=config.RB_LOCK_OFFSET_GHZ,
+                                   rb_lock_offset_ghz=1.323,
                                    f_px=config.F_PX_DEFAULT,
                                    phi_rad=config.VIPA_TILT_ANGLE,
                                    n_r=config.N_FUSED_SILICA_780):

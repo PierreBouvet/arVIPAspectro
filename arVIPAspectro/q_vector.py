@@ -23,16 +23,17 @@ def extract_q_vector(
     data_source: Union[Dict, str, Path],
     path_sample: Optional[str] = None,
     wrapper=None,
-    bin_val_h: int = config.BIN_VAL_H,
-    bin_val_w: int = config.BIN_VAL_W,
-    refractive_index: float = config.N_SAMPLE,
+    bin_val_h: int = 4,
+    bin_val_w: int = 2,
+    refractive_index: float = 1.33,
     laser_wavelength: float = config.lambda_0,
-    use_errors: bool = config.USE_ERROR_WEIGHTING,
-    error_percentile_floor: float = config.ERROR_PERCENTILE_FLOOR,
-    average_pairs: bool = config.AVERAGE_STOKES_ANTISTOKES,
-    shift_bounds: Tuple[Optional[float], Optional[float]] = config.SHIFT_RANGE_SAMPLE,
-    linewidth_bounds: Tuple[Optional[float], Optional[float]] = config.LINEWIDTH_RANGE_SAMPLE,
-    initial_M_theta: float = config.INITIAL_M_THETA,
+    use_errors: bool = True,
+    error_percentile_floor: float = 1.0,
+    average_pairs: bool = True,
+    shift_bounds: Tuple[Optional[float], Optional[float]] = (4.8, 5.3),
+    linewidth_bounds: Tuple[Optional[float], Optional[float]] = (0.5, 1.2),
+    initial_M_theta: float = 3000.0,
+    fixed_ellipse_angle_deg: Optional[float] = 90.0,
     verbose: bool = True,
 ) -> Dict[str, Union[np.ndarray, float, Dict]]:
     """
@@ -47,6 +48,9 @@ def extract_q_vector(
         Internal HDF5 group path to the sample if data_source is an HDF5 wrapper.
     wrapper : Wrapper, optional
         Open HDF5 wrapper instance if extracting from an existing open file.
+    fixed_ellipse_angle_deg : float, optional
+        Imposed principal rotation angle phi of the concentric ellipses in degrees (e.g. 90.0).
+        If None, the rotation angle is freely optimized. Defaults to 90.0.
     """
     if verbose:
         print("\n" + "=" * 80)
@@ -103,6 +107,7 @@ def extract_q_vector(
         linewidth=linewidth_flat,
         shift_err=shift_err_flat if has_errors else None,
         linewidth_err=linewidth_err_flat if has_errors else None,
+        fixed_phi_deg=fixed_ellipse_angle_deg,
     )
 
     # 4. Refine ellipse parameters by minimizing radial residual variance
@@ -114,6 +119,7 @@ def extract_q_vector(
         shift_err=shift_err_flat if has_errors else None,
         linewidth_err=linewidth_err_flat if has_errors else None,
         initial_params=coaxial_fit,
+        fixed_phi_deg=fixed_ellipse_angle_deg,
     )
 
     # 5. Transform coordinates to spherical system
@@ -175,8 +181,13 @@ def extract_q_vector(
     }
 
     if verbose:
+        angle_mode_str = (
+            f"{opt_params['phi_deg']:+.2f}° (imposed)"
+            if fixed_ellipse_angle_deg is not None
+            else f"{opt_params['phi_deg']:+.2f}° (fitted)"
+        )
         print(f"  • Refined Ellipse Center : ({opt_params['xc']:.2f}, {opt_params['yc']:.2f}) px")
-        print(f"  • Principal Director Axis: {opt_params['phi_deg']:+.2f}°")
+        print(f"  • Principal Director Axis: {angle_mode_str}")
         print(f"  • Aspect Ratio γ         : {opt_params['gamma']:.4f}")
         print(f"  • Normal Shift S(0)      : {S0_fit:.4f} ± {S0_err:.4f} GHz")
         print(f"  • Magnification M_theta  : {M_theta_fit:.1f} ± {M_theta_err:.1f} px")

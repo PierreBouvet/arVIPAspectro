@@ -32,16 +32,22 @@ from arVIPAspectro import plotting
 # Paths & Execution Configuration
 # ==============================================================================
 
-DATA_DIR = '/Volumes/LAUDATE/Data/260916 - arBLS/261105'
+DATA_DIR = '/Volumes/LAUDATE/Data/260916 - arBLS/261110'
 TARGET_FILE = 'Measures.h5'
 FIGURE_DIRECTORY_NAME = 'figures'
 OUT_DIR = os.path.join(DATA_DIR, FIGURE_DIRECTORY_NAME)
 os.makedirs(OUT_DIR, exist_ok=True)
 
 FIGURE_PREFIX = ''
-SHOW_PLOTS = True
+SHOW_PLOTS = False
 FORCE_ALL_PROCESS = 1
 FORCE_PLOT_ALL = 1
+
+# ==============================================================================
+# HDF5 Hierarchy
+# ==============================================================================
+GROUP_INTEREST = 'Brillouin'
+PATH_LASER_REF = 'laser_reference'
 
 # Execution flags per step: (plot_*, stop_*, force_*)
 # Step 2: Laser Denoising
@@ -74,12 +80,13 @@ stop_2D_anamorphic_cal = 0
 # 01 - Open / Create HDF5 Wrapper
 # ==============================================================================
 wrapper = bck.create_wrapper(DATA_DIR, TARGET_FILE, exclude_dir=[FIGURE_DIRECTORY_NAME])
+
 print('Step 1 - Opened / created H5 file.')
 
 # ==============================================================================
 # 02 - Monochromatic Laser Reference Image & Denoising
 # ==============================================================================
-path_h5_laser = f'{config.GROUP_INTEREST}/{config.PATH_LASER_REF}'
+path_h5_laser = f'{GROUP_INTEREST}/{PATH_LASER_REF}'
 data_laser_reference = wrapper[f'{path_h5_laser}/image'].astype(np.float64)
 
 if not force_denoise_laser and 'image_corrected' in wrapper.get_children_elements(path_h5_laser):

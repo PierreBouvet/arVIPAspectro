@@ -58,7 +58,7 @@ KSIZE_BLUR_LASER = 11                       # Gaussian blur kernel size for base
 
 Y_CENTER_LASER = 1200                       # Approximate vertical axis of symmetry (px)
 DY_LASER = 50                               # Half-window height for row-averaging around symmetry axis (px)
-NB_LASER_MODES = 15                         # Expected number of laser reference fringes
+NB_LASER_MODES = 14                         # Expected number of laser reference fringes
 DISTANCE_PEAKS_LASER = 100                  # Minimum horizontal distance between peaks (px)
 DY_TRACE = 20                               # Window height for vertical fringe tracing
 VAR_TRACE = 2                               # Max horizontal step variation between consecutive rows (px)
@@ -68,51 +68,25 @@ SATURATION_LIMIT = 65000.0                  # Pixel saturation threshold (counts
 MIN_NET_AMP = 200.0                         # Minimum net peak amplitude above baseline (counts)
 
 # ==============================================================================
-# Default Rubidium Calibration Algorithm Parameters
+# Reference Sample Physical Parameters
+# (Tuned directly in main.py and local_codes scripts)
 # ==============================================================================
-T_CELL = 70.0                               # Temperature of Rubidium cell (Celsius)
-L_CELL = 0.07                               # Path length of Rubidium vapor cell (m)
 
-SCALE_RB = 9                                # Downsampling factor for Rb morphological baseline
-KSIZE_STRUCTURING_ELEMENTS_RB = 3           # Structuring element size for Rb baseline
-KSIZE_BLUR_RB = 11                          # Gaussian blur kernel size for Rb baseline
-
-DELTA_NU_LASER_OFFSET = 0.0                 # Initial coarse laser offset guess (GHz)
-FIT_WINDOW_GHZ = 10.0                       # Fitting window around Rb D2 center (GHz)
-RB_LOCK_OFFSET_GHZ = 1.323                  # 85Rb F=2 absorption line offset from D2 center (GHz)
-
-# ==============================================================================
-# Default Sample Spectrum Fitting (DHO) Parameters
-# ==============================================================================
-BIN_VAL_H = 4                               # Vertical spatial binning factor (pixels per bin)
-BIN_VAL_W = 2                               # Horizontal spatial binning factor (pixels per bin)
-# EXPECTED_BRILLOUIN_SHIFT = 9.7              # Expected Brillouin shift nu_B in GHz (e.g. 9.7 for plastic)
-EXPECTED_BRILLOUIN_SHIFT = 5.1              # Expected Brillouin shift nu_B in GHz (e.g. 9.7 for plastic)
-BRILLOUIN_SHIFT_TOLERANCE = 2.0             # Search half-window around expected shift in GHz
-EXPECTED_LINEWIDTH = 0.8                    # Expected Brillouin linewidth Gamma_B in GHz
-LINEWIDTH_BOUNDS = (0.4, 1.3)               # Acceptable linewidth range (min, max) in GHz
-N_ORDERS_SAMPLE = None                      # Number of Brillouin orders to fit (None = automatic detection)
-DHO_HW_PX = 12                              # Fitting half-window width in binned pixels
-DHO_MIN_AMP = 30.0                          # Minimum peak amplitude above chord baseline
-SIGMA_Y_BINS = 6.0                          # Smoothing length along vertical bins for in-situ calibration
-
-# ==============================================================================
-# Default Acoustic Wavevector (q-vector) Extraction Parameters
-# ==============================================================================
+# --- Polystyrene (Plastic) Reference ---
 # N_SAMPLE = 1.59                             # Refractive index of plastic (polystyrene) at 780 nm
-N_SAMPLE = 1.33                              # Refractive index of water at 780 nm
+# EXPECTED_BRILLOUIN_SHIFT = 9.7              # Expected Brillouin shift nu_B in GHz
+# BRILLOUIN_SHIFT_TOLERANCE = 2.0             # Search half-window around expected shift in GHz
+# EXPECTED_LINEWIDTH = 0.8                    # Expected Brillouin linewidth Gamma_B in GHz
+# LINEWIDTH_BOUNDS = (0.4, 1.3)               # Acceptable linewidth range (min, max) in GHz
 # SHIFT_RANGE_SAMPLE = (9.3, 9.9)             # Filtering range for Brillouin shift (GHz)
-SHIFT_RANGE_SAMPLE = (4.8, 5.3)             # Filtering range for Brillouin shift (GHz)
-LINEWIDTH_RANGE_SAMPLE = (0.5, 1.2)         # Filtering range for Brillouin linewidth (GHz)
-USE_ERROR_WEIGHTING = True                  # Statistical error-weighting (w_i = 1 / sigma_i)
-ERROR_PERCENTILE_FLOOR = 1.0                # Percentile floor to regularize tiny uncertainties
-AVERAGE_STOKES_ANTISTOKES = True            # Average paired Stokes & Anti-Stokes orders
-INITIAL_M_THETA = 3000.0                    # Initial guess for angular magnification factor M_theta (px)
+# LINEWIDTH_RANGE_SAMPLE = (0.5, 1.2)         # Filtering range for Brillouin linewidth (GHz)
 
-# ==============================================================================
-# HDF5 Hierarchy
-# ==============================================================================
-GROUP_INTEREST = 'Brillouin'
-PATH_LASER_REF = 'laser_reference'
-PATH_RB_ABSORPTION = 'Rb_absorption'
-PATH_SAMPLE = 'water_5s'
+# --- Water Reference ---
+# N_SAMPLE = 1.33                              # Refractive index of water at 780 nm
+# EXPECTED_BRILLOUIN_SHIFT = 5.1              # Expected Brillouin shift nu_B in GHz
+# BRILLOUIN_SHIFT_TOLERANCE = 2.0             # Search half-window around expected shift in GHz
+# EXPECTED_LINEWIDTH = 0.8                    # Expected Brillouin linewidth Gamma_B in GHz
+# LINEWIDTH_BOUNDS = (0.4, 1.3)               # Acceptable linewidth range (min, max) in GHz
+# SHIFT_RANGE_SAMPLE = (4.8, 5.3)             # Filtering range for Brillouin shift (GHz)
+# LINEWIDTH_RANGE_SAMPLE = (0.5, 1.2)         # Filtering range for Brillouin linewidth (GHz)
+

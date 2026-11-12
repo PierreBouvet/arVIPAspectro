@@ -595,7 +595,7 @@ def plot_q_vector_dispersion(
     plt.tight_layout()
 
     if out_dir is not None:
-        save_path = os.path.join(out_dir, f"{prefix}14 - Shift and linewidth vs q_vector.png")
+        save_path = os.path.join(out_dir, f"14 - {prefix} - Shift and linewidth vs q_vector.png")
         fig.savefig(save_path, dpi=250, bbox_inches="tight")
     if show_plots:
         plt.show()
@@ -690,7 +690,8 @@ def plot_complete_diagnostic_suite(
     ax = axes[0, 2]
     ax.scatter(r_sph, shift, c="royalblue", s=8, alpha=0.45, label="Experimental Shift")
     r_arr = np.linspace(0, np.max(r_sph), 200)
-    s_model = S0_fit * np.cos(np.arctan(r_arr / M_theta_fit) / 2.0)
+    u_arr = np.clip(r_arr / max(M_theta_fit, 1e-6), -0.999999, 0.999999)
+    s_model = S0_fit * np.cos(np.arcsin(u_arr) / 2.0)
     ax.plot(
         r_arr,
         s_model,
@@ -712,7 +713,7 @@ def plot_complete_diagnostic_suite(
 
     formula_box = (
         r"$\mathbf{Kinematic\ Model:}$" + "\n"
-        r"$\mathrm{Shift}(r_{\mathrm{sph}}) = S_0 \cdot \cos\left(\frac{1}{2}\arctan\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$" + "\n"
+        r"$\mathrm{Shift}(r_{\mathrm{sph}}) = S_0 \cdot \cos\left(\frac{1}{2}\arcsin\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$" + "\n"
         f"{s0_text}\n"
         f"{m_text}"
     )
@@ -823,7 +824,7 @@ def plot_complete_diagnostic_suite(
     plt.tight_layout()
 
     if out_dir is not None:
-        save_path = os.path.join(out_dir, f"{prefix}14B - Complete elliptical qvector diagnostics.png")
+        save_path = os.path.join(out_dir, f"14B - {prefix} - Complete elliptical qvector diagnostics.png")
         fig.savefig(save_path, dpi=250, bbox_inches="tight")
     if show_plots:
         plt.show()

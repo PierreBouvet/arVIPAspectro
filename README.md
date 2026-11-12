@@ -21,7 +21,14 @@ arVIPAspectro/
 │   ├── spectrum_fitting.py           # Steps 11–13: In-situ self-calibration & vectorized DHO fits
 │   ├── q_vector.py                   # Step 14: 2D concentric coaxial ellipse & q-dispersion
 │   ├── q_vector_extraction.py        # Step 14: Standalone wrapper & CLI runner
-│   └── plotting.py                   # Comprehensive diagnostic plotting suite (Figs 2 to 14B)
+│   ├── plotting.py                   # Comprehensive diagnostic plotting suite (Figs 2 to 14B)
+│   └── gui/                          # Interactive PySide6 GUI Application Suite
+│       ├── __init__.py               # GUI launcher function
+│       ├── app.py                    # Main window & layout orchestrator
+│       ├── canvas.py                 # Matplotlib canvas & multi-view visualizer
+│       ├── h5_explorer.py            # HDF5 hierarchy browser & spectrum selector
+│       ├── step_widgets.py           # Collapsible parameter sections & step cards
+│       └── workers.py                # Asynchronous background execution threads
 ├── _static/                          # Project assets and branding icon
 ├── docs/                             # Complete pipeline documentation and mathematical theory
 ├── local_codes/                      # Modular partial processing scripts (git-ignored)
@@ -30,6 +37,8 @@ arVIPAspectro/
 │   ├── peak_fit.py                   # Steps 11–13 (autonomous DHO peak fitting)
 │   └── analysis_results.py           # Steps 14–15 (q-vector & speed of sound extraction)
 ├── main.py                           # Top-level pipeline orchestrator script
+├── gui.py                            # Standalone GUI launcher script
+├── run_gui.sh                        # Shell launcher activating virtual environment
 ├── pyproject.toml                    # Modern PEP 517/621 package metadata
 └── README.md
 ```
@@ -47,12 +56,25 @@ pip install -e .
 
 ## Quick Usage
 
-### 1. Running the Full Pipeline
+### 1. Interactive Graphical User Interface (GUI)
+Launch the 2-frame interactive GUI application:
+```bash
+./run_gui.sh
+# or
+python gui.py [path/to/Measures.h5]
+```
+- **Left Frame**: Interactive Matplotlib visualizer with figure switcher dropdown, colormaps, cursor readout, and navigation toolbar.
+- **Right Frame (Dual Tab)**:
+  - **📁 HDF5 Data Explorer**: Inspect HDF5 hierarchy, preview 1D/2D datasets directly, convert `.dat` directories, and assign dataset roles.
+  - **⚙ Processing Steps**: Collapsible accordion cards for Laser calibration, Rb calibration, DHO peak fitting (with single and batch mode), and acoustic dispersion analysis.
+- **Bottom Frame**: Collapsible execution log console with live output, progress bar, and status indicators.
+
+### 2. Running the Full Pipeline via CLI
 ```bash
 python main.py
 ```
 
-### 2. Importing as a Python Module
+### 3. Importing as a Python Module
 ```python
 import arVIPAspectro as ar
 from arVIPAspectro import backend as bck

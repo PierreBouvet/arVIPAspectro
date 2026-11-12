@@ -26,12 +26,12 @@ def calibrate_sample_frequency_map(
     yy_in,
     fsr_val,
     y0_center,
-    bin_val_h=config.BIN_VAL_H,
-    bin_val_w=config.BIN_VAL_W,
+    bin_val_h=4,
+    bin_val_w=2,
     n_orders=None,
-    sigma_y_bins=config.SIGMA_Y_BINS,
-    expected_shift=config.EXPECTED_BRILLOUIN_SHIFT,
-    shift_tol=config.BRILLOUIN_SHIFT_TOLERANCE,
+    sigma_y_bins=6.0,
+    expected_shift=5.1,
+    shift_tol=2.0,
 ):
     """
     Two-stage in-situ 2D frequency map calibration for a Brillouin sample interferogram:
@@ -256,13 +256,15 @@ def fit_sample_dho(
     xx,
     yy,
     fsr_val,
-    bin_val_h=config.BIN_VAL_H,
-    bin_val_w=config.BIN_VAL_W,
-    n_orders=config.N_ORDERS_SAMPLE,
-    ds_init=config.EXPECTED_BRILLOUIN_SHIFT,
-    shift_tol=config.BRILLOUIN_SHIFT_TOLERANCE,
-    gamma_init=config.EXPECTED_LINEWIDTH,
-    gamma_bounds=config.LINEWIDTH_BOUNDS,
+    bin_val_h=4,
+    bin_val_w=2,
+    n_orders=None,
+    ds_init=5.1,
+    shift_tol=2.0,
+    gamma_init=0.8,
+    gamma_bounds=(0.4, 1.3),
+    hw_px=12,
+    min_amp=30.0,
     verbose=True,
 ):
     """
@@ -278,7 +280,7 @@ def fit_sample_dho(
         freq_bin, data_bin, xx_bin, yy_bin, fsr_val,
         n_orders=n_orders, ds_init=ds_init, shift_tol=shift_tol,
         gamma_init=gamma_init, gamma_bounds=gamma_bounds,
-        hw_px=config.DHO_HW_PX, min_amp=config.DHO_MIN_AMP, verbose=verbose
+        hw_px=hw_px, min_amp=min_amp, verbose=verbose
     )
 
     shift_clipped_averaged = 0.5 * (shift_clipped[:, 0::2] + shift_clipped[:, 1::2])
@@ -315,7 +317,7 @@ def fit_sample_dho(
 # Persistence & Retrieval (HDF5)
 # ==============================================================================
 
-def retrieve_sample_dho_fit(wrapper, path_sample, bin_val_h=config.BIN_VAL_H, bin_val_w=config.BIN_VAL_W):
+def retrieve_sample_dho_fit(wrapper, path_sample, bin_val_h=4, bin_val_w=2):
     """
     Retrieves previously fitted DHO datasets from HDF5 if present.
     """
@@ -325,12 +327,18 @@ def retrieve_sample_dho_fit(wrapper, path_sample, bin_val_h=config.BIN_VAL_H, bi
         return None
 
     try:
-        shift_clipped = wrapper[f'{group_treated}/shift'].astype(np.float64)
-        shift_err = wrapper[f'{group_treated}/shift_err'].astype(np.float64)
-        linewidth_clipped = wrapper[f'{group_treated}/linewidth'].astype(np.float64)
-        linewidth_err = wrapper[f'{group_treated}/linewidth_err'].astype(np.float64)
+        shift_clipped = wrapper[f'{group_treated}/Shift'].astype(np.float64)
+        print('S OK')
+        shift_err = wrapper[f'{group_treated}/Shift error'].astype(np.float64)
+        print('SE OK')
+        linewidth_clipped = wrapper[f'{group_treated}/Linewidth'].astype(np.float64)
+        print('L OK')
+        linewidth_err = wrapper[f'{group_treated}/Linewidth error'].astype(np.float64)
+        print('LE OK')
         x_coords = wrapper[f'{group_treated}/x_coords'].astype(np.float64)
+        print('X OK')
         y_coords = wrapper[f'{group_treated}/y_coords'].astype(np.float64)
+        print('Y OK')
 
         shift_clipped_averaged = 0.5 * (shift_clipped[:, 0::2] + shift_clipped[:, 1::2])
         linewidth_clipped_averaged = 0.5 * (linewidth_clipped[:, 0::2] + linewidth_clipped[:, 1::2])

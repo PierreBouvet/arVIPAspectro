@@ -38,6 +38,70 @@ SHOW_PLOTS = True
 FORCE_ALL_PROCESS = 1
 FORCE_PLOT_ALL = 1
 
+# ==============================================================================
+# HDF5 Hierarchy Defaults
+# ==============================================================================
+GROUP_INTEREST = 'Brillouin'
+PATH_LASER_REF = 'laser_reference'
+PATH_RB_ABSORPTION = 'Rb_absorption'
+PATH_SAMPLE = 'water_5s'
+
+# ==============================================================================
+# Rubidium Calibration Parameters (Steps 7 to 10B)
+# ==============================================================================
+T_CELL = 70.0                               # Temperature of Rubidium cell (Celsius)
+L_CELL = 0.07                               # Path length of Rubidium vapor cell (m)
+
+SCALE_RB = 9                                # Downsampling factor for Rb morphological baseline
+KSIZE_STRUCTURING_ELEMENTS_RB = 3           # Structuring element size for Rb baseline
+KSIZE_BLUR_RB = 11                          # Gaussian blur kernel size for Rb baseline
+
+DELTA_NU_LASER_OFFSET = 0.0                 # Initial coarse laser offset guess (GHz)
+FIT_WINDOW_GHZ = 10.0                       # Fitting window around Rb D2 center (GHz)
+RB_LOCK_OFFSET_GHZ = 1.323                  # 85Rb F=2 absorption line offset from D2 center (GHz)
+
+# ==============================================================================
+# Sample Spectrum Fitting (DHO) Parameters (Steps 11 to 13)
+# ==============================================================================
+BIN_VAL_H = 4                               # Vertical spatial binning factor (pixels per bin)
+BIN_VAL_W = 2                               # Horizontal spatial binning factor (pixels per bin)
+
+# --- Polystyrene (Plastic) Reference ---
+# EXPECTED_BRILLOUIN_SHIFT = 9.7              # Expected Brillouin shift nu_B in GHz (plastic)
+# BRILLOUIN_SHIFT_TOLERANCE = 2.0             # Search half-window around expected shift in GHz
+# EXPECTED_LINEWIDTH = 0.8                    # Expected Brillouin linewidth Gamma_B in GHz
+# LINEWIDTH_BOUNDS = (0.4, 1.3)               # Acceptable linewidth range (min, max) in GHz
+
+# --- Water Reference ---
+EXPECTED_BRILLOUIN_SHIFT = 5.1              # Expected Brillouin shift nu_B in GHz (water)
+BRILLOUIN_SHIFT_TOLERANCE = 2.0             # Search half-window around expected shift in GHz
+EXPECTED_LINEWIDTH = 0.8                    # Expected Brillouin linewidth Gamma_B in GHz
+LINEWIDTH_BOUNDS = (0.4, 1.3)               # Acceptable linewidth range (min, max) in GHz
+
+N_ORDERS_SAMPLE = None                      # Number of Brillouin orders to fit (None = automatic detection)
+DHO_HW_PX = 12                              # Fitting half-window width in binned pixels
+DHO_MIN_AMP = 30.0                          # Minimum peak amplitude above chord baseline
+SIGMA_Y_BINS = 6.0                          # Smoothing length along vertical bins for in-situ calibration
+
+# ==============================================================================
+# Acoustic Wavevector (q-vector) Extraction Parameters (Steps 14 to 15)
+# ==============================================================================
+# --- Polystyrene (Plastic) Reference ---
+# N_SAMPLE = 1.59                             # Refractive index of plastic (polystyrene) at 780 nm
+# SHIFT_RANGE_SAMPLE = (9.3, 9.9)             # Filtering range for Brillouin shift (GHz)
+# LINEWIDTH_RANGE_SAMPLE = (0.5, 1.2)         # Filtering range for Brillouin linewidth (GHz)
+
+# --- Water Reference ---
+N_SAMPLE = 1.33                              # Refractive index of water at 780 nm
+SHIFT_RANGE_SAMPLE = (4.8, 5.3)             # Filtering range for Brillouin shift (GHz)
+LINEWIDTH_RANGE_SAMPLE = (0.5, 1.2)         # Filtering range for Brillouin linewidth (GHz)
+
+USE_ERROR_WEIGHTING = True                  # Statistical error-weighting (w_i = 1 / sigma_i)
+ERROR_PERCENTILE_FLOOR = 1.0                # Percentile floor to regularize tiny uncertainties
+AVERAGE_STOKES_ANTISTOKES = True            # Average paired Stokes & Anti-Stokes orders
+INITIAL_M_THETA = 3000.0                    # Initial guess for angular magnification factor M_theta (px)
+FIXED_ELLIPSE_ANGLE_DEG = 90.0              # Imposed ellipse rotation angle in degrees (e.g. 90.0). Set to None for free unconstrained fitting
+
 # Execution flags per step: (plot_*, stop_*, force_*)
 # Step 2: Laser Denoising
 plot_denoise_laser = FORCE_PLOT_ALL or 0
@@ -87,7 +151,6 @@ plot_freq_map = FORCE_PLOT_ALL or 0
 stop_freq_map = 0
 
 # Step 11: Sample In-Situ Frequency Map Self-Calibration
-PATH_SAMPLE = config.PATH_SAMPLE
 plot_sample_freq_calib = FORCE_PLOT_ALL or 0
 stop_sample_freq_calib = 0
 
@@ -113,7 +176,7 @@ print('Step 1 - Opened / created H5 file.')
 # ==============================================================================
 # 02 - Monochromatic Laser Reference Image & Denoising
 # ==============================================================================
-path_h5_laser = f'{config.GROUP_INTEREST}/{config.PATH_LASER_REF}'
+path_h5_laser = f'{GROUP_INTEREST}/{PATH_LASER_REF}'
 data_laser_reference = wrapper[f'{path_h5_laser}/image'].astype(np.float64)
 
 if not force_denoise_laser and 'image_corrected' in wrapper.get_children_elements(path_h5_laser):
@@ -264,7 +327,7 @@ if stop_2D_anamorphic_cal:
 # 07 - Theoretical Natural Rubidium D2 Absorption Spectrum Model
 # ==============================================================================
 det_table_MHz, trans_table, trans_fast = Rb_calib.create_rubidium_reference_table(
-    T_cell=config.T_CELL, L_cell=config.L_CELL
+    T_cell=T_CELL, L_cell=L_CELL
 )
 print('Step 7 - Created theoretical reference table for Rubidium D2 absorption.')
 
@@ -278,7 +341,7 @@ if stop_Rb_absorption:
 # ==============================================================================
 # 08 - Rubidium Absorption Image Denoising
 # ==============================================================================
-path_h5_rb = f'{config.GROUP_INTEREST}/{config.PATH_RB_ABSORPTION}'
+path_h5_rb = f'{GROUP_INTEREST}/{PATH_RB_ABSORPTION}'
 data_absorption_raw = wrapper[f'{path_h5_rb}/image'].astype(np.float64)
 
 if not force_denoise_Rb and 'image_corrected' in wrapper.get_children_elements(path_h5_rb):
@@ -287,9 +350,9 @@ if not force_denoise_Rb and 'image_corrected' in wrapper.get_children_elements(p
 else:
     data_absorption, baseline_absorption = Rb_calib.denoise_rb(
         wrapper, path_h5_rb, data_absorption_raw,
-        scale=config.SCALE_RB,
-        ksize_structuring_elements=config.KSIZE_STRUCTURING_ELEMENTS_RB,
-        ksize_blur=config.KSIZE_BLUR_RB
+        scale=SCALE_RB,
+        ksize_structuring_elements=KSIZE_STRUCTURING_ELEMENTS_RB,
+        ksize_blur=KSIZE_BLUR_RB
     )
     print('Step 8 - Denoised Rubidium absorption spectrum and stored it in H5 file.')
 
@@ -343,8 +406,8 @@ if not force_Rb_calibration and 'FSR' in rb_attrs:
         avg_spectrum_radius,
         trans_fast,
         nu_0=config.nu_0,
-        fit_window_ghz=config.FIT_WINDOW_GHZ,
-        delta_nu_laser_offset=config.DELTA_NU_LASER_OFFSET
+        fit_window_ghz=FIT_WINDOW_GHZ,
+        delta_nu_laser_offset=DELTA_NU_LASER_OFFSET
     )
     print(f"Step 10 - Retrieved calibrated FSR = {fsr_results['FSR_cal']:.4f} GHz, "
           f"delta_nu = {fsr_results['delta_nu_opt']:.3f} GHz from H5 file.")
@@ -357,8 +420,8 @@ else:
         avg_spectrum_radius,
         trans_fast,
         nu_0=config.nu_0,
-        fit_window_ghz=config.FIT_WINDOW_GHZ,
-        delta_nu_laser_offset=config.DELTA_NU_LASER_OFFSET
+        fit_window_ghz=FIT_WINDOW_GHZ,
+        delta_nu_laser_offset=DELTA_NU_LASER_OFFSET
     )
     print(f"Step 10 - Calibrated VIPA FSR = {fsr_results['FSR_cal']:.4f} GHz, "
           f"delta_nu = {fsr_results['delta_nu_opt']:.3f} GHz and saved in H5 file.")
@@ -401,7 +464,7 @@ freq_map, phi_order_map, xi_elastic = Rb_calib.compute_and_save_frequency_map(
     L_y=calib_results['L_y'],
     FSR_cal=fsr_results['FSR_cal'],
     delta_nu_opt=fsr_results['delta_nu_opt'],
-    rb_lock_offset_ghz=config.RB_LOCK_OFFSET_GHZ,
+    rb_lock_offset_ghz=RB_LOCK_OFFSET_GHZ,
     f_px=config.F_PX_DEFAULT,
     phi_rad=config.VIPA_TILT_ANGLE,
     n_r=config.N_FUSED_SILICA_780
@@ -419,7 +482,7 @@ if stop_freq_map:
 # ==============================================================================
 # 11 - Load Sample & Calibrate Sample Frequency Map In-Situ
 # ==============================================================================
-path_h5_sample = f'{config.GROUP_INTEREST}/{PATH_SAMPLE}'
+path_h5_sample = f'{GROUP_INTEREST}/{PATH_SAMPLE}'
 data_sample = wrapper[f'{path_h5_sample}/image'].astype(np.float64)
 yy, xx = np.indices(data_sample.shape, dtype=np.float64)
 
@@ -431,10 +494,10 @@ freq_corrected, df_coarse, dz_map_2d, dinst_disp_map, bls_peaks, avg_data_sample
         yy_in=yy,
         fsr_val=fsr_results['FSR_cal'],
         y0_center=y0_fit,
-        bin_val_h=config.BIN_VAL_H,
-        bin_val_w=config.BIN_VAL_W,
-        expected_shift=config.EXPECTED_BRILLOUIN_SHIFT,
-        shift_tol=config.BRILLOUIN_SHIFT_TOLERANCE,
+        bin_val_h=BIN_VAL_H,
+        bin_val_w=BIN_VAL_W,
+        expected_shift=EXPECTED_BRILLOUIN_SHIFT,
+        shift_tol=BRILLOUIN_SHIFT_TOLERANCE,
     )
 )
 print(f"Step 11 - In-situ calibrated 2D frequency map for {PATH_SAMPLE}: coarse df = {df_coarse*1e3:+.2f} MHz | "
@@ -458,13 +521,13 @@ cached_fit = None
 if not force_dho_fit:
     cached_fit = spectrum_fitting.retrieve_sample_dho_fit(
         wrapper, path_h5_sample,
-        bin_val_h=config.BIN_VAL_H,
-        bin_val_w=config.BIN_VAL_W
+        bin_val_h=BIN_VAL_H,
+        bin_val_w=BIN_VAL_W
     )
 
 if cached_fit is not None:
     dho_results = cached_fit
-    print(f"Step 12 - Retrieved cached {config.BIN_VAL_H}x{config.BIN_VAL_W} binned DHO fit for {PATH_SAMPLE} from H5 file.")
+    print(f"Step 12 - Retrieved cached {BIN_VAL_H}x{BIN_VAL_W} binned DHO fit for {PATH_SAMPLE} from H5 file.")
 else:
     dho_results = spectrum_fitting.fit_sample_dho(
         data_sample=data_sample,
@@ -472,24 +535,24 @@ else:
         xx=xx,
         yy=yy,
         fsr_val=fsr_results['FSR_cal'],
-        bin_val_h=config.BIN_VAL_H,
-        bin_val_w=config.BIN_VAL_W,
-        ds_init=config.EXPECTED_BRILLOUIN_SHIFT,
-        shift_tol=config.BRILLOUIN_SHIFT_TOLERANCE,
-        gamma_init=config.EXPECTED_LINEWIDTH,
-        gamma_bounds=config.LINEWIDTH_BOUNDS,
+        bin_val_h=BIN_VAL_H,
+        bin_val_w=BIN_VAL_W,
+        ds_init=EXPECTED_BRILLOUIN_SHIFT,
+        shift_tol=BRILLOUIN_SHIFT_TOLERANCE,
+        gamma_init=EXPECTED_LINEWIDTH,
+        gamma_bounds=LINEWIDTH_BOUNDS,
         verbose=True
     )
     print(f"Step 12 - Fitted {dho_results['n_fringes']} orders with vectorized DHO for {PATH_SAMPLE} "
-          f"({config.BIN_VAL_H}x{config.BIN_VAL_W} binning).")
+          f"({BIN_VAL_H}x{BIN_VAL_W} binning).")
     print(f"\t Stokes vs Anti-Stokes splitting RMS: {dho_results['stokes_antistokes_rms_mhz']:.2f} MHz")
 
     # Step 15: Save Treated Data
     spectrum_fitting.save_treated_data(
         wrapper=wrapper,
         path_sample=path_h5_sample,
-        bin_val_h=config.BIN_VAL_H,
-        bin_val_w=config.BIN_VAL_W,
+        bin_val_h=BIN_VAL_H,
+        bin_val_w=BIN_VAL_W,
         shift_rel=dho_results['shift_clipped'],
         shift_err=dho_results['shift_error'],
         lw_rel=dho_results['linewidth_clipped'],
@@ -497,7 +560,7 @@ else:
         x_coords=dho_results['x_coords'],
         y_coords=dho_results['y_coords']
     )
-    print(f"Step 15 - Saved treated {config.BIN_VAL_H}x{config.BIN_VAL_W} data for {PATH_SAMPLE} in H5 file.")
+    print(f"Step 15 - Saved treated {BIN_VAL_H}x{BIN_VAL_W} data for {PATH_SAMPLE} in H5 file.")
 
 
 # ==============================================================================
@@ -544,8 +607,8 @@ if not force_q_vector:
     cached_q = q_vector.retrieve_q_vector_results(
         wrapper=wrapper,
         path_sample=path_h5_sample,
-        bin_val_h=config.BIN_VAL_H,
-        bin_val_w=config.BIN_VAL_W
+        bin_val_h=BIN_VAL_H,
+        bin_val_w=BIN_VAL_W
     )
 
 if cached_q is not None:
@@ -556,23 +619,24 @@ else:
         data_source=dho_results,
         path_sample=path_h5_sample,
         wrapper=wrapper,
-        bin_val_h=config.BIN_VAL_H,
-        bin_val_w=config.BIN_VAL_W,
-        refractive_index=config.N_SAMPLE,
+        bin_val_h=BIN_VAL_H,
+        bin_val_w=BIN_VAL_W,
+        refractive_index=N_SAMPLE,
         laser_wavelength=config.lambda_0,
-        use_errors=config.USE_ERROR_WEIGHTING,
-        error_percentile_floor=config.ERROR_PERCENTILE_FLOOR,
-        average_pairs=config.AVERAGE_STOKES_ANTISTOKES,
-        shift_bounds=config.SHIFT_RANGE_SAMPLE,
-        linewidth_bounds=config.LINEWIDTH_RANGE_SAMPLE,
-        initial_M_theta=config.INITIAL_M_THETA,
+        use_errors=USE_ERROR_WEIGHTING,
+        error_percentile_floor=ERROR_PERCENTILE_FLOOR,
+        average_pairs=AVERAGE_STOKES_ANTISTOKES,
+        shift_bounds=SHIFT_RANGE_SAMPLE,
+        linewidth_bounds=LINEWIDTH_RANGE_SAMPLE,
+        initial_M_theta=INITIAL_M_THETA,
+        fixed_ellipse_angle_deg=FIXED_ELLIPSE_ANGLE_DEG,
         verbose=True
     )
     q_vector.save_q_vector_results(
         wrapper=wrapper,
         path_sample=path_h5_sample,
-        bin_val_h=config.BIN_VAL_H,
-        bin_val_w=config.BIN_VAL_W,
+        bin_val_h=BIN_VAL_H,
+        bin_val_w=BIN_VAL_W,
         q_results=q_results
     )
     print(f"Step 14 - Saved q-vector datasets and attributes for {PATH_SAMPLE} in H5 file.")
@@ -587,7 +651,7 @@ if plot_q_dispersion:
         linewidth_err=q_results.get("linewidth_err"),
         Shift_0=q_results.get("Shift_0"),
         M_theta=q_results.get("M_theta"),
-        n_medium=config.N_SAMPLE,
+        n_medium=N_SAMPLE,
         lambda_vacuum=config.lambda_0,
         V_s=q_results.get("V_s"),
         V_s_err=q_results.get("V_s_err"),
@@ -614,7 +678,7 @@ if plot_q_diagnostics and "x_sph" in q_results:
         M_theta_fit=q_results["M_theta"],
         S0_err=q_results.get("Shift_0_err"),
         M_theta_err=q_results.get("M_theta_err"),
-        n_medium=config.N_SAMPLE,
+        n_medium=N_SAMPLE,
         lambda_vacuum=config.lambda_0,
         V_s=q_results.get("V_s"),
         V_s_err=q_results.get("V_s_err"),

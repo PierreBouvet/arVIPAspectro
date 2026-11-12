@@ -29,10 +29,10 @@
    - Optimizes $\gamma$ via `scipy.optimize.minimize(method='Nelder-Mead')` to minimize the radial variance of $\mathrm{Shift}$ around its moving average.
 4. **Kinematic Fit of Angular Magnification $M_\theta$**:
    - Fits the non-linear kinematic curve via Levenberg-Marquardt (`curve_fit`):
-     $$\mathrm{Shift}(r_{\mathrm{sph}}) = S_0 \cdot \cos\left(\frac{1}{2}\arctan\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$$
+     $$\mathrm{Shift}(r_{\mathrm{sph}}) = S_0 \cdot \cos\left(\frac{1}{2}\arcsin\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$$
    - Returns optimal parameters $S_0, M_\theta$ and their full $2 \times 2$ covariance matrix $\mathbf{\Sigma}_{\mathrm{kin}}$.
 5. **Acoustic Wavevector Delineation & Longitudinal Sound Velocity $V_s$**:
-   - Internal scattering angle: $\theta(r_{\mathrm{sph}}) = \arctan(r_{\mathrm{sph}} / M_\theta)$.
+   - Internal scattering angle: $\theta(r_{\mathrm{sph}}) = \arcsin(r_{\mathrm{sph}} / M_\theta)$.
    - Acoustic wavevector magnitude:
      $$q(r_{\mathrm{sph}}) = \frac{4\pi n}{\lambda_0} \cos\left(\frac{\theta(r_{\mathrm{sph}})}{2}\right)$$
    - Longitudinal sound velocity:
@@ -51,8 +51,9 @@ Recovering the aspect ratio $\gamma$ restores isotropic spherical symmetry ($r_{
 
 ## Physical Approximations
 1. **Affine Elliptical Pupil Deformation**: The anamorphic distortion of the collection cone is modeled as a 2D affine scaling along orthogonal principal axes.
-2. **Linear Acoustic Dispersion**: The phonon group velocity equals the phase velocity: $\Omega = V_s \cdot q$, which holds rigorously in the GHz frequency domain far below the Debye cutoff.
-3. **Isotropic Medium**: The sample is assumed mechanically isotropic with scalar sound velocity $V_s$.
+2. **Abbe Sine Condition**: The aplanatic collection objective maps scattering angles to pupil coordinates via $r \propto \sin\theta$, modeled rigorously via the $\arcsin$ kinematic relation.
+3. **Linear Acoustic Dispersion**: The phonon group velocity equals the phase velocity: $\Omega = V_s \cdot q$, which holds rigorously in the GHz frequency domain far below the Debye cutoff.
+4. **Isotropic Medium**: The sample is assumed mechanically isotropic with scalar sound velocity $V_s$.
 
 ---
 
@@ -61,9 +62,9 @@ Recovering the aspect ratio $\gamma$ restores isotropic spherical symmetry ($r_{
   $$x_{\mathrm{sph}} = (x - x_c)\cos\phi + (y - y_c)\sin\phi, \qquad y_{\mathrm{sph}} = \frac{-(x - x_c)\sin\phi + (y - y_c)\cos\phi}{\gamma}$$
   $$r_{\mathrm{sph}} = \sqrt{x_{\mathrm{sph}}^2 + y_{\mathrm{sph}}^2}$$
 - **Kinematic Shift Model**:
-  $$\mathrm{Shift}(r_{\mathrm{sph}}) = S_0 \cdot \cos\left(\frac{1}{2}\arctan\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$$
+  $$\mathrm{Shift}(r_{\mathrm{sph}}) = S_0 \cdot \cos\left(\frac{1}{2}\arcsin\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$$
 - **Acoustic Wavevector Formula**:
-  $$q(r_{\mathrm{sph}}) = \frac{4\pi n}{\lambda_0} \cos\left(\frac{1}{2}\arctan\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$$
+  $$q(r_{\mathrm{sph}}) = \frac{4\pi n}{\lambda_0} \cos\left(\frac{1}{2}\arcsin\left(\frac{r_{\mathrm{sph}}}{M_\theta}\right)\right)$$
 - **Sound Velocity & Propagated Uncertainty**:
   $$V_s = \frac{\lambda_0 S_0}{2 n}$$
   $$\sigma_{V_s}^2 = J_{S_0}^2 \sigma_{S_0}^2 + J_{M_\theta}^2 \sigma_{M_\theta}^2 + 2 J_{S_0} J_{M_\theta} \mathrm{cov}(S_0, M_\theta)$$
@@ -73,6 +74,9 @@ Recovering the aspect ratio $\gamma$ restores isotropic spherical symmetry ($r_{
 ---
 
 ## Code Implementation
+- **Theoretical Foundations**:
+  - Exact Refractive Index Scaling & Magnification Derivation: [`theory/refractive_index_magnification_derivation.md`](file:/theory/refractive_index_magnification_derivation.md)
+  - Abbe Sine Condition & Pupil Mapping: [`theory/abbe_sine_condition_and_pupil_mapping.md`](file:/theory/abbe_sine_condition_and_pupil_mapping.md)
 - **Pipeline Function**: `extract_q_vector(...)` in [`arVIPAspectro/q_vector.py`](file:/arVIPAspectro/q_vector.py#L18-L177)
 - **Core Solvers**:
   - `fit_concentric_ellipses_coaxial`: [`arVIPAspectro/backend.py`](file:/arVIPAspectro/backend.py#L900-L960)

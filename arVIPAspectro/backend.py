@@ -4,13 +4,21 @@ Core mathematical, physical, and signal/image processing functions for VIPA Bril
 
 import os
 import time
+from typing import Optional
 import cv2
 import numpy as np
 import scipy.ndimage as ndimage
 from scipy.special import wofz
 from scipy.optimize import minimize, curve_fit
 from HDF5_BLS import Wrapper
-from HDF5_BLS.errors import WrapperError_Overwrite
+try:
+    from HDF5_BLS.errors import WrapperError_Overwrite
+except ImportError:
+    try:
+        from HDF5_BLS.wrapper import WrapperError as WrapperError_Overwrite
+    except ImportError:
+        class WrapperError_Overwrite(Exception):
+            pass
 
 try:
     from . import config
@@ -32,19 +40,23 @@ def create_wrapper(directory, name='Measures.h5', exclude_dir=None):
     if exclude_dir is None:
         exclude_dir = []
 
-    def add_dat(file, dir_path, parent_group='Brillouin'):
+    def add_dat(file, dir_path, parent_group='Brillouin', tab = 0):
         if os.path.isdir(file):
             grp_name = os.path.basename(file)
-            wrapper.create_group(name=grp_name, parent_group=parent_group)
+            if hasattr(wrapper, "create_group"):
+                wrapper.create_group(name=grp_name, parent_group=parent_group)
+            elif hasattr(wrapper, "add_data_group_to_wrapper"):
+                wrapper.add_data_group_to_wrapper(name=grp_name, parent_group=parent_group)
             for path in os.listdir(file):
                 add_dat(
                     os.path.join(file, path),
                     dir_path=os.path.join(dir_path, grp_name),
-                    parent_group=f'{parent_group}/{grp_name}'
+                    parent_group=f'{parent_group}/{grp_name}',
+                    tab = tab+1
                 )
         elif file.endswith('.dat'):
             data = np.loadtxt(os.path.join(dir_path, file))
-            grp_name = os.path.splitext(file)[0]
+            grp_name = os.path.splitext(os.path.basename(file))[0]
             wrapper.add_raw_data(data, parent_group=f'{parent_group}/{grp_name}', name='image')
 
     if not name.endswith('.h5'):
@@ -579,19 +591,20 @@ def fit_dho_batched(
     Dynamically determines n_orders and acoustic parameters if not specified.
     """
     if ds_init is None:
-        ds_init = config.EXPECTED_BRILLOUIN_SHIFT
+        ds_init = getattr(config, 'EXPECTED_BRILLOUIN_SHIFT', 5.1)
     if shift_tol is None:
-        shift_tol = config.BRILLOUIN_SHIFT_TOLERANCE
+        shift_tol = getattr(config, 'BRILLOUIN_SHIFT_TOLERANCE', 2.0)
     if gamma_init is None:
-        gamma_init = config.EXPECTED_LINEWIDTH
+        gamma_init = getattr(config, 'EXPECTED_LINEWIDTH', 0.8)
     if gamma_bounds is None:
-        gamma_bounds = config.LINEWIDTH_BOUNDS
+        gamma_bounds = getattr(config, 'LINEWIDTH_BOUNDS', (0.4, 1.3))
 
     t_start = time.time()
     n_rows, n_cols = freq_bin_in.shape
     if n_orders is None:
-        if config.N_ORDERS_SAMPLE is not None:
-            n_orders = config.N_ORDERS_SAMPLE
+        n_orders_cfg = getattr(config, 'N_ORDERS_SAMPLE', None)
+        if n_orders_cfg is not None:
+            n_orders = n_orders_cfg
         else:
             yc_idx = n_rows // 2
             f_mid = np.nanmean(freq_bin_in[max(0, yc_idx - 25) : min(n_rows, yc_idx + 25), :], axis=0)
@@ -768,6 +781,7 @@ def fit_concentric_ellipses_coaxial(
     shift_err=None,
     linewidth_err=None,
     initial_guess=None,
+    fixed_phi_deg: Optional[float] = None,
 ):
     """
     Fits 2D concentric ellipses with shared director axes (coaxial center xc, yc
@@ -779,6 +793,12 @@ def fit_concentric_ellipses_coaxial(
     Points are weighted by their standard errors (w_i = 1 / sigma_i), and the
     joint cost function is balanced by the overall sample variance (std^2) of
     Shift and Linewidth across the dataset.
+
+    Parameters
+    ----------
+    fixed_phi_deg : float, optional
+        If provided (e.g. 90.0), fixes the ellipse rotation angle phi to this angle
+        in degrees, only optimizing the center (xc, yc). If None, phi is optimized freely.
     """
     w_s = 1.0 / np.asarray(shift_err, dtype=np.float64) if shift_err is not None else np.ones_like(shift, dtype=np.float64)
     w_lw = 1.0 / np.asarray(linewidth_err, dtype=np.float64) if linewidth_err is not None else np.ones_like(linewidth, dtype=np.float64)
@@ -812,19 +832,36 @@ def fit_concentric_ellipses_coaxial(
 
         return cs, clw, chi2_s, chi2_lw
 
-    def _joint_weighted_cost(params):
-        xc, yc, phi = params
-        _, _, chi2_s, chi2_lw = _eval_weighted_solution(xc, yc, phi)
-        return float(chi2_s / var_s_scale + chi2_lw / var_lw_scale)
+    if fixed_phi_deg is not None:
+        phi_fixed = float(np.deg2rad(fixed_phi_deg))
 
-    opt_result = minimize(
-        _joint_weighted_cost,
-        x0=np.array([xc_init, yc_init, phi_init]),
-        method="Nelder-Mead",
-        options={"maxiter": 4000, "xatol": 1e-4, "fatol": 1e-5},
-    )
+        def _joint_weighted_cost_fixed(params):
+            xc, yc = params
+            _, _, chi2_s, chi2_lw = _eval_weighted_solution(xc, yc, phi_fixed)
+            return float(chi2_s / var_s_scale + chi2_lw / var_lw_scale)
 
-    xc_opt, yc_opt, phi_opt = opt_result.x
+        opt_result = minimize(
+            _joint_weighted_cost_fixed,
+            x0=np.array([xc_init, yc_init]),
+            method="Nelder-Mead",
+            options={"maxiter": 4000, "xatol": 1e-4, "fatol": 1e-5},
+        )
+        xc_opt, yc_opt = opt_result.x
+        phi_opt = phi_fixed
+    else:
+        def _joint_weighted_cost(params):
+            xc, yc, phi = params
+            _, _, chi2_s, chi2_lw = _eval_weighted_solution(xc, yc, phi)
+            return float(chi2_s / var_s_scale + chi2_lw / var_lw_scale)
+
+        opt_result = minimize(
+            _joint_weighted_cost,
+            x0=np.array([xc_init, yc_init, phi_init]),
+            method="Nelder-Mead",
+            options={"maxiter": 4000, "xatol": 1e-4, "fatol": 1e-5},
+        )
+        xc_opt, yc_opt, phi_opt = opt_result.x
+
     cs_opt, clw_opt, _, _ = _eval_weighted_solution(xc_opt, yc_opt, phi_opt)
 
     S0, a_s, b_s = cs_opt
@@ -857,10 +894,17 @@ def optimize_elliptical_symmetry_variance(
     shift_err,
     linewidth_err,
     initial_params,
+    fixed_phi_deg: Optional[float] = None,
 ):
     """
     Refines 2D concentric ellipse parameters (xc, yc, phi, gamma) by minimizing
     the error-weighted residual variance around 1D radial profiles.
+
+    Parameters
+    ----------
+    fixed_phi_deg : float, optional
+        If provided (e.g. 90.0), keeps the ellipse rotation angle phi fixed to this angle
+        in degrees, only optimizing (xc, yc, gamma). If None, phi is optimized freely.
     """
     w_s = 1.0 / np.asarray(shift_err, dtype=np.float64) if shift_err is not None else np.ones_like(shift, dtype=np.float64)
     w_lw = 1.0 / np.asarray(linewidth_err, dtype=np.float64) if linewidth_err is not None else np.ones_like(linewidth, dtype=np.float64)
@@ -874,14 +918,12 @@ def optimize_elliptical_symmetry_variance(
 
     xc0 = float(initial_params["xc"])
     yc0 = float(initial_params["yc"])
-    phi0 = float(initial_params["phi_rad"])
+    phi0 = float(np.deg2rad(fixed_phi_deg)) if fixed_phi_deg is not None else float(initial_params["phi_rad"])
     gamma0 = float(initial_params["gamma"])
 
-    p0 = np.array([xc0, yc0, phi0, gamma0])
     R0 = 1000.0
 
-    def _weighted_radial_variance_cost(params):
-        xc, yc, phi, gamma = params
+    def _eval_radial_cost(xc, yc, phi, gamma):
         if gamma <= 0.2 or gamma >= 4.0:
             return 1e10
 
@@ -908,25 +950,56 @@ def optimize_elliptical_symmetry_variance(
 
         return float(chi2_res_s / var_s_scale + chi2_res_lw / var_lw_scale)
 
-    bounds = [
-        (xc0 - 250.0, xc0 + 250.0),
-        (yc0 - 250.0, yc0 + 250.0),
-        (phi0 - np.deg2rad(25.0), phi0 + np.deg2rad(25.0)),
-        (max(0.3, gamma0 - 0.8), min(3.5, gamma0 + 0.8)),
-    ]
+    if fixed_phi_deg is not None:
+        phi_fixed = float(np.deg2rad(fixed_phi_deg))
+        p0 = np.array([xc0, yc0, gamma0])
+        initial_cost = _eval_radial_cost(xc0, yc0, phi_fixed, gamma0)
 
-    opt_result = minimize(
-        _weighted_radial_variance_cost,
-        x0=p0,
-        bounds=bounds,
-        method="L-BFGS-B",
-        options={"maxiter": 3000, "ftol": 1e-7},
-    )
+        def _cost_fixed(params):
+            xc, yc, gamma = params
+            return _eval_radial_cost(xc, yc, phi_fixed, gamma)
 
-    xc_ref, yc_ref, phi_ref, gamma_ref = opt_result.x
-    initial_cost = _weighted_radial_variance_cost(p0)
+        bounds = [
+            (xc0 - 250.0, xc0 + 250.0),
+            (yc0 - 250.0, yc0 + 250.0),
+            (max(0.3, gamma0 - 0.8), min(3.5, gamma0 + 0.8)),
+        ]
+
+        opt_result = minimize(
+            _cost_fixed,
+            x0=p0,
+            bounds=bounds,
+            method="L-BFGS-B",
+            options={"maxiter": 3000, "ftol": 1e-7},
+        )
+        xc_ref, yc_ref, gamma_ref = opt_result.x
+        phi_ref = phi_fixed
+    else:
+        p0 = np.array([xc0, yc0, phi0, gamma0])
+        initial_cost = _eval_radial_cost(xc0, yc0, phi0, gamma0)
+
+        def _weighted_radial_variance_cost(params):
+            xc, yc, phi, gamma = params
+            return _eval_radial_cost(xc, yc, phi, gamma)
+
+        bounds = [
+            (xc0 - 250.0, xc0 + 250.0),
+            (yc0 - 250.0, yc0 + 250.0),
+            (phi0 - np.deg2rad(25.0), phi0 + np.deg2rad(25.0)),
+            (max(0.3, gamma0 - 0.8), min(3.5, gamma0 + 0.8)),
+        ]
+
+        opt_result = minimize(
+            _weighted_radial_variance_cost,
+            x0=p0,
+            bounds=bounds,
+            method="L-BFGS-B",
+            options={"maxiter": 3000, "ftol": 1e-7},
+        )
+        xc_ref, yc_ref, phi_ref, gamma_ref = opt_result.x
+
     final_cost = float(opt_result.fun)
-    improvement = (initial_cost - final_cost) / initial_cost * 100.0
+    improvement = (initial_cost - final_cost) / initial_cost * 100.0 if initial_cost > 0 else 0.0
 
     return {
         "xc": float(xc_ref),
@@ -974,7 +1047,7 @@ def fit_magnification_factor_M_theta(
 ):
     """
     Fits the angular magnification factor M_theta and normal backscattering shift Shift(0):
-        Shift(r_sph) = Shift(0) * cos(arctan(r_sph / M_theta) / 2)
+        Shift(r_sph) = Shift(0) * cos(arcsin(r_sph / M_theta) / 2)
     weighted by experimental errors (sigma = shift_err).
 
     Returns:
@@ -982,11 +1055,15 @@ def fit_magnification_factor_M_theta(
         (S0_fit, M_theta_fit, (S0_err, M_theta_err), pcov) if return_covariance=True
     """
     def _shift_vs_r_sph_model(r, S0, M):
-        return S0 * np.cos(np.arctan(r / M) / 2.0)
+        u = np.clip(r / max(M, 1e-6), -0.999999, 0.999999)
+        return S0 * np.cos(np.arcsin(u) / 2.0)
 
     S0_guess = float(np.percentile(shift, 98))
-    p0 = [S0_guess, initial_M_theta]
-    bounds = ([0.0, 100.0], [50.0, 100000.0])
+    r_max = float(np.max(r_sph)) if len(r_sph) > 0 else 1000.0
+    min_M = max(r_max * 1.005, 50.0)
+    init_M = max(initial_M_theta, min_M * 1.05)
+    p0 = [S0_guess, init_M]
+    bounds = ([0.0, min_M], [50.0, 100000.0])
 
     use_sig = shift_err is not None and not np.all(shift_err == 1.0)
     popt, pcov = curve_fit(
@@ -1021,11 +1098,12 @@ def compute_theta_and_q_vector(
     """
     Deduces scattering angle theta, acoustic wavevector magnitude q_vector, and longitudinal sound velocity V_s
     with error propagation from Shift_0 and M_theta:
-        theta    = np.arctan(r_sph / M_theta)
+        theta    = np.arcsin(np.clip(r_sph / M_theta, -1.0, 1.0))
         q_vector = 2 * n * (2 * np.pi / lambda) * np.cos(theta / 2)
         V_s      = (lambda * Shift_0) / (2 * n)
     """
-    theta = np.arctan(r_sph / M_theta)
+    u = np.clip(r_sph / max(M_theta, 1e-6), -0.999999, 0.999999)
+    theta = np.arcsin(u)
     theta_deg = np.degrees(theta)
 
     k0 = 2.0 * np.pi / lambda_vacuum
@@ -1049,7 +1127,11 @@ def compute_theta_and_q_vector(
 
         # 2. Partial derivative wrt M_theta via linear dispersion slope:
         #    Omega(q) = V_s * q  =>  V_s = 2*pi * sum(w * q * Shift*1e9) / sum(w * q^2)
-        #    where q(M_theta) depends on M_theta.
+        #    where q(M_theta) depends on M_theta via theta = arcsin(r / M_theta).
+        #    d theta / dM = - r / (M * sqrt(M^2 - r^2))
+        #    dq / dM = (dq / d theta) * (d theta / dM)
+        #            = (- n * k0 * sin(theta / 2)) * (- r / (M * sqrt(M^2 - r^2)))
+        #            = (2 * pi * n / lambda) * sin(theta / 2) * (r / (M * sqrt(M^2 - r^2)))
         dVs_dM = 0.0
         if shift_exp is not None and len(shift_exp) == len(r_sph):
             w = 1.0 / (shift_err**2) if (shift_err is not None and not np.all(shift_err == 1.0)) else np.ones_like(shift_exp)
@@ -1061,7 +1143,8 @@ def compute_theta_and_q_vector(
                 th_v = theta[valid]
                 q_v = q_vector[valid]
 
-                dq_dM = (2.0 * np.pi * n_medium / lambda_vacuum) * np.sin(th_v / 2.0) * (r_v / (M_theta**2 + r_v**2))
+                denom_sqrt = np.sqrt(np.maximum(M_theta**2 - r_v**2, 1e-12))
+                dq_dM = (2.0 * np.pi * n_medium / lambda_vacuum) * np.sin(th_v / 2.0) * (r_v / (M_theta * denom_sqrt))
                 N = np.sum(w_v * q_v * s_v)
                 D = np.sum(w_v * q_v**2)
                 N_prime = np.sum(w_v * dq_dM * s_v)

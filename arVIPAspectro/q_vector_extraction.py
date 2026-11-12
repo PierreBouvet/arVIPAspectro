@@ -27,13 +27,14 @@ except ImportError:
 def run_q_vector_extraction(
     path_h5: Union[str, Path] = None,
     group: str = None,
-    refractive_index: float = config.N_SAMPLE,
+    refractive_index: float = 1.33,
     laser_wavelength: float = config.lambda_0,
-    use_errors: bool = config.USE_ERROR_WEIGHTING,
-    error_percentile_floor: float = config.ERROR_PERCENTILE_FLOOR,
-    average_pairs: bool = config.AVERAGE_STOKES_ANTISTOKES,
-    shift_bounds: Tuple[Optional[float], Optional[float]] = config.SHIFT_RANGE_SAMPLE,
-    linewidth_bounds: Tuple[Optional[float], Optional[float]] = config.LINEWIDTH_RANGE_SAMPLE,
+    use_errors: bool = True,
+    error_percentile_floor: float = 1.0,
+    average_pairs: bool = True,
+    shift_bounds: Tuple[Optional[float], Optional[float]] = (4.8, 5.3),
+    linewidth_bounds: Tuple[Optional[float], Optional[float]] = (0.5, 1.2),
+    fixed_ellipse_angle_deg: Optional[float] = 90.0,
     out_dir: Optional[Union[str, Path]] = None,
     show_plots: bool = True,
     save_plots: bool = True,
@@ -44,15 +45,15 @@ def run_q_vector_extraction(
     if path_h5 is None:
         path_h5 = os.path.join(config.DATA_DIR, config.TARGET_FILE) if hasattr(config, "DATA_DIR") else "Measures.h5"
     if group is None:
-        group = f"{config.GROUP_INTEREST}/{config.PATH_SAMPLE}/Treated {config.BIN_VAL_H}x{config.BIN_VAL_W} bins"
+        group = "Brillouin/water_5s/Treated 4x2 bins"
 
     wrapper = bck.create_wrapper(os.path.dirname(str(path_h5)), name=os.path.basename(str(path_h5)))
 
     # Path to sample parent group
     path_sample = "/".join(group.split("/")[:2])
     parts = group.split("/")
-    bin_h = config.BIN_VAL_H
-    bin_w = config.BIN_VAL_W
+    bin_h = 4
+    bin_w = 2
     if len(parts) >= 3 and "Treated" in parts[2]:
         try:
             dims = parts[2].replace("Treated ", "").replace(" bins", "").split("x")
@@ -74,7 +75,8 @@ def run_q_vector_extraction(
         average_pairs=average_pairs,
         shift_bounds=shift_bounds,
         linewidth_bounds=linewidth_bounds,
-        initial_M_theta=config.INITIAL_M_THETA,
+        initial_M_theta=3000.0,
+        fixed_ellipse_angle_deg=fixed_ellipse_angle_deg,
         verbose=True,
     )
 
