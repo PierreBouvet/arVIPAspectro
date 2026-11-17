@@ -362,8 +362,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_stage_connect.clicked.connect(self._on_toggle_stage)
         self.btn_stage_refresh = QtWidgets.QPushButton("Read Pos")
         self.btn_stage_refresh.clicked.connect(self._update_stage_ui)
+        self.btn_stage_zero_xy = QtWidgets.QPushButton("Zero XY")
+        self.btn_stage_zero_xy.setToolTip("Set current physical X, Y stage position as (0.0, 0.0) µm")
+        self.btn_stage_zero_xy.clicked.connect(lambda: self._on_zero_stage(("X", "Y")))
+        self.btn_stage_zero_z = QtWidgets.QPushButton("Zero Z")
+        self.btn_stage_zero_z.setToolTip("Set current physical Z stage position as 0.0 µm")
+        self.btn_stage_zero_z.clicked.connect(lambda: self._on_zero_stage(("Z",)))
         btn_row.addWidget(self.btn_stage_connect)
         btn_row.addWidget(self.btn_stage_refresh)
+        btn_row.addWidget(self.btn_stage_zero_xy)
+        btn_row.addWidget(self.btn_stage_zero_z)
         layout.addLayout(btn_row)
 
         info_form = QtWidgets.QFormLayout()
@@ -555,10 +563,17 @@ class MainWindow(QtWidgets.QMainWindow):
             preset_row.addWidget(btn_p)
         step_col.addLayout(preset_row)
 
+        stage_ctrl_row = QtWidgets.QHBoxLayout()
+        self.btn_zero_xy_nav = QtWidgets.QPushButton("Zero XY (0, 0)")
+        self.btn_zero_xy_nav.setToolTip("Set current physical X, Y position as (0.0, 0.0) µm")
+        self.btn_zero_xy_nav.clicked.connect(lambda: self._on_zero_stage(("X", "Y")))
+        stage_ctrl_row.addWidget(self.btn_zero_xy_nav)
+
         self.btn_halt_stage = QtWidgets.QPushButton("HALT / Stop Stage")
         self.btn_halt_stage.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
         self.btn_halt_stage.clicked.connect(self._on_halt_stage)
-        step_col.addWidget(self.btn_halt_stage)
+        stage_ctrl_row.addWidget(self.btn_halt_stage)
+        step_col.addLayout(stage_ctrl_row)
         step_col.addStretch()
         jog_outer.addLayout(step_col)
 
@@ -955,6 +970,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stage.halt()
             self._update_stage_ui()
 
+    def _on_zero_stage(self, axes=("X", "Y")):
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the ASI MS-2000 stage first.")
+            return
+        if self._worker is not None and self._worker.isRunning() and not self._live_running:
+            self._threadsafe_log("Cannot zero stage while a move/acquisition action is running.")
+            return
+        try:
+            pos = self.stage.zero_position(axes=axes)
+            self._update_stage_ui()
+            if "X" in axes and pos.get("X") is not None:
+                self.spin_target_x.setValue(float(pos["X"]))
+            if "Y" in axes and pos.get("Y") is not None:
+                self.spin_target_y.setValue(float(pos["Y"]))
+        except Exception as exc:
+            self._append_log_slot(f"ERROR (Zero Stage): {exc}")
+            QtWidgets.QMessageBox.warning(self, "Zero Stage Error", str(exc))
+
     @QtCore.Slot(object, object, float, int, int)
     def _on_frame_acquired(self, frame, pos, exposure_s: float, n_avg: int, binning: int):
         self.image_viewer.update_image(
@@ -997,8 +1030,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_roi_vend.setEnabled(geom_unlocked)
         self.btn_apply_roi.setEnabled(geom_unlocked)
 
-        for b in (self.btn_jog_xp, self.btn_jog_xm, self.btn_jog_yp, self.btn_jog_ym, self.btn_move_abs, self.btn_copy_pos):
+        for b in (
+            self.btn_jog_xp,
+            self.btn_jog_xm,
+            self.btn_jog_yp,
+            self.btn_jog_ym,
+            self.btn_move_abs,
+            self.btn_copy_pos,
+            self.btn_stage_zero_xy,
+            self.btn_zero_xy_nav,
+        ):
             b.setEnabled(stage_ok)
+        self.btn_stage_zero_z.setEnabled(has_z)
         self.btn_jog_zp.setEnabled(has_z)
         self.btn_jog_zm.setEnabled(has_z)
 

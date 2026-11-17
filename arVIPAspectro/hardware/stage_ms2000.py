@@ -10,7 +10,7 @@ All public position coordinates and movements are expressed in micrometers (µm)
 
 import time
 import threading
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Tuple
 
 
 class MS2000Error(Exception):
@@ -410,6 +410,42 @@ class MS2000Stage:
             if time.time() - t0 > timeout_s:
                 raise MS2000Error("Timeout waiting for ASI MS-2000 stage movement to complete.")
             time.sleep(poll_interval_s)
+
+    def zero_position(self, axes: Tuple[str, ...] = ("X", "Y")) -> Dict[str, Optional[float]]:
+        """
+        Sets the current physical stage position to zero (`0.0 µm`) for the given axes
+        without moving the motors, using the ASI MS-2000 `HERE` command (`H X=0 Y=0`).
+        """
+        with self._lock:
+            if not self._connected:
+                raise MS2000Error("Stage is not connected.")
+
+            norm_axes = []
+            for ax in axes:
+                ax_u = str(ax).strip().upper()
+                if ax_u in ("X", "Y"):
+                    norm_axes.append(ax_u)
+                elif ax_u == "Z" and self._has_z:
+                    norm_axes.append(ax_u)
+
+            if not norm_axes:
+                return self.get_position()
+
+            if self._simulate:
+                for ax_u in norm_axes:
+                    self._sim_pos[ax_u] = 0.0
+                pos = self.get_position()
+                self._log(f"Zeroed axes {','.join(norm_axes)} (sim) -> {pos}.")
+                return pos
+
+            tokens = ["H"] + [f"{ax_u}=0" for ax_u in norm_axes]
+            resp = self._serial_command(" ".join(tokens))
+            if not resp.startswith(":A"):
+                raise MS2000Error(f"Zero command ('{' '.join(tokens)}') rejected: {resp!r}")
+
+            pos = self.get_position()
+            self._log(f"Zeroed axes {','.join(norm_axes)} via HERE command -> {pos}.")
+            return pos
 
     def halt(self):
         """Emergency stop of all stage axes (`\\` command)."""
