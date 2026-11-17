@@ -48,7 +48,10 @@ class ImageViewerWidget(QtWidgets.QWidget):
         ctrl_bar.addSpacing(12)
         ctrl_bar.addWidget(QtWidgets.QLabel("Contrast:"))
         self.combo_contrast = QtWidgets.QComboBox()
-        self.combo_contrast.addItem("Auto (1% – 99.8%)", "percentile")
+        self.combo_contrast.addItem("Auto (1% – 99.8%)", (1.0, 99.8))
+        self.combo_contrast.addItem("5% – 95%", (5.0, 95.0))
+        self.combo_contrast.addItem("10% – 90%", (10.0, 90.0))
+        self.combo_contrast.addItem("0% – 50%", (0.0, 50.0))
         self.combo_contrast.addItem("Min – Max", "minmax")
         self.combo_contrast.addItem("Full 16-bit (0 – 65535)", "uint16")
         self.combo_contrast.currentIndexChanged.connect(self._on_display_settings_changed)
@@ -130,6 +133,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         if self._in_diagnostic_view:
             self._im_artist = None
             self._in_diagnostic_view = False
+        self._last_live_map_state = None
         self._render_image()
 
     def _compute_clim(self, img: np.ndarray):
@@ -139,10 +143,13 @@ class ImageViewerWidget(QtWidgets.QWidget):
         if mode == "minmax":
             vmin, vmax = float(np.min(img)), float(np.max(img))
             return (vmin, vmax) if vmax > vmin else (vmin, vmin + 1.0)
+        low_pct, high_pct = mode if isinstance(mode, tuple) else (1.0, 99.8)
         sample = img[::4, ::4] if img.size > 65536 else img
-        vmin, vmax = np.percentile(sample, [1.0, 99.8])
+        vmin, vmax = np.percentile(sample, [low_pct, high_pct])
         if vmax <= vmin:
-            vmin, vmax = float(np.min(img)), float(np.max(img)) + 1.0
+            vmin, vmax = float(np.min(img)), float(np.max(img))
+            if vmax <= vmin:
+                vmax = vmin + 1.0
         return float(vmin), float(vmax)
 
     def _render_image(self):
@@ -182,7 +189,10 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self.canvas.draw_idle()
 
     def _on_display_settings_changed(self):
-        if not self._in_diagnostic_view:
+        if self._in_diagnostic_view:
+            if self._last_live_map_state is not None:
+                self._render_live_map_state()
+        else:
             self._render_image()
 
     # ==========================================================================
@@ -201,6 +211,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
           - `'anamorphic_res'`: Step 6 2D anamorphic polynomial surface residuals (MHz).
         """
         self._in_diagnostic_view = True
+        self._last_live_map_state = None
         self._im_artist = None
         self.figure.clear()
 
@@ -317,6 +328,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
           - `'freq_map'`: Step 10B Full 2D calibrated frequency map & intra-order detuning map.
         """
         self._in_diagnostic_view = True
+        self._last_live_map_state = None
         self._im_artist = None
         self.figure.clear()
 
@@ -453,6 +465,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
           - `'q_dispersion'`: Step 14 2D Coaxial Ellipse Geometry & Acoustic Dispersion V_s.
         """
         self._in_diagnostic_view = True
+        self._last_live_map_state = None
         self._im_artist = None
         self.figure.clear()
 
