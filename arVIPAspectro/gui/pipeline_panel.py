@@ -17,6 +17,7 @@ from PySide6 import QtWidgets, QtCore
 
 from ..hardware import MS2000Stage, OrcaFlashCamera
 from ..acquisition_pipeline import AcquisitionSession, MapGridConfig
+from .. import config
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -113,6 +114,53 @@ class CalibrationCaptureWorker(QtCore.QThread):
             self.sig_captured.emit(self.role, frame, pos, exp_s, n_avg, binning)
         except Exception as exc:
             self.sig_error.emit(f"Calibration Capture Error ({self.role})", str(exc))
+
+
+class LaserCalibrationWorker(QtCore.QThread):
+    """
+    Background worker for Step 5.1: Executes `session.run_laser_calibration(...)`
+    (Steps 2–6 of `arVIPAspectro.laser_calib`: denoising, fringe tracing, sub-pixel
+    refinement, 2D gnomonic VIPA geometry fit, and 2D anamorphic order surface fit).
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_calibrated = QtCore.Signal(object)  # calib_res dict
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(
+        self,
+        session: AcquisitionSession,
+        params: Dict[str, Any],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.session = session
+        self.params = params
+
+    def run(self):
+        try:
+            t0 = time.time()
+            self.sig_log.emit("Step 5.1 — Running Laser Reference Calibration (Steps 2–6)...")
+            res = self.session.run_laser_calibration(
+                scale_laser=int(self.params.get("scale_laser", config.SCALE_LASER)),
+                ksize_se=int(self.params.get("ksize_se", config.KSIZE_STRUCTURING_ELEMENTS_LASER)),
+                ksize_blur=int(self.params.get("ksize_blur", config.KSIZE_BLUR_LASER)),
+                y_center_laser=int(self.params.get("y_center_laser", config.Y_CENTER_LASER)),
+                dy_laser=int(self.params.get("dy_laser", config.DY_LASER)),
+                nb_laser_modes=int(self.params.get("nb_laser_modes", config.NB_LASER_MODES)),
+                distance_peaks=int(self.params.get("distance_peaks", config.DISTANCE_PEAKS_LASER)),
+                poly_deg=int(self.params.get("poly_deg", 4)),
+            )
+            dt = time.time() - t0
+            self.sig_log.emit(
+                f"Step 5.1 Completed in {dt:.2f} s: {len(res['refined_fringes'])} modes | "
+                f"Optical axis (x0={res['x0_fit']:.2f}, y0={res['y0_fit']:.2f}) px | "
+                f"Gnomonic Xc={res['xc_gnom']:.2f} px | "
+                f"Anamorphic RMS: {res['rms_raw_mhz']:.2f} MHz raw, {res['rms_smooth_mhz']:.2f} MHz smooth."
+            )
+            self.sig_calibrated.emit(res)
+        except Exception as exc:
+            self.sig_error.emit("Step 5.1 Laser Calibration Error", str(exc))
 
 
 class MapScanWorker(QtCore.QThread):
@@ -260,6 +308,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
     sig_log = QtCore.Signal(str)
     sig_display_frame = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
+    sig_show_laser_diagnostics = QtCore.Signal(object, str)             # (calib_res, view_mode)
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
     sig_lock_geometry = QtCore.Signal(bool)
@@ -278,6 +327,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.session = AcquisitionSession()
 
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
+        self._laser_calib_worker: Optional[LaserCalibrationWorker] = None
         self._map_worker: Optional[MapScanWorker] = None
         self._map_paused: bool = False
 
@@ -307,6 +357,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
         layout.addWidget(self._build_h5_session_card())
         layout.addWidget(self._build_calibration_prompt_card())
+        layout.addWidget(self._build_step5_1_laser_calib_card())
         layout.addWidget(self._build_map_configuration_card())
         layout.addStretch()
 
@@ -453,6 +504,101 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.lbl_status_ref.setAlignment(QtCore.Qt.AlignCenter)
         self.lbl_status_ref.setMinimumWidth(95)
         grid.addWidget(self.lbl_status_ref, 3, 5)
+
+        return box
+
+    def _build_step5_1_laser_calib_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox(
+            "Step 5.1 — Laser Reference Calibration (Steps 2–6: Fringes, VIPA Geometry & Anamorphic Surface)"
+        )
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(6)
+
+        # Row 1: Auto-calibrate toggle + Status badge
+        top_row = QtWidgets.QHBoxLayout()
+        self.chk_auto_calib_laser = QtWidgets.QCheckBox(
+            "Auto-run Laser Calibration after acquiring Laser Reference"
+        )
+        self.chk_auto_calib_laser.setChecked(True)
+        top_row.addWidget(self.chk_auto_calib_laser)
+        top_row.addStretch()
+
+        self.lbl_laser_calib_status = QtWidgets.QLabel("NOT CALIBRATED")
+        self.lbl_laser_calib_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_laser_calib_status.setMinimumWidth(140)
+        top_row.addWidget(self.lbl_laser_calib_status)
+        layout.addLayout(top_row)
+
+        # Row 2: Algorithm parameters
+        param_row = QtWidgets.QHBoxLayout()
+        param_row.addWidget(QtWidgets.QLabel("Modes:"))
+        self.spin_lc_modes = QtWidgets.QSpinBox()
+        self.spin_lc_modes.setRange(2, 30)
+        self.spin_lc_modes.setValue(int(config.NB_LASER_MODES))
+        param_row.addWidget(self.spin_lc_modes)
+
+        param_row.addSpacing(6)
+        param_row.addWidget(QtWidgets.QLabel("Sym Y₀:"))
+        self.spin_lc_ycenter = QtWidgets.QSpinBox()
+        self.spin_lc_ycenter.setRange(10, 4096)
+        self.spin_lc_ycenter.setValue(int(config.Y_CENTER_LASER))
+        self.spin_lc_ycenter.setSuffix(" px")
+        param_row.addWidget(self.spin_lc_ycenter)
+
+        param_row.addSpacing(6)
+        param_row.addWidget(QtWidgets.QLabel("Min Peak Dist:"))
+        self.spin_lc_dist = QtWidgets.QSpinBox()
+        self.spin_lc_dist.setRange(10, 1000)
+        self.spin_lc_dist.setValue(int(config.DISTANCE_PEAKS_LASER))
+        self.spin_lc_dist.setSuffix(" px")
+        param_row.addWidget(self.spin_lc_dist)
+
+        param_row.addSpacing(6)
+        param_row.addWidget(QtWidgets.QLabel("Morph Scale:"))
+        self.spin_lc_scale = QtWidgets.QSpinBox()
+        self.spin_lc_scale.setRange(2, 32)
+        self.spin_lc_scale.setValue(int(config.SCALE_LASER))
+        param_row.addWidget(self.spin_lc_scale)
+
+        param_row.addSpacing(6)
+        param_row.addWidget(QtWidgets.QLabel("Poly Deg:"))
+        self.spin_lc_deg = QtWidgets.QSpinBox()
+        self.spin_lc_deg.setRange(2, 6)
+        self.spin_lc_deg.setValue(4)
+        param_row.addWidget(self.spin_lc_deg)
+        param_row.addStretch()
+        layout.addLayout(param_row)
+
+        # Row 3: Execute Calibration button + Diagnostic Plot Viewers
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_run_laser_calib = QtWidgets.QPushButton("⚙ Calibrate Laser Reference (Steps 2–6)")
+        self.btn_run_laser_calib.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_run_laser_calib.clicked.connect(self._on_run_laser_calibration)
+        btn_row.addWidget(self.btn_run_laser_calib)
+
+        self.btn_diag_seeds = QtWidgets.QPushButton("📊 5.1A: Denoise & Seeds")
+        self.btn_diag_seeds.clicked.connect(lambda: self._on_show_laser_diag("denoise_seeds"))
+        btn_row.addWidget(self.btn_diag_seeds)
+
+        self.btn_diag_geom = QtWidgets.QPushButton("📊 5.1B: Fringes & Geometry")
+        self.btn_diag_geom.clicked.connect(lambda: self._on_show_laser_diag("fringes_geom"))
+        btn_row.addWidget(self.btn_diag_geom)
+
+        self.btn_diag_res = QtWidgets.QPushButton("📊 5.1C: Surface Residuals")
+        self.btn_diag_res.clicked.connect(lambda: self._on_show_laser_diag("anamorphic_res"))
+        btn_row.addWidget(self.btn_diag_res)
+        layout.addLayout(btn_row)
+
+        # Row 4: Calibrated Geometry & Surface RMS Summary Banner
+        self.lbl_laser_calib_summary = QtWidgets.QLabel(
+            "Acquire or load a Laser Reference image, then click 'Calibrate Laser Reference'."
+        )
+        self.lbl_laser_calib_summary.setStyleSheet(
+            "background-color: #1e293b; color: #e2e8f0; font-family: monospace; "
+            "font-size: 11px; padding: 5px; border-radius: 4px;"
+        )
+        self.lbl_laser_calib_summary.setWordWrap(True)
+        layout.addWidget(self.lbl_laser_calib_summary)
 
         return box
 
@@ -706,6 +852,58 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.sig_display_frame.emit(frame, pos, exp_s, n_avg, binning)
         self._update_calibration_badges()
 
+        # If Laser Reference was just acquired and auto-calibrate is enabled, trigger Step 5.1
+        if role == AcquisitionSession.ROLE_LASER and self.chk_auto_calib_laser.isChecked():
+            QtCore.QTimer.singleShot(50, self._on_run_laser_calibration)
+
+    def _on_run_laser_calibration(self):
+        if not self._ensure_h5_open():
+            return
+        if self.session.laser_image is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Laser Reference Missing",
+                "Please acquire or load a Laser Reference image first (Section 4B).",
+            )
+            return
+        if self._is_busy():
+            return
+
+        params = {
+            "nb_laser_modes": int(self.spin_lc_modes.value()),
+            "y_center_laser": int(self.spin_lc_ycenter.value()),
+            "distance_peaks": int(self.spin_lc_dist.value()),
+            "scale_laser": int(self.spin_lc_scale.value()),
+            "poly_deg": int(self.spin_lc_deg.value()),
+        }
+        self._set_controls_busy(True)
+        self._laser_calib_worker = LaserCalibrationWorker(
+            session=self.session,
+            params=params,
+            parent=self,
+        )
+        self._laser_calib_worker.sig_log.connect(self.sig_log.emit)
+        self._laser_calib_worker.sig_calibrated.connect(self._on_laser_calibrated)
+        self._laser_calib_worker.sig_error.connect(self._on_worker_error)
+        self._laser_calib_worker.finished.connect(lambda: self._set_controls_busy(False))
+        self._laser_calib_worker.start()
+
+    @QtCore.Slot(object)
+    def _on_laser_calibrated(self, res: dict):
+        self._update_calibration_badges()
+        self.sig_show_laser_diagnostics.emit(res, "fringes_geom")
+
+    def _on_show_laser_diag(self, view_mode: str):
+        res = self.session.laser_calib_result
+        if res is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Not Calibrated Yet",
+                "Run 'Calibrate Laser Reference (Steps 2–6)' first to view diagnostic plots.",
+            )
+            return
+        self.sig_show_laser_diagnostics.emit(res, view_mode)
+
     def _on_view_calibration(self, role: str):
         img = None
         meta = {}
@@ -758,6 +956,35 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_view_laser.setEnabled(has_laser)
         self.btn_view_rb.setEnabled(has_rb)
         self.btn_view_ref.setEnabled(has_ref)
+
+        # Update Step 5.1 Laser Calibration badge & summary
+        lc_res = self.session.laser_calib_result
+        has_lc = lc_res is not None
+        if has_lc:
+            self.lbl_laser_calib_status.setText("✓ CALIBRATED")
+            self.lbl_laser_calib_status.setStyleSheet(
+                "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+            )
+            self.lbl_laser_calib_summary.setText(
+                f"Modes: {len(lc_res['refined_fringes'])}  |  "
+                f"Optical Axis (x₀, y₀) = ({lc_res['x0_fit']:.2f}, {lc_res['y0_fit']:.2f}) px  |  "
+                f"Gnomonic Xc = {lc_res['xc_gnom']:.2f} px\n"
+                f"2D Anamorphic Surface Fit RMS: {lc_res['rms_raw_mhz']:.2f} MHz (raw)  /  "
+                f"{lc_res['rms_smooth_mhz']:.2f} MHz (smoothed)"
+            )
+        else:
+            self.lbl_laser_calib_status.setText("NOT CALIBRATED")
+            self.lbl_laser_calib_status.setStyleSheet(
+                "background-color: #455a64; color: #cfd8dc; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+            )
+            self.lbl_laser_calib_summary.setText(
+                "Acquire or load a Laser Reference image, then click 'Calibrate Laser Reference'."
+            )
+
+        self.btn_run_laser_calib.setEnabled(has_laser)
+        self.btn_diag_seeds.setEnabled(has_lc)
+        self.btn_diag_geom.setEnabled(has_lc)
+        self.btn_diag_res.setEnabled(has_lc)
 
     # ==========================================================================
     # Event Handlers: Spatial Map Grid & Teaching
@@ -970,6 +1197,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     def _is_busy(self) -> bool:
         if self._cal_worker is not None and self._cal_worker.isRunning():
             return True
+        if self._laser_calib_worker is not None and self._laser_calib_worker.isRunning():
+            return True
         if self._map_worker is not None and self._map_worker.isRunning():
             return True
         return False
@@ -981,6 +1210,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             self.btn_acq_laser,
             self.btn_acq_rb,
             self.btn_acq_ref,
+            self.btn_run_laser_calib,
             self.btn_start_map,
             self.btn_set_start_current,
             self.btn_teach_a,

@@ -238,10 +238,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.pipeline_panel.sig_log.connect(self._append_log_slot)
         self.pipeline_panel.sig_display_frame.connect(self._on_frame_acquired)
+        self.pipeline_panel.sig_show_laser_diagnostics.connect(
+            self.image_viewer.show_laser_calibration_diagnostics
+        )
         self.pipeline_panel.sig_stage_updated.connect(self._update_stage_ui)
         self.pipeline_panel.sig_camera_updated.connect(self._update_camera_ui)
         self.pipeline_panel.sig_lock_geometry.connect(self.chk_lock_geometry.setChecked)
-        self.tabs_right.addTab(self.pipeline_panel, "🧭 Step 4: Acquisition Pipeline & Mapping")
+        self.tabs_right.addTab(self.pipeline_panel, "🧭 Steps 4–5: Pipeline, Calibration & Mapping")
 
         right_layout.addWidget(self.tabs_right, stretch=3)
 

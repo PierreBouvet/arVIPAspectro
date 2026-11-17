@@ -554,8 +554,23 @@ class OrcaFlashCamera:
         xn = (xx - 0.5 * det_w) / (0.5 * det_w)
         yn = (yy - 0.5 * det_h) / (0.5 * det_h)
 
-        # Curved VIPA orders (parabolic curvature along y + non-linear dispersion along x)
-        order_phase = 6.0 * (xn + 1.05) - 0.45 * (xn + 1.05) ** 2 + 0.18 * (yn ** 2)
+        # Exact 2D gnomonic VIPA order dispersion using arVIPAspectro backend physics
+        try:
+            from .. import config, backend as bck
+            g_2d = bck.g_from_xy(
+                xx,
+                yy,
+                x0=100.0,
+                y0=1150.0,
+                f=config.F_PX_DEFAULT,
+                phi=config.VIPA_TILT_ANGLE,
+                n_r=config.N_FUSED_SILICA_780,
+            )
+            g_min_ref, g_max_ref = 1.449836, 1.451927
+            order_phase = 12.0 * (g_max_ref - g_2d) / (g_max_ref - g_min_ref) - 0.35
+        except Exception:
+            order_phase = 6.0 * (xn + 1.05) - 0.45 * (xn + 1.05) ** 2 + 0.18 * (yn ** 2)
+
         frac = order_phase - np.floor(order_phase)
 
         mode = str(spectrum_type).lower().strip()

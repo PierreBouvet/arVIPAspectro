@@ -1,11 +1,12 @@
 """
-2D Camera Frame Viewer Widget (`ImageViewerWidget`) for displaying acquired
-Hamamatsu Orca Flash 4.0 v3 interferograms in real time.
+2D Camera Frame & Calibration Diagnostic Viewer Widget (`ImageViewerWidget`)
+for displaying acquired Hamamatsu Orca Flash 4.0 v3 interferograms and
+step-by-step calibration diagnostics.
 """
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 import numpy as np
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtWidgets
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
@@ -14,7 +15,7 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 class ImageViewerWidget(QtWidgets.QWidget):
     """
     Interactive 2D image canvas with colormap/contrast controls, frame statistics,
-    and live cursor pixel/intensity readout.
+    live cursor pixel/intensity readout, and calibration diagnostic plot modes.
     """
 
     COLORMAPS = ["inferno", "viridis", "magma", "plasma", "gray", "turbo"]
@@ -25,6 +26,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._current_title: str = "No image acquired yet"
         self._im_artist = None
         self._cbar = None
+        self._in_diagnostic_view: bool = False
 
         self._build_ui()
 
@@ -114,6 +116,9 @@ class ImageViewerWidget(QtWidgets.QWidget):
             f"Min: {vmin_raw}  |  Max: {vmax_raw}  |  Mean: {vmean:.1f}  |  Sat(≥65k): {n_sat} px"
         )
 
+        if self._in_diagnostic_view:
+            self._im_artist = None
+            self._in_diagnostic_view = False
         self._render_image()
 
     def _compute_clim(self, img: np.ndarray):
@@ -123,7 +128,6 @@ class ImageViewerWidget(QtWidgets.QWidget):
         if mode == "minmax":
             vmin, vmax = float(np.min(img)), float(np.max(img))
             return (vmin, vmax) if vmax > vmin else (vmin, vmin + 1.0)
-        # Default: fast strided percentile for large 2048x2048 frames
         sample = img[::4, ::4] if img.size > 65536 else img
         vmin, vmax = np.percentile(sample, [1.0, 99.8])
         if vmax <= vmin:
@@ -138,7 +142,11 @@ class ImageViewerWidget(QtWidgets.QWidget):
         vmin, vmax = self._compute_clim(self._current_image)
         h, w = self._current_image.shape[:2]
 
-        if self._im_artist is not None and self._im_artist.get_array().shape == (h, w):
+        if (
+            not self._in_diagnostic_view
+            and self._im_artist is not None
+            and self._im_artist.get_array().shape == (h, w)
+        ):
             self._im_artist.set_data(self._current_image)
             self._im_artist.set_cmap(cmap)
             self._im_artist.set_clim(vmin, vmax)
@@ -163,13 +171,134 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self.canvas.draw_idle()
 
     def _on_display_settings_changed(self):
-        self._render_image()
+        if not self._in_diagnostic_view:
+            self._render_image()
+
+    # ==========================================================================
+    # Step 5.1: Laser Reference Calibration Diagnostic Views
+    # ==========================================================================
+
+    def show_laser_calibration_diagnostics(
+        self,
+        calib_res: Dict[str, Any],
+        view_mode: str = "fringes_geom",
+    ):
+        """
+        Renders diagnostic plots for Step 5.1 (Laser Reference Calibration):
+          - `'denoise_seeds'`: Step 2–3 Denoised laser image + central row profile & seed peaks.
+          - `'fringes_geom'`: Step 4–5 Traced & refined sub-pixel fringes + gnomonic optical axis.
+          - `'anamorphic_res'`: Step 6 2D anamorphic polynomial surface residuals (MHz).
+        """
+        self._in_diagnostic_view = True
+        self._im_artist = None
+        self.figure.clear()
+
+        cmap = self.combo_cmap.currentText()
+        data_sub = calib_res["data_subtracted"]
+        vmin, vmax = self._compute_clim(data_sub)
+
+        if view_mode == "denoise_seeds":
+            gs = self.figure.add_gridspec(2, 1, height_ratios=[2.2, 1.0])
+            ax_img = self.figure.add_subplot(gs[0])
+            ax_prof = self.figure.add_subplot(gs[1])
+
+            im = ax_img.imshow(data_sub, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper", aspect="auto")
+            self.figure.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04, label="Net ADU")
+
+            yc = calib_res["y_center_laser"]
+            dy = calib_res["dy_laser"]
+            peaks = np.asarray(calib_res["peaks"]).ravel()
+            ax_img.axhline(yc - dy, color="cyan", linestyle="--", linewidth=1.0, label="Row-avg band")
+            ax_img.axhline(yc + dy, color="cyan", linestyle="--", linewidth=1.0)
+            ax_img.plot(peaks, np.full_like(peaks, yc), "r*", markersize=8, label=f"{len(peaks)} seed peaks")
+            ax_img.set_title("Step 5.1A — Denoised Laser Interferogram & Central Seed Band", fontsize=10)
+            ax_img.set_ylabel("Detector Y (px)")
+            ax_img.legend(loc="upper right", fontsize=8)
+
+            avg_row = calib_res["average_row"]
+            ax_prof.plot(np.arange(len(avg_row)), avg_row, color="#0288d1", linewidth=1.2, label="Row average")
+            ax_prof.plot(peaks, avg_row[peaks], "ro", markersize=5, label="Detected modes")
+            ax_prof.set_title("Central Row-Averaged Profile & Detected Laser Fringes", fontsize=10)
+            ax_prof.set_xlabel("Detector X (px)")
+            ax_prof.set_ylabel("Net Intensity (ADU)")
+            ax_prof.grid(True, alpha=0.3)
+            ax_prof.legend(loc="upper right", fontsize=8)
+            self.ax = ax_img
+
+        elif view_mode == "anamorphic_res":
+            ax1 = self.figure.add_subplot(1, 2, 1)
+            ax2 = self.figure.add_subplot(1, 2, 2)
+
+            all_x = calib_res["all_x_laser"]
+            all_y = calib_res["all_y_laser"]
+            err_raw = calib_res["err_2d_mhz"]
+            err_sm = calib_res["err_2d_smooth_mhz"]
+            rms_raw = calib_res["rms_raw_mhz"]
+            rms_sm = calib_res["rms_smooth_mhz"]
+
+            lim = max(5.0, float(np.percentile(np.abs(err_raw), 98)))
+            sc = ax1.scatter(all_x, all_y, c=err_raw, s=2, cmap="coolwarm", vmin=-lim, vmax=lim)
+            self.figure.colorbar(sc, ax=ax1, fraction=0.046, pad=0.04, label="Residual (MHz)")
+            ax1.invert_yaxis()
+            ax1.set_title(f"2D Surface Residuals (Raw RMS = {rms_raw:.2f} MHz)", fontsize=10)
+            ax1.set_xlabel("Detector X (px)")
+            ax1.set_ylabel("Detector Y (px)")
+            ax1.grid(True, alpha=0.25)
+
+            ax2.scatter(err_raw, all_y, s=2, alpha=0.3, color="#64b5f6", label=f"Raw ({rms_raw:.2f} MHz)")
+            ax2.scatter(err_sm, all_y, s=2, alpha=0.7, color="#e53935", label=f"Smoothed ({rms_sm:.2f} MHz)")
+            ax2.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
+            ax2.invert_yaxis()
+            ax2.set_title("Anamorphic Residual vs. Detector Y", fontsize=10)
+            ax2.set_xlabel("Frequency Residual (MHz)")
+            ax2.set_ylabel("Detector Y (px)")
+            ax2.grid(True, alpha=0.3)
+            ax2.legend(loc="upper right", fontsize=8)
+            self.ax = ax1
+
+        else:
+            # Default: 'fringes_geom' — Refined fringes + fitted optical axis
+            ax_img = self.figure.add_subplot(111)
+            im = ax_img.imshow(data_sub, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper", aspect="equal")
+            self.figure.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04, label="Net ADU")
+
+            ref_fringes = calib_res["refined_fringes"]
+            for k, (fx, fy) in enumerate(ref_fringes):
+                lbl = "Refined fringes (k)" if k == 0 else None
+                ax_img.plot(fx, fy, color="#00e5ff", linewidth=1.1, alpha=0.9, label=lbl)
+
+            x0_fit = calib_res["x0_fit"]
+            y0_fit = calib_res["y0_fit"]
+            xc_gnom = calib_res["xc_gnom"]
+            ax_img.axhline(y0_fit, color="#ffeb3b", linestyle="--", linewidth=1.2, label=f"Symmetry y₀ = {y0_fit:.1f} px")
+            ax_img.plot([x0_fit], [y0_fit], "r+", markersize=12, markeredgewidth=2.0, label=f"Optical axis x₀ = {x0_fit:.1f} px")
+
+            ax_img.set_title(
+                f"Step 5.1B — {len(ref_fringes)} Refined Fringes | "
+                f"Optical Axis ({x0_fit:.1f}, {y0_fit:.1f}) px | Gnomonic Xc = {xc_gnom:.1f} px",
+                fontsize=10,
+            )
+            ax_img.set_xlabel("Detector X (px)")
+            ax_img.set_ylabel("Detector Y (px)")
+            ax_img.legend(loc="upper right", fontsize=8)
+            self.ax = ax_img
+
+        self.lbl_stats.setText(
+            f"Laser Calib: {len(calib_res['refined_fringes'])} modes  |  "
+            f"(x₀, y₀)=({calib_res['x0_fit']:.1f}, {calib_res['y0_fit']:.1f}) px  |  "
+            f"RMS: {calib_res['rms_raw_mhz']:.2f} MHz raw, {calib_res['rms_smooth_mhz']:.2f} MHz smooth"
+        )
+        self.canvas.draw_idle()
 
     def _on_mouse_move(self, event):
-        if self._current_image is None or event.inaxes != self.ax:
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
             self.lbl_cursor.setText("Cursor: —")
             return
-        if event.xdata is None or event.ydata is None:
+        if self._in_diagnostic_view:
+            self.lbl_cursor.setText(f"Cursor: X = {event.xdata:.2f}, Y = {event.ydata:.2f}")
+            return
+        if self._current_image is None or event.inaxes != self.ax:
+            self.lbl_cursor.setText("Cursor: —")
             return
         col = int(round(event.xdata))
         row = int(round(event.ydata))

@@ -21,6 +21,9 @@ import numpy as np
 import h5py
 from HDF5_BLS import Wrapper
 
+from . import config
+from . import laser_calib
+
 
 @dataclass
 class MapGridConfig:
@@ -156,6 +159,9 @@ class AcquisitionSession:
         self.rb_meta: Dict[str, Any] = {}
         self.ref_sample_meta: Dict[str, Any] = {}
 
+        # Step 5.1: Laser Calibration results dictionary
+        self.laser_calib_result: Optional[Dict[str, Any]] = None
+
     @property
     def is_open(self) -> bool:
         return self.wrapper is not None and self.h5_path is not None
@@ -192,10 +198,12 @@ class AcquisitionSession:
         self.laser_image, self.laser_meta = self._try_load_calibration(self.ROLE_LASER)
         self.rb_image, self.rb_meta = self._try_load_calibration(self.ROLE_RB)
         self.ref_sample_image, self.ref_sample_meta = self._try_load_calibration(self.ROLE_REF_SAMPLE)
+        self.laser_calib_result = self._try_load_laser_calibration_result()
 
         return {
             "h5_path": self.h5_path,
             "has_laser": self.laser_image is not None,
+            "has_laser_calib": self.laser_calib_result is not None,
             "has_rb": self.rb_image is not None,
             "has_ref_sample": self.ref_sample_image is not None,
             "existing_maps": self.list_map_groups(),
@@ -266,12 +274,220 @@ class AcquisitionSession:
         if role == self.ROLE_LASER:
             self.laser_image = np.asarray(image)
             self.laser_meta = attrs
+            self.laser_calib_result = None  # Reset calibration state when a new raw laser image is saved
         elif role == self.ROLE_RB:
             self.rb_image = np.asarray(image)
             self.rb_meta = attrs
         elif role == self.ROLE_REF_SAMPLE:
             self.ref_sample_image = np.asarray(image)
             self.ref_sample_meta = attrs
+
+    # ==========================================================================
+    # Step 5.1: Laser Reference Calibration (Steps 2 to 6 of arVIPAspectro)
+    # ==========================================================================
+
+    def _try_load_laser_calibration_result(self) -> Optional[Dict[str, Any]]:
+        """
+        Attempts to reconstruct previously saved Laser Calibration results from
+        `Brillouin/Calibration/laser_reference` in the HDF5 file if present.
+        """
+        if not self.is_open or self.laser_image is None:
+            return None
+
+        path_laser = f"{self.CALIBRATION_GROUP}/{self.ROLE_LASER}"
+        try:
+            children = self.wrapper.get_children_elements(path_laser)
+            attrs = self.wrapper.get_attributes(path_laser)
+            if "image_corrected" not in children or "x0_fit_circular" not in attrs:
+                return None
+
+            surf = laser_calib.retrieve_anamorphic_surface_calibration(self.wrapper, path_laser)
+            if surf is None:
+                return None
+
+            data_sub, base_2d = laser_calib.retrieve_denoised_data(self.wrapper, path_laser)
+            h = data_sub.shape[0]
+            y_center = min(int(config.Y_CENTER_LASER), h // 2)
+            peaks, points = laser_calib.retrieve_fringes(self.wrapper, path_laser, y_center_laser=y_center)
+            ref_fringes, ax, axs, ay, ak = laser_calib.retrieve_refined_fringes(self.wrapper, path_laser)
+            x0_fit, y0_fit, xc_gnom, yc_gnom = laser_calib.retrieve_vipa_geometry(self.wrapper, path_laser)
+
+            # Recompute full calibration dict for diagnostic plotting
+            full_cal = laser_calib.calibrate_anamorphic_order_surface(
+                self.wrapper,
+                path_laser,
+                ax,
+                axs,
+                ay,
+                ak,
+                x0_fit,
+                y0_fit,
+                h_img=h,
+                nb_laser_modes=len(ref_fringes),
+                fsr_vipa=config.FSR_VIPA,
+            )
+            y_min = max(0, int(y_center - config.DY_LASER))
+            y_max = min(h, int(y_center + config.DY_LASER))
+            avg_row = np.average(data_sub[y_min:y_max, :], axis=0)
+
+            res = {
+                "data_raw": self.laser_image.astype(np.float64),
+                "data_subtracted": data_sub,
+                "baseline_2d": base_2d,
+                "peaks": peaks,
+                "points": points,
+                "average_row": avg_row,
+                "y_center_laser": y_center,
+                "dy_laser": config.DY_LASER,
+                "refined_fringes": ref_fringes,
+                "all_x_laser": ax,
+                "all_x_laser_smooth": axs,
+                "all_y_laser": ay,
+                "all_k_laser": ak,
+                "x0_fit": x0_fit,
+                "y0_fit": y0_fit,
+                "xc_gnom": xc_gnom,
+                "yc_gnom": yc_gnom,
+            }
+            res.update(full_cal)
+            return res
+        except Exception:
+            return None
+
+    def run_laser_calibration(
+        self,
+        scale_laser: int = config.SCALE_LASER,
+        ksize_se: int = config.KSIZE_STRUCTURING_ELEMENTS_LASER,
+        ksize_blur: int = config.KSIZE_BLUR_LASER,
+        y_center_laser: int = config.Y_CENTER_LASER,
+        dy_laser: int = config.DY_LASER,
+        nb_laser_modes: int = config.NB_LASER_MODES,
+        distance_peaks: int = config.DISTANCE_PEAKS_LASER,
+        poly_deg: int = 4,
+    ) -> Dict[str, Any]:
+        """
+        Executes Steps 2–6 of `arVIPAspectro.laser_calib` on `Brillouin/Calibration/laser_reference`:
+          - Step 2: Morphological background extraction & denoising (`denoise_laser`)
+          - Step 3: Seed peak detection & full-height vertical fringe tracing (`extract_laser_fringes`)
+          - Step 4: Unsaturated quadratic-weighted sub-pixel centroiding & outlier rejection (`refine_laser_fringes`)
+          - Step 5: Exact 2D gnomonic VIPA geometry fit (`fit_vipa_geometry`)
+          - Step 6: 2D anamorphic polynomial order surface fit & persistence (`calibrate_anamorphic_order_surface`)
+        """
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+        if self.laser_image is None:
+            raise RuntimeError("No Laser Reference image has been acquired or loaded yet.")
+
+        path_laser = f"{self.CALIBRATION_GROUP}/{self.ROLE_LASER}"
+        data_raw = self.laser_image.astype(np.float64)
+        h, w = data_raw.shape
+
+        # Clamp y_center_laser and distance_peaks if a smaller ROI or binning is active
+        y_center = int(y_center_laser)
+        if y_center >= h - 10 or y_center < 10:
+            y_center = h // 2
+        dy_c = min(int(dy_laser), max(5, h // 6))
+        dist_p = min(int(distance_peaks), max(10, w // (max(2, int(nb_laser_modes)) + 2)))
+
+        # Step 2: Denoising
+        data_sub, base_2d = laser_calib.denoise_laser(
+            self.wrapper,
+            path_laser,
+            data_raw,
+            scale=int(scale_laser),
+            ksize_structuring_elements=int(ksize_se),
+            ksize_blur=int(ksize_blur),
+        )
+
+        # Step 3: Fringe Detection & Vertical Tracing
+        peaks, points, avg_row = laser_calib.extract_laser_fringes(
+            self.wrapper,
+            path_laser,
+            data_sub,
+            y_center_laser=y_center,
+            dy_laser=dy_c,
+            nb_laser_modes=int(nb_laser_modes),
+            distance_peaks=dist_p,
+            dy_trace=config.DY_TRACE,
+            var_trace=config.VAR_TRACE,
+        )
+        if len(points) < 2:
+            raise RuntimeError(
+                f"Only {len(points)} laser fringe(s) were detected. "
+                "Check laser exposure/contrast or adjust 'Symmetry Y' and 'Min Peak Distance'."
+            )
+
+        # Step 4: Sub-Pixel Refinement & Outlier Rejection
+        ref_fringes, ax, axs, ay, ak = laser_calib.refine_laser_fringes(
+            self.wrapper,
+            path_laser,
+            points,
+            data_raw,
+            data_sub,
+            w_sub=config.W_SUB,
+            saturation_limit=config.SATURATION_LIMIT,
+            min_net_amp=config.MIN_NET_AMP,
+        )
+        if len(ref_fringes) < 2:
+            raise RuntimeError(
+                f"Only {len(ref_fringes)} fringe(s) survived sub-pixel refinement (check saturation or low signal)."
+            )
+
+        # Step 5: Exact 2D Gnomonic VIPA Geometry Fit
+        x0_fit, y0_fit, xc_gnom, yc_gnom = laser_calib.fit_vipa_geometry(
+            self.wrapper,
+            path_laser,
+            ref_fringes,
+            ax,
+            ay,
+            ak,
+            f_px=config.F_PX_DEFAULT,
+            phi_rad=config.VIPA_TILT_ANGLE,
+            n_r=config.N_FUSED_SILICA_780,
+        )
+
+        # Step 6: 2D Anamorphic Order Surface Calibration
+        calib_res = laser_calib.calibrate_anamorphic_order_surface(
+            self.wrapper,
+            path_laser,
+            ax,
+            axs,
+            ay,
+            ak,
+            x0_fit,
+            y0_fit,
+            f_px=config.F_PX_DEFAULT,
+            phi_rad=config.VIPA_TILT_ANGLE,
+            n_r=config.N_FUSED_SILICA_780,
+            h_img=h,
+            nb_laser_modes=len(ref_fringes),
+            fsr_vipa=config.FSR_VIPA,
+            deg=int(poly_deg),
+        )
+        laser_calib.save_anamorphic_surface_calibration(self.wrapper, path_laser, calib_res)
+
+        result = {
+            "data_raw": data_raw,
+            "data_subtracted": data_sub,
+            "baseline_2d": base_2d,
+            "peaks": peaks,
+            "points": points,
+            "average_row": avg_row,
+            "y_center_laser": y_center,
+            "dy_laser": dy_c,
+            "refined_fringes": ref_fringes,
+            "all_x_laser": ax,
+            "all_x_laser_smooth": axs,
+            "all_y_laser": ay,
+            "all_k_laser": ak,
+            "x0_fit": x0_fit,
+            "y0_fit": y0_fit,
+            "xc_gnom": xc_gnom,
+            "yc_gnom": yc_gnom,
+        }
+        result.update(calib_res)
+        self.laser_calib_result = result
+        return result
 
     def list_map_groups(self) -> List[str]:
         """Lists existing `Measure` map groups under `Brillouin/`."""
