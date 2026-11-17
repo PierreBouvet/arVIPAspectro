@@ -14,6 +14,7 @@ Manages:
 """
 
 import os
+import threading
 import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
@@ -22,6 +23,7 @@ import h5py
 from HDF5_BLS import Wrapper
 
 from . import config
+from . import backend as bck
 from . import laser_calib
 from . import Rb_calib
 from . import spectrum_fitting
@@ -149,6 +151,7 @@ class AcquisitionSession:
     ROLE_REF_SAMPLE = "reference_sample"
 
     def __init__(self):
+        self._h5_lock = threading.RLock()
         self.h5_path: Optional[str] = None
         self.wrapper: Optional[Wrapper] = None
 
