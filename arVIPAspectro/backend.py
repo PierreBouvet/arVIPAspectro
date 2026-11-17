@@ -10,7 +10,7 @@ import numpy as np
 import scipy.ndimage as ndimage
 from scipy.special import wofz
 from scipy.optimize import minimize, curve_fit
-from HDF5_BLS import Wrapper
+from HDF5_BLS import Wrapper, File
 try:
     from HDF5_BLS.errors import WrapperError_Overwrite
 except ImportError:
@@ -44,10 +44,11 @@ def create_wrapper(directory, name='Measures.h5', exclude_dir=None):
         if os.path.isdir(file):
             grp_name = os.path.basename(file)
             if hasattr(wrapper, "create_group"):
-                wrapper.create_group(name=grp_name, parent_group=parent_group)
+                wrapper[parent_group].create_group(name=grp_name)
             elif hasattr(wrapper, "add_data_group_to_wrapper"):
                 wrapper.add_data_group_to_wrapper(name=grp_name, parent_group=parent_group)
             for path in os.listdir(file):
+                # print(tab*'\t', path)
                 add_dat(
                     os.path.join(file, path),
                     dir_path=os.path.join(dir_path, grp_name),
@@ -55,24 +56,29 @@ def create_wrapper(directory, name='Measures.h5', exclude_dir=None):
                     tab = tab+1
                 )
         elif file.endswith('.dat'):
+            # print(tab*"\t", file)
             data = np.loadtxt(os.path.join(dir_path, file))
             grp_name = os.path.splitext(os.path.basename(file))[0]
-            wrapper.add_raw_data(data, parent_group=f'{parent_group}/{grp_name}', name='image')
+            if grp_name in wrapper.get_children_elements(parent_group):
+                pass
+            else:
+                wrapper.add_raw_data(data, parent_group=f'{parent_group}/{grp_name}', name='image')
 
     if not name.endswith('.h5'):
         name += '.h5'
     target_file = os.path.join(directory, name)
-    wrapper = Wrapper(target_file)
+    
+    with File(target_file, "a") as wrapper:
+        for file in os.listdir(directory):
+            # print(file)
+            if file.endswith('.h5') or file in exclude_dir:
+                continue
+            try:
+                add_dat(os.path.join(directory, file), directory)
+            except WrapperError_Overwrite:
+                pass
 
-    for file in os.listdir(directory):
-        if file.endswith('.h5') or file in exclude_dir:
-            continue
-        try:
-            add_dat(os.path.join(directory, file), directory)
-        except WrapperError_Overwrite:
-            pass
-
-    return wrapper
+    return Wrapper(target_file)
 
 
 # ==============================================================================
@@ -268,7 +274,7 @@ def g_function(u, n_r):
     """
     Internal refraction geometric factor g(u) = sqrt(u^2 + n_r^2 - 1)/n_r.
     """
-    return np.sqrt(np.asarray(u, float)**2 + n_r**2 - 1.0)/n_r
+    return np.sqrt(np.asarray(u, float)**2 + n_r**2 - 1.0)#/n_r
 
 
 def g_from_xy(x, y, x0, y0, f, phi, n_r):

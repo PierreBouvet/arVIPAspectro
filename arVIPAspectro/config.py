@@ -58,7 +58,7 @@ KSIZE_BLUR_LASER = 11                       # Gaussian blur kernel size for base
 
 Y_CENTER_LASER = 1200                       # Approximate vertical axis of symmetry (px)
 DY_LASER = 50                               # Half-window height for row-averaging around symmetry axis (px)
-NB_LASER_MODES = 14                         # Expected number of laser reference fringes
+NB_LASER_MODES = 12                         # Expected number of laser reference fringes
 DISTANCE_PEAKS_LASER = 100                  # Minimum horizontal distance between peaks (px)
 DY_TRACE = 20                               # Window height for vertical fringe tracing
 VAR_TRACE = 2                               # Max horizontal step variation between consecutive rows (px)

@@ -17,6 +17,9 @@ dependencies = [
     "matplotlib",
     "h5py",
     "opencv-python",
+    "PySide6",
+    "pyserial",
+    "pylablib-lightweight",
 ]
 
 [tool.setuptools.packages.find]

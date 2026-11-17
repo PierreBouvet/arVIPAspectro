@@ -1,523 +1,372 @@
 """
-app.py: Main Window and GUI Orchestrator for arVIPAspectro Suite.
+Step 1 GUI: Hardware Connection & Status Panel for
+  - Hamamatsu Orca Flash 4.0 v3 sCMOS Camera (DCAM-API / `pylablib`)
+  - ASI MS-2000 Motorized XY(Z) Stage (`pyserial`)
 """
 
-import os
-import sys
-from typing import Optional, Dict, Any, List
-import numpy as np
+import datetime
 from PySide6 import QtWidgets, QtCore, QtGui
 
-from .canvas import PlotVisualizer
-from .h5_explorer import H5ExplorerWidget
-from .step_widgets import (
-    LaserCalibrationWidget,
-    RbCalibrationWidget,
-    PeakFittingWidget,
-    WavevectorDispersionWidget,
+from ..hardware import (
+    MS2000Stage,
+    MS2000Error,
+    list_serial_ports,
+    OrcaFlashCamera,
+    OrcaCameraError,
+    count_dcam_cameras,
 )
-from .workers import PipelineWorker
-from .theme import DARK_QSS, LIGHT_QSS, get_system_theme
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Main Application Window for arVIPAspectro."""
+    """Step 1 Application Window: Hardware Connection & Verification."""
 
-    def __init__(self, default_h5: Optional[str] = None):
+    def __init__(self):
         super().__init__()
-        self.setWindowTitle("arVIPAspectro — Angle-Resolved VIPA Brillouin Spectrometry Suite")
-        self.resize(1400, 900)
+        self.setWindowTitle("arVIPAspectro — Step 1: Hardware Connection (Orca Flash 4.0 v3 & ASI MS-2000)")
+        self.resize(920, 620)
 
-        self.theme_mode: str = "system"  # 'system', 'dark', or 'light'
-        self.current_theme: str = get_system_theme()
-        self.current_worker: Optional[PipelineWorker] = None
+        # Hardware driver instances
+        self.camera = OrcaFlashCamera(logger=self._append_log)
+        self.stage = MS2000Stage(logger=self._append_log)
 
-        self._setup_ui()
-        self._setup_menus()
-        self.apply_theme(self.current_theme)
+        self._build_ui()
+        self._refresh_serial_ports()
+        self._scan_dcam_cameras()
+        self._update_camera_ui()
+        self._update_stage_ui()
 
-        # Connect system appearance day/night changes
-        hints = QtGui.QGuiApplication.styleHints()
-        if hasattr(hints, "colorSchemeChanged"):
-            hints.colorSchemeChanged.connect(self._on_system_color_scheme_changed)
+    # ==========================================================================
+    # UI Construction
+    # ==========================================================================
 
-        if default_h5 and os.path.exists(default_h5):
-            self.h5_explorer.set_h5_file(default_h5)
+    def _build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root_layout = QtWidgets.QVBoxLayout(central)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(10)
 
-    def _setup_ui(self):
-        # Main central splitter (Horizontal: Left Visualizer | Right Controls)
-        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        self.setCentralWidget(self.main_splitter)
+        # 1. Top Toolbar: Global Connect / Disconnect
+        top_bar = QtWidgets.QHBoxLayout()
+        title_lbl = QtWidgets.QLabel("Step 1 — Hardware Connection & Diagnostics")
+        title_font = title_lbl.font()
+        title_font.setPointSize(13)
+        title_font.setBold(True)
+        title_lbl.setFont(title_font)
 
-        # ----------------------------------------------------------------------
-        # LEFT FRAME: Visualizer & Canvas
-        # ----------------------------------------------------------------------
-        left_container = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left_container)
-        left_layout.setContentsMargins(4, 4, 4, 4)
-        left_layout.setSpacing(4)
+        self.btn_connect_all = QtWidgets.QPushButton("Connect Both (Camera + Stage)")
+        self.btn_connect_all.setMinimumHeight(32)
+        self.btn_connect_all.clicked.connect(self._on_connect_all)
 
-        # Left/Bottom Vertical Splitter (Canvas on top, Console on bottom)
-        self.left_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.btn_disconnect_all = QtWidgets.QPushButton("Disconnect All")
+        self.btn_disconnect_all.setMinimumHeight(32)
+        self.btn_disconnect_all.clicked.connect(self._on_disconnect_all)
 
-        # Graph Visualizer
-        self.visualizer = PlotVisualizer(self)
-        self.left_splitter.addWidget(self.visualizer)
+        top_bar.addWidget(title_lbl)
+        top_bar.addStretch()
+        top_bar.addWidget(self.btn_connect_all)
+        top_bar.addWidget(self.btn_disconnect_all)
+        root_layout.addLayout(top_bar)
 
-        # Collapsible Bottom Console Drawer
-        self.console_drawer = self._create_console_drawer()
-        self.left_splitter.addWidget(self.console_drawer)
-        self.left_splitter.setStretchFactor(0, 4)
-        self.left_splitter.setStretchFactor(1, 1)
+        # 2. Middle Section: Side-by-Side Camera & Stage Cards
+        cards_layout = QtWidgets.QHBoxLayout()
+        cards_layout.setSpacing(12)
+        cards_layout.addWidget(self._build_camera_card(), stretch=1)
+        cards_layout.addWidget(self._build_stage_card(), stretch=1)
+        root_layout.addLayout(cards_layout, stretch=1)
 
-        left_layout.addWidget(self.left_splitter)
-        self.main_splitter.addWidget(left_container)
+        # 3. Bottom Section: Hardware Communication Log
+        log_group = QtWidgets.QGroupBox("Hardware Communication Log")
+        log_layout = QtWidgets.QVBoxLayout(log_group)
+        log_layout.setContentsMargins(8, 8, 8, 8)
 
-        # ----------------------------------------------------------------------
-        # RIGHT FRAME: Dual Tab (Tab 1: H5 Explorer, Tab 2: Processing Steps)
-        # ----------------------------------------------------------------------
-        right_container = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right_container)
-        right_layout.setContentsMargins(4, 4, 4, 4)
+        self.txt_log = QtWidgets.QPlainTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setFont(QtGui.QFont("Courier", 10))
+        self.txt_log.setMinimumHeight(150)
 
-        self.tabs_right = QtWidgets.QTabWidget()
+        btn_clear_log = QtWidgets.QPushButton("Clear Log")
+        btn_clear_log.setFixedWidth(90)
+        btn_clear_log.clicked.connect(self.txt_log.clear)
 
-        # Tab 1: HDF5 File Explorer
-        self.h5_explorer = H5ExplorerWidget(self)
-        self.h5_explorer.sig_dataset_preview.connect(self._on_h5_dataset_preview)
-        self.h5_explorer.sig_sample_selected.connect(self._on_sample_selected_from_h5)
-        self.h5_explorer.sig_laser_selected.connect(self._on_laser_selected_from_h5)
-        self.h5_explorer.sig_rb_selected.connect(self._on_rb_selected_from_h5)
-        self.h5_explorer.sig_file_loaded.connect(self._on_file_loaded)
-        self.tabs_right.addTab(self.h5_explorer, "📁 HDF5 Data Explorer")
+        log_header = QtWidgets.QHBoxLayout()
+        log_header.addStretch()
+        log_header.addWidget(btn_clear_log)
 
-        # Tab 2: Processing & Calibration Steps
-        steps_container = self._create_steps_container()
-        self.tabs_right.addTab(steps_container, "⚙ Processing & Calibration Steps")
+        log_layout.addWidget(self.txt_log)
+        log_layout.addLayout(log_header)
+        root_layout.addWidget(log_group)
 
-        right_layout.addWidget(self.tabs_right)
-        self.main_splitter.addWidget(right_container)
+    def _build_camera_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Camera — Hamamatsu Orca Flash 4.0 v3")
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(8)
 
-        # Proportions: 60% Left, 40% Right
-        self.main_splitter.setStretchFactor(0, 6)
-        self.main_splitter.setStretchFactor(1, 4)
+        # Status badge
+        self.lbl_cam_status = QtWidgets.QLabel("DISCONNECTED")
+        self.lbl_cam_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_cam_status.setMinimumHeight(28)
+        layout.addWidget(self.lbl_cam_status)
 
-        # Status Bar
-        self.status_bar = QtWidgets.QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Load an HDF5 container to begin.")
+        # Connection settings form
+        form = QtWidgets.QFormLayout()
+        self.chk_cam_sim = QtWidgets.QCheckBox("Simulation / Mock Mode (offline testing)")
+        form.addRow("Mode:", self.chk_cam_sim)
 
-    def _create_console_drawer(self) -> QtWidgets.QWidget:
-        drawer = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(drawer)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
+        cam_idx_row = QtWidgets.QHBoxLayout()
+        self.spin_cam_idx = QtWidgets.QSpinBox()
+        self.spin_cam_idx.setRange(0, 7)
+        self.spin_cam_idx.setValue(0)
+        self.btn_scan_dcam = QtWidgets.QPushButton("Scan DCAM")
+        self.btn_scan_dcam.clicked.connect(self._scan_dcam_cameras)
+        self.lbl_dcam_count = QtWidgets.QLabel("0 detected")
+        cam_idx_row.addWidget(self.spin_cam_idx)
+        cam_idx_row.addWidget(self.btn_scan_dcam)
+        cam_idx_row.addWidget(self.lbl_dcam_count)
+        form.addRow("Camera Index:", cam_idx_row)
+        layout.addLayout(form)
 
-        # Header bar
-        h_bar = QtWidgets.QHBoxLayout()
-        lbl_console = QtWidgets.QLabel("Execution Console & Logs")
-        lbl_console.setStyleSheet("font-weight: bold; font-size: 11px; color: #aaaaaa;")
+        # Action buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_cam_connect = QtWidgets.QPushButton("Connect Camera")
+        self.btn_cam_connect.clicked.connect(self._on_toggle_camera)
+        self.btn_cam_refresh = QtWidgets.QPushButton("Query Status")
+        self.btn_cam_refresh.clicked.connect(self._update_camera_ui)
+        btn_row.addWidget(self.btn_cam_connect)
+        btn_row.addWidget(self.btn_cam_refresh)
+        layout.addLayout(btn_row)
 
-        self.progress_bar = QtWidgets.QProgressBar()
-        self.progress_bar.setMaximumHeight(16)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedWidth(200)
+        # Readout fields
+        info_form = QtWidgets.QFormLayout()
+        self.lbl_cam_model = QtWidgets.QLabel("—")
+        self.lbl_cam_serial = QtWidgets.QLabel("—")
+        self.lbl_cam_sensor = QtWidgets.QLabel("—")
+        self.lbl_cam_exposure = QtWidgets.QLabel("—")
+        self.lbl_cam_temp = QtWidgets.QLabel("—")
 
-        btn_clear = QtWidgets.QPushButton("Clear")
-        btn_clear.setStyleSheet("font-size: 10px; padding: 1px 6px;")
-        btn_clear.clicked.connect(self._clear_console)
+        info_form.addRow("Model:", self.lbl_cam_model)
+        info_form.addRow("Serial / FW:", self.lbl_cam_serial)
+        info_form.addRow("Sensor / ROI:", self.lbl_cam_sensor)
+        info_form.addRow("Exposure:", self.lbl_cam_exposure)
+        info_form.addRow("Temperature:", self.lbl_cam_temp)
+        layout.addLayout(info_form)
+        layout.addStretch()
+        return box
 
-        self.btn_toggle_console = QtWidgets.QPushButton("Hide Logs")
-        self.btn_toggle_console.setStyleSheet("font-size: 10px; padding: 1px 6px;")
-        self.btn_toggle_console.clicked.connect(self._toggle_console)
+    def _build_stage_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Motorized Stage — ASI MS-2000")
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(8)
 
-        h_bar.addWidget(lbl_console)
-        h_bar.addStretch()
-        h_bar.addWidget(self.progress_bar)
-        h_bar.addWidget(btn_clear)
-        h_bar.addWidget(self.btn_toggle_console)
-        layout.addLayout(h_bar)
+        # Status badge
+        self.lbl_stage_status = QtWidgets.QLabel("DISCONNECTED")
+        self.lbl_stage_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_stage_status.setMinimumHeight(28)
+        layout.addWidget(self.lbl_stage_status)
 
-        self.txt_console = QtWidgets.QPlainTextEdit()
-        self.txt_console.setReadOnly(True)
-        self.txt_console.setMaximumBlockCount(2000)
-        layout.addWidget(self.txt_console)
+        # Connection settings form
+        form = QtWidgets.QFormLayout()
+        self.chk_stage_sim = QtWidgets.QCheckBox("Simulation / Mock Mode (offline testing)")
+        form.addRow("Mode:", self.chk_stage_sim)
 
-        return drawer
+        port_row = QtWidgets.QHBoxLayout()
+        self.combo_stage_port = QtWidgets.QComboBox()
+        self.combo_stage_port.setEditable(True)
+        self.btn_refresh_ports = QtWidgets.QPushButton("Refresh Ports")
+        self.btn_refresh_ports.clicked.connect(self._refresh_serial_ports)
+        port_row.addWidget(self.combo_stage_port, stretch=1)
+        port_row.addWidget(self.btn_refresh_ports)
+        form.addRow("Serial COM Port:", port_row)
 
-    def _create_steps_container(self) -> QtWidgets.QWidget:
-        container = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(container)
-        layout.setContentsMargins(4, 6, 4, 4)
-        layout.setSpacing(6)
+        self.combo_stage_baud = QtWidgets.QComboBox()
+        self.combo_stage_baud.addItem("115200 (USB Default)", 115200)
+        self.combo_stage_baud.addItem("9600 (RS-232 Default)", 9600)
+        self.combo_stage_baud.addItem("28800", 28800)
+        form.addRow("Baudrate:", self.combo_stage_baud)
+        layout.addLayout(form)
 
-        # Active Sample Selector Bar
-        sample_bar = QtWidgets.QHBoxLayout()
-        lbl_sample = QtWidgets.QLabel("Active Sample:")
-        lbl_sample.setStyleSheet("font-weight: bold; color: #4fc3f7;")
-        self.combo_sample = QtWidgets.QComboBox()
-        self.combo_sample.setMinimumWidth(180)
-        self.combo_sample.currentTextChanged.connect(self._on_active_sample_changed)
+        # Action buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_stage_connect = QtWidgets.QPushButton("Connect Stage")
+        self.btn_stage_connect.clicked.connect(self._on_toggle_stage)
+        self.btn_stage_refresh = QtWidgets.QPushButton("Read Position")
+        self.btn_stage_refresh.clicked.connect(self._update_stage_ui)
+        btn_row.addWidget(self.btn_stage_connect)
+        btn_row.addWidget(self.btn_stage_refresh)
+        layout.addLayout(btn_row)
 
-        btn_refresh_samples = QtWidgets.QPushButton("↻")
-        btn_refresh_samples.setToolTip("Refresh sample list from HDF5")
-        btn_refresh_samples.setFixedWidth(28)
-        btn_refresh_samples.clicked.connect(self._refresh_samples_list)
+        # Readout fields
+        info_form = QtWidgets.QFormLayout()
+        self.lbl_stage_port = QtWidgets.QLabel("—")
+        self.lbl_stage_fw = QtWidgets.QLabel("—")
+        self.lbl_stage_axes = QtWidgets.QLabel("—")
+        self.lbl_stage_pos_xy = QtWidgets.QLabel("—")
+        self.lbl_stage_pos_z = QtWidgets.QLabel("—")
 
-        sample_bar.addWidget(lbl_sample)
-        sample_bar.addWidget(self.combo_sample, stretch=1)
-        sample_bar.addWidget(btn_refresh_samples)
-        layout.addLayout(sample_bar)
+        info_form.addRow("Active Port:", self.lbl_stage_port)
+        info_form.addRow("Controller:", self.lbl_stage_fw)
+        info_form.addRow("Axes / State:", self.lbl_stage_axes)
+        info_form.addRow("X / Y Position:", self.lbl_stage_pos_xy)
+        info_form.addRow("Z Position:", self.lbl_stage_pos_z)
+        layout.addLayout(info_form)
+        layout.addStretch()
+        return box
 
-        # Scroll Area for Collapsible Sections
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+    # ==========================================================================
+    # Hardware Actions & Event Handlers
+    # ==========================================================================
 
-        scroll_widget = QtWidgets.QWidget()
-        scroll_layout = QtWidgets.QVBoxLayout(scroll_widget)
-        scroll_layout.setContentsMargins(2, 2, 6, 2)
-        scroll_layout.setSpacing(8)
+    def _append_log(self, message: str):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        if hasattr(self, "txt_log"):
+            self.txt_log.appendPlainText(f"[{ts}] {message}")
 
-        # Section 1: Laser Calibration
-        self.sec_laser = LaserCalibrationWidget(self)
-        self.sec_laser.btn_action.clicked.connect(self._run_laser_all)
-        self.sec_laser.card_step2.btn_action.clicked.connect(self._run_laser_all)
-        self.sec_laser.card_step3.btn_action.clicked.connect(self._run_laser_all)
-        self.sec_laser.card_step4.btn_action.clicked.connect(self._run_laser_all)
-        self.sec_laser.card_step5.btn_action.clicked.connect(self._run_laser_all)
-        self.sec_laser.card_step6.btn_action.clicked.connect(self._run_laser_all)
-        scroll_layout.addWidget(self.sec_laser)
+    def _scan_dcam_cameras(self):
+        n_cams = count_dcam_cameras()
+        self.lbl_dcam_count.setText(f"{n_cams} detected")
+        self._append_log(f"DCAM scan: {n_cams} Hamamatsu camera(s) detected on system.")
 
-        # Section 2: Rubidium Calibration
-        self.sec_rb = RbCalibrationWidget(self)
-        self.sec_rb.btn_action.clicked.connect(self._run_rb_all)
-        self.sec_rb.card_step7.btn_action.clicked.connect(self._run_rb_all)
-        self.sec_rb.card_step8.btn_action.clicked.connect(self._run_rb_all)
-        self.sec_rb.card_step9.btn_action.clicked.connect(self._run_rb_all)
-        self.sec_rb.card_step10a.btn_action.clicked.connect(self._run_rb_all)
-        self.sec_rb.card_step10b.btn_action.clicked.connect(self._run_rb_all)
-        scroll_layout.addWidget(self.sec_rb)
+    def _refresh_serial_ports(self):
+        self.combo_stage_port.clear()
+        self.combo_stage_port.addItem("auto (Scan COM Ports)", "auto")
+        ports = list_serial_ports()
+        for p in ports:
+            label = f"{p['port']} — {p['description']}"
+            self.combo_stage_port.addItem(label, p["port"])
+        self._append_log(f"Serial scan: {len(ports)} COM port(s) found.")
 
-        # Section 3: Peak Fitting
-        self.sec_peak = PeakFittingWidget(self)
-        self.sec_peak.btn_action.clicked.connect(self._run_peak_fit)
-        scroll_layout.addWidget(self.sec_peak)
-
-        # Section 4: Wavevector & Dispersion
-        self.sec_wavevector = WavevectorDispersionWidget(self)
-        self.sec_wavevector.btn_action.clicked.connect(self._run_q_vector)
-        scroll_layout.addWidget(self.sec_wavevector)
-
-        self._cards = [
-            self.sec_laser, self.sec_laser.card_step2, self.sec_laser.card_step3,
-            self.sec_laser.card_step4, self.sec_laser.card_step5, self.sec_laser.card_step6,
-            self.sec_rb, self.sec_rb.card_step7, self.sec_rb.card_step8,
-            self.sec_rb.card_step9, self.sec_rb.card_step10a, self.sec_rb.card_step10b,
-            self.sec_peak, self.sec_wavevector
-        ]
-
-        scroll_layout.addStretch()
-        scroll.setWidget(scroll_widget)
-        layout.addWidget(scroll)
-
-        return container
-
-    def _setup_menus(self):
-        menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
-
-        act_open = QtGui.QAction("Open HDF5 Measures File...", self)
-        act_open.setShortcut("Ctrl+O")
-        act_open.triggered.connect(self.h5_explorer.browse_h5_file)
-        file_menu.addAction(act_open)
-
-        act_convert = QtGui.QAction("Convert Folder of .dat to H5...", self)
-        act_convert.triggered.connect(self.h5_explorer._on_convert_dat_folder)
-        file_menu.addAction(act_convert)
-
-        file_menu.addSeparator()
-        act_exit = QtGui.QAction("Exit", self)
-        act_exit.setShortcut("Ctrl+Q")
-        act_exit.triggered.connect(self.close)
-        file_menu.addAction(act_exit)
-
-        view_menu = menubar.addMenu("View")
-        act_toggle_log = QtGui.QAction("Toggle Bottom Log Drawer", self)
-        act_toggle_log.setShortcut("Ctrl+L")
-        act_toggle_log.triggered.connect(self._toggle_console)
-        view_menu.addAction(act_toggle_log)
-
-        view_menu.addSeparator()
-        theme_menu = view_menu.addMenu("Theme / Appearance")
-        theme_group = QtGui.QActionGroup(self)
-
-        act_auto = QtGui.QAction("Auto (Match System Day/Night)", self, checkable=True)
-        act_auto.setChecked(True)
-        act_auto.triggered.connect(lambda: self._set_theme_mode("system"))
-        theme_group.addAction(act_auto)
-        theme_menu.addAction(act_auto)
-
-        act_light = QtGui.QAction("Light Mode (Day)", self, checkable=True)
-        act_light.triggered.connect(lambda: self._set_theme_mode("light"))
-        theme_group.addAction(act_light)
-        theme_menu.addAction(act_light)
-
-        act_dark = QtGui.QAction("Dark Mode (Night)", self, checkable=True)
-        act_dark.triggered.connect(lambda: self._set_theme_mode("dark"))
-        theme_group.addAction(act_dark)
-        theme_menu.addAction(act_dark)
-
-    # --------------------------------------------------------------------------
-    # Theme Management
-    # --------------------------------------------------------------------------
-
-    def apply_theme(self, theme_name: str):
-        """Applies dark or light theme across all widgets and canvases."""
-        self.current_theme = theme_name
-        qss = DARK_QSS if theme_name == "dark" else LIGHT_QSS
-        self.setStyleSheet(qss)
-        if hasattr(self, "visualizer"):
-            self.visualizer.set_theme(theme_name)
-        if hasattr(self, "h5_explorer"):
-            self.h5_explorer.set_theme(theme_name)
-        for card in getattr(self, "_cards", []):
-            card.style().unpolish(card)
-            card.style().polish(card)
-            card.update()
-
-    def _on_system_color_scheme_changed(self, scheme):
-        if self.theme_mode == "system":
-            resolved = "dark" if scheme == QtCore.Qt.ColorScheme.Dark else "light"
-            self.apply_theme(resolved)
-            self.status_bar.showMessage(f"Appearance updated to system {resolved.capitalize()} Mode.")
-
-    def _set_theme_mode(self, mode: str):
-        self.theme_mode = mode
-        resolved = get_system_theme() if mode == "system" else mode
-        self.apply_theme(resolved)
-        mode_str = f"System Default ({resolved.capitalize()})" if mode == "system" else f"{mode.capitalize()} Mode"
-        self.status_bar.showMessage(f"Theme set to {mode_str}.")
-
-    # --------------------------------------------------------------------------
-    # Inter-widget Event Callbacks
-    # --------------------------------------------------------------------------
-
-    def _on_h5_dataset_preview(self, path: str, data: Any, attrs: dict):
-        """Displays selected H5 dataset on Left Visualizer."""
-        if isinstance(data, np.ndarray):
-            if data.ndim == 2:
-                self.visualizer.show_2d_image(data, title=f"H5 Preview: {path}")
-                self.status_bar.showMessage(f"Previewing 2D Matrix: {path} ({data.shape[0]}x{data.shape[1]})")
-            elif data.ndim == 1:
-                x = np.arange(len(data))
-                self.visualizer.show_1d_curve(x, data, title=f"H5 Preview: {path}", xlabel="Index", ylabel="Intensity")
-                self.status_bar.showMessage(f"Previewing 1D Vector: {path} (length {len(data)})")
-            else:
-                self.status_bar.showMessage(f"Dataset {path} has {data.ndim} dimensions; cannot preview directly.")
-
-    def _on_sample_selected_from_h5(self, sample_name: str):
-        idx = self.combo_sample.findText(sample_name)
-        if idx >= 0:
-            self.combo_sample.setCurrentIndex(idx)
+    def _on_toggle_camera(self):
+        if self.camera.is_connected:
+            self.camera.disconnect()
         else:
-            self.combo_sample.addItem(sample_name)
-            self.combo_sample.setCurrentText(sample_name)
-        self.tabs_right.setCurrentIndex(1)
-        self.status_bar.showMessage(f"Set active sample to: '{sample_name}'")
+            simulate = self.chk_cam_sim.isChecked()
+            idx = int(self.spin_cam_idx.value())
+            try:
+                self.camera.connect(camera_idx=idx, simulate=simulate)
+            except OrcaCameraError as exc:
+                self._append_log(f"ERROR (Camera): {exc}")
+                QtWidgets.QMessageBox.warning(self, "Camera Connection Error", str(exc))
+        self._update_camera_ui()
 
-    def _on_laser_selected_from_h5(self, laser_path: str):
-        # Strip parent if 'Brillouin/' prefix is present
-        clean = laser_path.replace("Brillouin/", "")
-        self.sec_laser.txt_laser_path.setText(clean)
-        self.tabs_right.setCurrentIndex(1)
-        self.status_bar.showMessage(f"Set laser reference group to: '{clean}'")
+    def _on_toggle_stage(self):
+        if self.stage.is_connected:
+            self.stage.disconnect()
+        else:
+            simulate = self.chk_stage_sim.isChecked()
+            port_data = self.combo_stage_port.currentData()
+            port = port_data if port_data is not None else self.combo_stage_port.currentText().strip()
+            baudrate = int(self.combo_stage_baud.currentData() or 115200)
+            try:
+                self.stage.connect(port=port, baudrate=baudrate, simulate=simulate)
+            except MS2000Error as exc:
+                self._append_log(f"ERROR (Stage): {exc}")
+                QtWidgets.QMessageBox.warning(self, "Stage Connection Error", str(exc))
+        self._update_stage_ui()
 
-    def _on_rb_selected_from_h5(self, rb_path: str):
-        clean = rb_path.replace("Brillouin/", "")
-        self.sec_rb.txt_rb_path.setText(clean)
-        self.tabs_right.setCurrentIndex(1)
-        self.status_bar.showMessage(f"Set Rb reference group to: '{clean}'")
+    def _on_connect_all(self):
+        if not self.camera.is_connected:
+            self._on_toggle_camera()
+        if not self.stage.is_connected:
+            self._on_toggle_stage()
 
-    def _on_file_loaded(self, h5_path: str):
-        self._refresh_samples_list()
-        self.status_bar.showMessage(f"Loaded HDF5 container: {os.path.basename(h5_path)}")
+    def _on_disconnect_all(self):
+        if self.camera.is_connected:
+            self.camera.disconnect()
+            self._update_camera_ui()
+        if self.stage.is_connected:
+            self.stage.disconnect()
+            self._update_stage_ui()
 
-    def _refresh_samples_list(self):
-        samples = self.h5_explorer.list_available_samples()
-        current = self.combo_sample.currentText()
-        self.combo_sample.blockSignals(True)
-        self.combo_sample.clear()
-        for s in samples:
-            self.combo_sample.addItem(s)
-        if current in samples:
-            self.combo_sample.setCurrentText(current)
-        elif self.combo_sample.count() > 0:
-            self.combo_sample.setCurrentIndex(0)
-        self.combo_sample.blockSignals(False)
+    # ==========================================================================
+    # UI State Updates
+    # ==========================================================================
 
-        self.sec_peak.populate_batch_samples(samples)
+    def _set_badge_style(self, label: QtWidgets.QLabel, connected: bool, simulated: bool):
+        if not connected:
+            label.setText("DISCONNECTED")
+            label.setStyleSheet(
+                "background-color: #424242; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 4px;"
+            )
+        elif simulated:
+            label.setText("CONNECTED (SIMULATION MODE)")
+            label.setStyleSheet(
+                "background-color: #ef6c00; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 4px;"
+            )
+        else:
+            label.setText("CONNECTED (HARDWARE)")
+            label.setStyleSheet(
+                "background-color: #2e7d32; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 4px;"
+            )
 
-    def _on_active_sample_changed(self, sample_name: str):
-        if sample_name:
-            self.status_bar.showMessage(f"Active Sample: '{sample_name}'")
-
-    def _clear_console(self):
-        self.txt_console.clear()
-
-    def _toggle_console(self):
-        is_visible = self.txt_console.isVisible()
-        self.txt_console.setVisible(not is_visible)
-        self.btn_toggle_console.setText("Show Logs" if is_visible else "Hide Logs")
-
-    # --------------------------------------------------------------------------
-    # Pipeline Worker Execution
-    # --------------------------------------------------------------------------
-
-    def _start_worker(self, task_type: str, params: Dict[str, Any]):
-        h5_path = self.h5_explorer.current_h5_path
-        if not h5_path or not os.path.exists(h5_path):
-            QtWidgets.QMessageBox.warning(self, "No HDF5 File", "Please select or load an HDF5 Measures file first!")
+    def _update_camera_ui(self):
+        try:
+            st = self.camera.get_status()
+        except Exception as exc:
+            self._append_log(f"Camera status error: {exc}")
             return
 
-        if self.current_worker and self.current_worker.isRunning():
-            QtWidgets.QMessageBox.warning(self, "Task Running", "A pipeline task is already running. Please wait.")
+        connected = bool(st["connected"])
+        simulated = bool(st["simulate"])
+        self._set_badge_style(self.lbl_cam_status, connected, simulated)
+
+        self.btn_cam_connect.setText("Disconnect Camera" if connected else "Connect Camera")
+        self.btn_cam_refresh.setEnabled(connected)
+        self.chk_cam_sim.setEnabled(not connected)
+        self.spin_cam_idx.setEnabled(not connected)
+
+        if connected:
+            self.lbl_cam_model.setText(f"{st['vendor']} {st['model']}")
+            self.lbl_cam_serial.setText(f"S/N: {st['serial_number']}  |  Ver: {st['camera_version']}")
+            det_w, det_h = st["detector_size"]
+            roi = st["roi"]
+            self.lbl_cam_sensor.setText(
+                f"{det_w} × {det_h} px  (ROI: {roi[0]}..{roi[1]} × {roi[2]}..{roi[3]}, Bin {roi[4]}×{roi[5]})"
+            )
+            exp_ms = (st["exposure_s"] or 0.0) * 1e3
+            self.lbl_cam_exposure.setText(f"{exp_ms:.2f} ms")
+            temp = st["temperature_c"]
+            self.lbl_cam_temp.setText(f"{temp:.1f} °C" if temp is not None else "N/A")
+        else:
+            self.lbl_cam_model.setText("—")
+            self.lbl_cam_serial.setText("—")
+            self.lbl_cam_sensor.setText("—")
+            self.lbl_cam_exposure.setText("—")
+            self.lbl_cam_temp.setText("—")
+
+    def _update_stage_ui(self):
+        try:
+            st = self.stage.get_status()
+        except Exception as exc:
+            self._append_log(f"Stage status error: {exc}")
             return
 
-        self.current_worker = PipelineWorker(task_type, h5_path, params, parent=self)
-        self.current_worker.signals.started.connect(self._on_task_started)
-        self.current_worker.signals.progress.connect(self._on_task_progress)
-        self.current_worker.signals.log.connect(self._on_task_log)
-        self.current_worker.signals.view_ready.connect(self._on_task_view_ready)
-        self.current_worker.signals.finished.connect(self._on_task_finished)
-        self.current_worker.signals.error.connect(self._on_task_error)
-        self.current_worker.start()
+        connected = bool(st["connected"])
+        simulated = bool(st["simulate"])
+        self._set_badge_style(self.lbl_stage_status, connected, simulated)
 
-    def _on_task_started(self, task_name: str):
-        self.progress_bar.setValue(0)
-        self.status_bar.showMessage(f"Running '{task_name}'...")
-        if not self.txt_console.isVisible():
-            self._toggle_console()
+        self.btn_stage_connect.setText("Disconnect Stage" if connected else "Connect Stage")
+        self.btn_stage_refresh.setEnabled(connected)
+        self.chk_stage_sim.setEnabled(not connected)
+        self.combo_stage_port.setEnabled(not connected)
+        self.combo_stage_baud.setEnabled(not connected)
 
-    def _on_task_progress(self, current: int, total: int, msg: str):
-        pct = int(100 * current / max(1, total))
-        self.progress_bar.setValue(pct)
-        self.status_bar.showMessage(f"{msg} ({pct}%)")
+        if connected:
+            self.lbl_stage_port.setText(f"{st['port']} @ {st['baudrate']} baud ({st['backend']})")
+            self.lbl_stage_fw.setText(str(st["firmware"]))
+            axes_str = "X, Y, Z" if st["has_z"] else "X, Y"
+            state_str = "BUSY (Moving)" if st["busy"] else "IDLE (Ready)"
+            self.lbl_stage_axes.setText(f"Axes: {axes_str}  |  State: {state_str}")
+            pos = st["position_um"]
+            self.lbl_stage_pos_xy.setText(f"X = {pos['X']:.2f} µm,   Y = {pos['Y']:.2f} µm")
+            self.lbl_stage_pos_z.setText(f"Z = {pos['Z']:.2f} µm" if pos["Z"] is not None else "Not present")
+        else:
+            self.lbl_stage_port.setText("—")
+            self.lbl_stage_fw.setText("—")
+            self.lbl_stage_axes.setText("—")
+            self.lbl_stage_pos_xy.setText("—")
+            self.lbl_stage_pos_z.setText("—")
 
-    def _on_task_log(self, text: str):
-        self.txt_console.moveCursor(QtGui.QTextCursor.End)
-        self.txt_console.insertPlainText(text)
-        self.txt_console.moveCursor(QtGui.QTextCursor.End)
-
-    def _on_task_view_ready(self, task_name: str, views: dict):
-        self.visualizer.set_views(views)
-
-    def _on_task_finished(self, task_name: str, results: dict):
-        self.progress_bar.setValue(100)
-        self.status_bar.showMessage(f"✓ Task '{task_name}' completed successfully.")
-
-        # Update section status labels
-        if task_name == "laser_all":
-            self.sec_laser.set_status("✓ Calibrated", "#4caf50")
-            if "xc_gnom" in results:
-                self.sec_laser.lbl_vipa_geom_result.setText(
-                    f"Center: ({results['xc_gnom']:.1f}, {results['yc_gnom']:.1f}) | Tilt y0: {results['y0_fit']:.1f}"
-                )
-        elif task_name == "rb_all":
-            self.sec_rb.set_status("✓ Calibrated", "#4caf50")
-            if "FSR_cal" in results:
-                self.sec_rb.lbl_fsr_result.setText(f"Calibrated FSR: {results['FSR_cal']:.4f} GHz")
-        elif task_name == "peak_fit":
-            self.sec_peak.set_status("✓ Fitted", "#4caf50")
-        elif task_name == "q_vector":
-            self.sec_wavevector.set_status("✓ Extracted", "#4caf50")
-            if "V_s" in results:
-                vs = results["V_s"]
-                vs_err = results.get("V_s_err", 0.0)
-                self.sec_wavevector.lbl_results_vs.setText(f"Speed of Sound V_s = {vs:.2f} ± {vs_err:.2f} m/s")
-
-        self.h5_explorer.reload_tree()
-
-    def _on_task_error(self, task_name: str, tb: str):
-        self.progress_bar.setValue(0)
-        self.status_bar.showMessage(f"❌ Error during '{task_name}'.")
-        QtWidgets.QMessageBox.critical(self, f"Pipeline Error ({task_name})", f"An error occurred during execution:\n\n{tb}")
-
-    # --------------------------------------------------------------------------
-    # Step Execution Triggers
-    # --------------------------------------------------------------------------
-
-    def _run_laser_all(self):
-        params = {
-            "laser_group": self.sec_laser.txt_laser_path.text().strip() or "laser_reference",
-            "scale_laser": self.sec_laser.spin_scale_laser.value(),
-            "ksize_se_laser": self.sec_laser.spin_ksize_se_laser.value(),
-            "ksize_blur_laser": self.sec_laser.spin_ksize_blur_laser.value(),
-            "poly_deg": self.sec_laser.spin_poly_deg.value(),
-        }
-        self.sec_laser.set_status("Running...", "#00bcd4")
-        self._start_worker("laser_all", params)
-
-    def _run_rb_all(self):
-        params = {
-            "rb_group": self.sec_rb.txt_rb_path.text().strip() or "Rb_absorption",
-            "laser_group": self.sec_laser.txt_laser_path.text().strip() or "laser_reference",
-            "t_cell": self.sec_rb.spin_t_cell.value(),
-            "l_cell": self.sec_rb.spin_l_cell.value(),
-            "scale_rb": self.sec_rb.spin_scale_rb.value(),
-            "ksize_se_rb": self.sec_rb.spin_ksize_se_rb.value(),
-            "ksize_blur_rb": self.sec_rb.spin_ksize_blur_rb.value(),
-            "laser_offset_guess": self.sec_rb.spin_laser_offset_guess.value(),
-            "fit_window_ghz": self.sec_rb.spin_fit_window_ghz.value(),
-            "rb_lock_offset": self.sec_rb.spin_rb_lock_offset.value(),
-        }
-        self.sec_rb.set_status("Running...", "#00bcd4")
-        self._start_worker("rb_all", params)
-
-    def _run_peak_fit(self):
-        sample = self.combo_sample.currentText()
-        if not sample:
-            QtWidgets.QMessageBox.warning(self, "No Sample Selected", "Please select a sample from the dropdown first!")
-            return
-
-        params = {
-            "sample_name": sample,
-            "rb_group": self.sec_rb.txt_rb_path.text().strip() or "Rb_absorption",
-            "bin_val_h": self.sec_peak.spin_bin_h.value(),
-            "bin_val_w": self.sec_peak.spin_bin_w.value(),
-            "expected_shift": self.sec_peak.spin_expected_shift.value(),
-            "shift_tol": self.sec_peak.spin_shift_tol.value(),
-            "expected_lw": self.sec_peak.spin_expected_lw.value(),
-            "lw_min": self.sec_peak.spin_lw_min.value(),
-            "lw_max": self.sec_peak.spin_lw_max.value(),
-        }
-        self.sec_peak.set_status("Running...", "#00bcd4")
-        self._start_worker("peak_fit", params)
-
-    def _run_q_vector(self):
-        sample = self.combo_sample.currentText()
-        if not sample:
-            QtWidgets.QMessageBox.warning(self, "No Sample Selected", "Please select a sample from the dropdown first!")
-            return
-
-        fixed_angle = self.sec_wavevector.spin_fixed_angle.value() if self.sec_wavevector.chk_fixed_angle.isChecked() else None
-
-        params = {
-            "sample_name": sample,
-            "bin_val_h": self.sec_peak.spin_bin_h.value(),
-            "bin_val_w": self.sec_peak.spin_bin_w.value(),
-            "refractive_index": self.sec_wavevector.spin_refractive_index.value(),
-            "shift_min": self.sec_wavevector.spin_shift_min.value(),
-            "shift_max": self.sec_wavevector.spin_shift_max.value(),
-            "lw_min": self.sec_wavevector.spin_lw_filter_min.value(),
-            "lw_max": self.sec_wavevector.spin_lw_filter_max.value(),
-            "use_errors": self.sec_wavevector.chk_use_errors.isChecked(),
-            "error_percentile_floor": self.sec_wavevector.spin_error_percentile_floor.value(),
-            "average_pairs": self.sec_wavevector.chk_average_pairs.isChecked(),
-            "initial_m_theta": self.sec_wavevector.spin_init_m_theta.value(),
-            "fixed_ellipse_angle_deg": fixed_angle,
-        }
-        self.sec_wavevector.set_status("Running...", "#00bcd4")
-        self._start_worker("q_vector", params)
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        """Ensure hardware connections are cleanly closed when exiting the GUI."""
+        self._on_disconnect_all()
+        super().closeEvent(event)

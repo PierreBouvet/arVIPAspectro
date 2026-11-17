@@ -32,7 +32,7 @@ from arVIPAspectro import plotting
 # Paths & Execution Configuration
 # ==============================================================================
 
-DATA_DIR = '/Volumes/LAUDATE/Data/260916 - arBLS/261110'
+DATA_DIR = '/Volumes/LAUDATE/Data/260916 - arBLS/261116/Multi_configs_test/cfg5'
 TARGET_FILE = 'Measures.h5'
 FIGURE_DIRECTORY_NAME = 'figures'
 OUT_DIR = os.path.join(DATA_DIR, FIGURE_DIRECTORY_NAME)

@@ -33,7 +33,7 @@ from arVIPAspectro import plotting
 # Paths & Execution Configuration
 # ==============================================================================
 
-DATA_DIR = '/Volumes/LAUDATE/Data/260916 - arBLS/261110'
+DATA_DIR = '/Volumes/LAUDATE/Data/260916 - arBLS/261116/Multi_configs_test/cfg5'
 TARGET_FILE = 'Measures.h5'
 FIGURE_DIRECTORY_NAME = 'figures'
 OUT_DIR = os.path.join(DATA_DIR, FIGURE_DIRECTORY_NAME)
@@ -61,7 +61,7 @@ SCALE_RB = 9                                # Downsampling factor for Rb morphol
 KSIZE_STRUCTURING_ELEMENTS_RB = 3           # Structuring element size for Rb baseline
 KSIZE_BLUR_RB = 11                          # Gaussian blur kernel size for Rb baseline
 
-DELTA_NU_LASER_OFFSET = -2.0                 # Initial coarse laser offset guess (GHz)
+DELTA_NU_LASER_OFFSET = 12.0                 # Initial coarse laser offset guess (GHz)
 FIT_WINDOW_GHZ = 10.0                       # Fitting window around Rb D2 center (GHz)
 RB_LOCK_OFFSET_GHZ = 1.323                  # 85Rb F=2 absorption line offset from D2 center (GHz)
 
@@ -71,21 +71,21 @@ plot_Rb_absorption = FORCE_PLOT_ALL or 0
 stop_Rb_absorption = 0
 
 # Step 8: Rubidium Absorption Preprocessing & Denoising
-plot_denoise_Rb = FORCE_PLOT_ALL or 0
+plot_denoise_Rb = FORCE_PLOT_ALL or 1
 stop_denoise_Rb = 0
 force_denoise_Rb = FORCE_ALL_PROCESS or 0
 
 # Step 9: Radial Profile Extraction of Rubidium Absorption
-plot_Rb_experimental = FORCE_PLOT_ALL or 0
+plot_Rb_experimental = FORCE_PLOT_ALL or 1
 stop_Rb_experimental = 0
 
 # Step 10: Calibration of VIPA FSR & Rubidium Hyperfine Offset
-plot_Rb_calibration = FORCE_PLOT_ALL or 0
+plot_Rb_calibration = FORCE_PLOT_ALL or 1
 stop_Rb_calibration = 0
 force_Rb_calibration = FORCE_ALL_PROCESS or 0
 
 # Step 10B: Calibrated 2D Frequency Map Generation
-plot_freq_map = FORCE_PLOT_ALL or 0
+plot_freq_map = FORCE_PLOT_ALL or 1
 stop_freq_map = 0
 
 
@@ -173,7 +173,7 @@ profiles_2d, radius_axis, avg_spectrum_radius, phi_order_r = Rb_calib.extract_ra
     f_px=config.F_PX_DEFAULT,
     phi_rad=config.VIPA_TILT_ANGLE,
     n_r=config.N_FUSED_SILICA_780,
-    num_angles=1000
+    num_angles=100
 )
 print('Step 9 - Extracted experimental radial absorption profile of the Rb cell.')
 
