@@ -857,8 +857,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _stop_live_if_running(self):
         if self._live_running and self._worker is not None and self._worker.isRunning():
+            try:
+                self._worker.sig_frame_acquired.disconnect(self._on_frame_acquired)
+            except (TypeError, RuntimeError):
+                pass
             self._worker.request_stop()
-            self._worker.wait(3000)
+            self._worker.wait(10000)
         self._live_running = False
         self.btn_live_preview.setText("▶ Start Live Preview")
         self.btn_live_preview.setStyleSheet("")
@@ -895,7 +899,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_running = False
         self.btn_live_preview.setText("▶ Start Live Preview")
         self.btn_live_preview.setStyleSheet("")
-        self._set_motion_controls_enabled(True)
+        map_running = (
+            hasattr(self, "pipeline_panel")
+            and self.pipeline_panel._map_worker is not None
+            and self.pipeline_panel._map_worker.isRunning()
+        )
+        if not map_running:
+            self._set_motion_controls_enabled(True)
 
     def _start_hardware_worker(self, action: str, params: Optional[Dict[str, Any]] = None):
         if self._live_running:

@@ -71,6 +71,45 @@ class MapGridConfig:
     def span_y_um(self) -> float:
         return max(0, int(self.ny) - 1) * abs(float(self.dy_um))
 
+    @property
+    def x_center_um(self) -> float:
+        nx = max(1, int(self.nx))
+        return float(self.x_start_um) + 0.5 * (nx - 1) * float(self.dx_um)
+
+    @property
+    def y_center_um(self) -> float:
+        ny = max(1, int(self.ny))
+        return float(self.y_start_um) + 0.5 * (ny - 1) * float(self.dy_um)
+
+    @classmethod
+    def from_center(
+        cls,
+        x_center_um: float,
+        y_center_um: float,
+        dx_um: float,
+        dy_um: float,
+        nx: int,
+        ny: int,
+        scan_pattern: str = "snake",
+    ) -> "MapGridConfig":
+        """
+        Builds a `MapGridConfig` centered on `(x_center_um, y_center_um)` with
+        step sizes `(dx_um, dy_um)` and `(nx, ny)` points.
+        """
+        nx_i = max(1, int(nx))
+        ny_i = max(1, int(ny))
+        x_start = float(x_center_um) - 0.5 * (nx_i - 1) * float(dx_um)
+        y_start = float(y_center_um) - 0.5 * (ny_i - 1) * float(dy_um)
+        return cls(
+            x_start_um=x_start,
+            y_start_um=y_start,
+            dx_um=float(dx_um),
+            dy_um=float(dy_um),
+            nx=nx_i,
+            ny=ny_i,
+            scan_pattern=scan_pattern,
+        )
+
     def build_trajectory(self) -> List[Tuple[int, int, float, float]]:
         """
         Returns the ordered list of scan points as `(iy, ix, y_um, x_um)`.
@@ -327,22 +366,51 @@ class AcquisitionSession:
             y_center = min(int(config.Y_CENTER_LASER), h // 2)
             peaks, points = laser_calib.retrieve_fringes(self.wrapper, path_laser, y_center_laser=y_center)
             ref_fringes, ax, axs, ay, ak = laser_calib.retrieve_refined_fringes(self.wrapper, path_laser)
+            if len(ax) == 0:
+                return None
             x0_fit, y0_fit, xc_gnom, yc_gnom = laser_calib.retrieve_vipa_geometry(self.wrapper, path_laser)
 
-            # Recompute full calibration dict for diagnostic plotting
-            full_cal = laser_calib.calibrate_anamorphic_order_surface(
-                self.wrapper,
-                path_laser,
-                ax,
-                axs,
-                ay,
-                ak,
-                x0_fit,
-                y0_fit,
-                h_img=h,
-                nb_laser_modes=len(ref_fringes),
-                fsr_vipa=config.FSR_VIPA,
+            # Reconstruct diagnostic arrays using the persisted 2D anamorphic surface
+            c_2d = surf["c_2d_order"]
+            g_mean_ref = float(surf["g_mean_ref"])
+            g_std_ref = float(surf["g_std_ref"])
+            L_y = float(surf["L_y"])
+            # Solve (deg+1)*(deg+2)/2 == len(c_2d) for polynomial degree (default 4)
+            poly_deg = 4
+            for d_cand in range(1, 10):
+                if (d_cand + 1) * (d_cand + 2) // 2 == len(c_2d):
+                    poly_deg = d_cand
+                    break
+
+            g_all_laser = bck.g_from_xy(
+                ax, ay, x0_fit, y0_fit,
+                f=config.F_PX_DEFAULT, phi=config.VIPA_TILT_ANGLE, n_r=config.N_FUSED_SILICA_780,
             )
+            g_all_laser_smooth = bck.g_from_xy(
+                axs, ay, x0_fit, y0_fit,
+                f=config.F_PX_DEFAULT, phi=config.VIPA_TILT_ANGLE, n_r=config.N_FUSED_SILICA_780,
+            )
+            gn_laser = (g_all_laser - g_mean_ref) / g_std_ref
+            yn_laser = (ay - y0_fit) / L_y
+            q_pred_2d = bck.eval_phi_order_surface(
+                g_all_laser, ay, c_2d, y0_fit, L_y, g_mean_ref, g_std_ref, deg=poly_deg
+            )
+            q_pred_2d_smooth = bck.eval_phi_order_surface(
+                g_all_laser_smooth, ay, c_2d, y0_fit, L_y, g_mean_ref, g_std_ref, deg=poly_deg
+            )
+            err_2d_mhz = (q_pred_2d - ak) * config.FSR_VIPA * 1e3
+            err_2d_smooth_mhz = (q_pred_2d_smooth - ak) * config.FSR_VIPA * 1e3
+
+            full_cal = dict(surf)
+            full_cal.update({
+                "gn_laser": gn_laser,
+                "yn_laser": yn_laser,
+                "g_all_laser": g_all_laser,
+                "q_pred_2d": q_pred_2d,
+                "q_pred_2d_smooth": q_pred_2d_smooth,
+                "err_2d_mhz": err_2d_mhz,
+                "err_2d_smooth_mhz": err_2d_smooth_mhz,
+            })
             y_min = max(0, int(y_center - config.DY_LASER))
             y_max = min(h, int(y_center + config.DY_LASER))
             avg_row = np.average(data_sub[y_min:y_max, :], axis=0)
@@ -1102,6 +1170,8 @@ class AcquisitionSession:
             "MEASURE.Field_Of_View_(X,Y,Z)_(um)": f"{grid.span_x_um:.2f},{grid.span_y_um:.2f},0.0",
             "x_start_um": float(grid.x_start_um),
             "y_start_um": float(grid.y_start_um),
+            "x_center_um": float(grid.x_center_um),
+            "y_center_um": float(grid.y_center_um),
             "dx_um": float(grid.dx_um),
             "dy_um": float(grid.dy_um),
             "nx": int(nx),

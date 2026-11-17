@@ -281,8 +281,8 @@ class MapScanWorker(QtCore.QThread):
     sig_stage_updated = QtCore.Signal()
     sig_point_acquired = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
     sig_live_map_updated = QtCore.Signal(
-        object, object, object, object, object, object, object, int, int, object, object
-    )  # (frame, x_um_1d, y_um_1d, map_shift, map_lw, map_s0, map_vs, iy, ix, pos, point_fit)
+        object, object, object, object, object, object, object, int, int, object, object, object
+    )  # (frame, x_um_1d, y_um_1d, map_shift, map_lw, map_s0, map_vs, iy, ix, pos, point_fit, step_um)
     sig_finished_map = QtCore.Signal(str, int)                           # (map_group_path, points_completed)
     sig_error = QtCore.Signal(str, str)
 
@@ -361,10 +361,28 @@ class MapScanWorker(QtCore.QThread):
             ny, nx = max(1, int(self.grid.ny)), max(1, int(self.grid.nx))
             x_coords_1d = self.grid.x_coords_um
             y_coords_1d = self.grid.y_coords_um
+            step_um = (float(self.grid.dx_um), float(self.grid.dy_um))
             map_mean_shift = np.full((ny, nx), np.nan, dtype=np.float64)
             map_mean_lw = np.full((ny, nx), np.nan, dtype=np.float64)
             map_shift_0 = np.full((ny, nx), np.nan, dtype=np.float64)
             map_vs = np.full((ny, nx), np.nan, dtype=np.float64)
+
+            if treated_group_path is not None:
+                init_iy, init_ix, init_y, init_x = trajectory[0]
+                self.sig_live_map_updated.emit(
+                    None,
+                    x_coords_1d,
+                    y_coords_1d,
+                    map_mean_shift,
+                    map_mean_lw,
+                    map_shift_0,
+                    map_vs,
+                    init_iy,
+                    init_ix,
+                    {"X": float(init_x), "Y": float(init_y)},
+                    None,
+                    step_um,
+                )
 
             self.sig_log.emit(
                 f"Starting Pipelined Map '{map_group_path}': {nx}x{ny} = {total_pts} point(s), "
@@ -430,6 +448,7 @@ class MapScanWorker(QtCore.QThread):
                                 c_ix,
                                 c_pos,
                                 point_fit,
+                                step_um,
                             )
                         else:
                             self.sig_point_acquired.emit(c_frame, c_pos, exp_s, n_avg, binning)
@@ -508,7 +527,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     sig_show_rb_diagnostics = QtCore.Signal(object, str)                # (rb_res, view_mode)
     sig_show_sample_diagnostics = QtCore.Signal(object, str)            # (sample_res, view_mode)
     sig_update_live_map = QtCore.Signal(
-        object, object, object, object, object, object, object, int, int, object, object
+        object, object, object, object, object, object, object, int, int, object, object, object
     )
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
@@ -1092,14 +1111,14 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         grid_form = QtWidgets.QGridLayout()
         grid_form.setSpacing(6)
 
-        grid_form.addWidget(QtWidgets.QLabel("Start X₀:"), 0, 0)
-        self.spin_x_start = QtWidgets.QDoubleSpinBox()
-        self.spin_x_start.setDecimals(2)
-        self.spin_x_start.setRange(-100000.0, 100000.0)
-        self.spin_x_start.setValue(0.0)
-        self.spin_x_start.setSuffix(" µm")
-        self.spin_x_start.valueChanged.connect(self._update_map_summary)
-        grid_form.addWidget(self.spin_x_start, 0, 1)
+        grid_form.addWidget(QtWidgets.QLabel("Center Xc:"), 0, 0)
+        self.spin_x_center = QtWidgets.QDoubleSpinBox()
+        self.spin_x_center.setDecimals(2)
+        self.spin_x_center.setRange(-100000.0, 100000.0)
+        self.spin_x_center.setValue(0.0)
+        self.spin_x_center.setSuffix(" µm")
+        self.spin_x_center.valueChanged.connect(self._update_map_summary)
+        grid_form.addWidget(self.spin_x_center, 0, 1)
 
         grid_form.addWidget(QtWidgets.QLabel("Step ΔX:"), 0, 2)
         self.spin_dx = QtWidgets.QDoubleSpinBox()
@@ -1117,14 +1136,14 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.spin_nx.valueChanged.connect(self._update_map_summary)
         grid_form.addWidget(self.spin_nx, 0, 5)
 
-        grid_form.addWidget(QtWidgets.QLabel("Start Y₀:"), 1, 0)
-        self.spin_y_start = QtWidgets.QDoubleSpinBox()
-        self.spin_y_start.setDecimals(2)
-        self.spin_y_start.setRange(-100000.0, 100000.0)
-        self.spin_y_start.setValue(0.0)
-        self.spin_y_start.setSuffix(" µm")
-        self.spin_y_start.valueChanged.connect(self._update_map_summary)
-        grid_form.addWidget(self.spin_y_start, 1, 1)
+        grid_form.addWidget(QtWidgets.QLabel("Center Yc:"), 1, 0)
+        self.spin_y_center = QtWidgets.QDoubleSpinBox()
+        self.spin_y_center.setDecimals(2)
+        self.spin_y_center.setRange(-100000.0, 100000.0)
+        self.spin_y_center.setValue(0.0)
+        self.spin_y_center.setSuffix(" µm")
+        self.spin_y_center.valueChanged.connect(self._update_map_summary)
+        grid_form.addWidget(self.spin_y_center, 1, 1)
 
         grid_form.addWidget(QtWidgets.QLabel("Step ΔY:"), 1, 2)
         self.spin_dy = QtWidgets.QDoubleSpinBox()
@@ -1144,10 +1163,10 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
         layout.addLayout(grid_form)
 
-        # 3. Stage Teaching Helpers (Set Start / Teach Corner A & Corner B)
+        # 3. Stage Teaching Helpers (Set Center / Teach Corner A & Corner B)
         teach_row = QtWidgets.QHBoxLayout()
-        self.btn_set_start_current = QtWidgets.QPushButton("Set (X₀, Y₀) from Current Stage")
-        self.btn_set_start_current.clicked.connect(self._on_set_start_from_stage)
+        self.btn_set_start_current = QtWidgets.QPushButton("Set Center (Xc, Yc) from Current Stage")
+        self.btn_set_start_current.clicked.connect(self._on_set_center_from_stage)
         teach_row.addWidget(self.btn_set_start_current)
 
         self.btn_teach_a = QtWidgets.QPushButton("Teach Corner A")
@@ -1280,6 +1299,21 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         except Exception as exc:
             self.sig_log.emit(f"ERROR opening HDF5: {exc}")
             QtWidgets.QMessageBox.critical(self, "HDF5 Error", str(exc))
+
+    def _refresh_h5_status_banner(self):
+        """Updates the HDF5 status banner cleanly without reloading/overwriting in-memory calibration results."""
+        if not self.session.is_open:
+            return
+        existing_maps = self.session.list_map_groups()
+        maps_str = ", ".join(existing_maps) if existing_maps else "none"
+        self.lbl_h5_status.setText(
+            f"Opened: {os.path.basename(self.session.h5_path)}  |  "
+            f"Laser: {'✓' if self.session.laser_image is not None else '—'}, "
+            f"Rb: {'✓' if self.session.rb_image is not None else '—'}, "
+            f"Ref: {'✓' if self.session.ref_sample_image is not None else '—'}  |  "
+            f"Maps: {maps_str}"
+        )
+        self._update_calibration_badges()
 
     def _ensure_h5_open(self) -> bool:
         if not self.session.is_open:
@@ -1679,9 +1713,9 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     # ==========================================================================
 
     def get_current_grid_config(self) -> MapGridConfig:
-        return MapGridConfig(
-            x_start_um=float(self.spin_x_start.value()),
-            y_start_um=float(self.spin_y_start.value()),
+        return MapGridConfig.from_center(
+            x_center_um=float(self.spin_x_center.value()),
+            y_center_um=float(self.spin_y_center.value()),
             dx_um=float(self.spin_dx.value()),
             dy_um=float(self.spin_dy.value()),
             nx=int(self.spin_nx.value()),
@@ -1689,16 +1723,16 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             scan_pattern=str(self.combo_pattern.currentData() or "snake"),
         )
 
-    def _on_set_start_from_stage(self):
+    def _on_set_center_from_stage(self):
         if not self.stage.is_connected:
             QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Connect the ASI MS-2000 stage first.")
             return
         pos = self.stage.get_position()
         if pos.get("X") is not None:
-            self.spin_x_start.setValue(float(pos["X"]))
+            self.spin_x_center.setValue(float(pos["X"]))
         if pos.get("Y") is not None:
-            self.spin_y_start.setValue(float(pos["Y"]))
-        self.sig_log.emit(f"Set Map Start (X₀, Y₀) to ({pos['X']:.2f}, {pos['Y']:.2f}) µm.")
+            self.spin_y_center.setValue(float(pos["Y"]))
+        self.sig_log.emit(f"Set Map Center (Xc, Yc) to ({pos['X']:.2f}, {pos['Y']:.2f}) µm.")
 
     def _on_teach_corner_a(self):
         if not self.stage.is_connected:
@@ -1706,8 +1740,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             return
         pos = self.stage.get_position()
         self._corner_a = (float(pos["X"]), float(pos["Y"]))
-        self.spin_x_start.setValue(self._corner_a[0])
-        self.spin_y_start.setValue(self._corner_a[1])
+        self.spin_x_center.setValue(self._corner_a[0])
+        self.spin_y_center.setValue(self._corner_a[1])
         self.sig_log.emit(f"Taught Corner A = ({self._corner_a[0]:.2f}, {self._corner_a[1]:.2f}) µm.")
 
     def _on_teach_corner_b(self):
@@ -1730,15 +1764,16 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             dy_um=self.spin_dy.value(),
             scan_pattern=str(self.combo_pattern.currentData() or "snake"),
         )
-        self.spin_x_start.setValue(cfg.x_start_um)
-        self.spin_y_start.setValue(cfg.y_start_um)
+        self.spin_x_center.setValue(cfg.x_center_um)
+        self.spin_y_center.setValue(cfg.y_center_um)
         self.spin_dx.setValue(cfg.dx_um)
         self.spin_dy.setValue(cfg.dy_um)
         self.spin_nx.setValue(cfg.nx)
         self.spin_ny.setValue(cfg.ny)
         self.sig_log.emit(
             f"Taught Corner B = ({self._corner_b[0]:.2f}, {self._corner_b[1]:.2f}) µm -> "
-            f"Computed Grid: {cfg.nx}x{cfg.ny} points, step=({cfg.dx_um:.2f}, {cfg.dy_um:.2f}) µm."
+            f"Computed Grid: {cfg.nx}x{cfg.ny} points centered at ({cfg.x_center_um:.2f}, {cfg.y_center_um:.2f}) µm, "
+            f"step=({cfg.dx_um:.2f}, {cfg.dy_um:.2f}) µm."
         )
 
     def _update_map_summary(self):
@@ -1774,10 +1809,13 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             if (otf_checked is None or otf_checked.isChecked())
             else "DISABLED"
         )
+        xs = cfg.x_coords_um
+        ys = cfg.y_coords_um
         self.lbl_map_summary.setText(
-            f"Grid: {cfg.nx} × {cfg.ny} = {cfg.total_points} points   |   "
-            f"Span: {cfg.span_x_um:.1f} × {cfg.span_y_um:.1f} µm   |   "
-            f"Est. Time: {_format_duration(est_sec)}\n"
+            f"Grid: {cfg.nx} × {cfg.ny} = {cfg.total_points} pts  |  "
+            f"Center: ({cfg.x_center_um:.1f}, {cfg.y_center_um:.1f}) µm  |  "
+            f"X:[{xs[0]:.1f}..{xs[-1]:.1f}], Y:[{ys[0]:.1f}..{ys[-1]:.1f}] µm  |  "
+            f"Est: {_format_duration(est_sec)}\n"
             f"On-the-Fly Fitted DHO Dataset: {otf_status}   |   "
             f"Raw 4D Dataset: {raw_status}"
         )
@@ -1897,9 +1935,9 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.sig_log.emit(f"Finished Map '{map_group_path}' ({completed} point(s) saved to HDF5).")
         self.sig_camera_updated.emit()
         self.sig_stage_updated.emit()
-        # Refresh HDF5 status banner
-        if self.session.h5_path:
-            self._on_open_or_create_h5()
+        # Refresh HDF5 status banner without wiping in-memory calibration fits
+        if self.session.is_open:
+            self._refresh_h5_status_banner()
 
     def _on_map_worker_thread_done(self):
         self._set_controls_busy(False, map_running=False)

@@ -111,7 +111,6 @@ def retrieve_refined_fringes(wrapper, path_group):
     """
     Retrieves refined and smoothed fringes from HDF5.
     """
-    nb_fringe = 0
     refined_fringes = []
     all_x_laser = []
     all_x_laser_smooth = []
@@ -119,7 +118,14 @@ def retrieve_refined_fringes(wrapper, path_group):
     all_k_laser = []
 
     children = wrapper.get_children_elements(path_group)
-    while f'fringe_{nb_fringe}_smoothed' in children:
+    smoothed_indices = sorted(
+        int(c[len("fringe_"):-len("_smoothed")])
+        for c in children
+        if c.startswith("fringe_")
+        and c.endswith("_smoothed")
+        and c[len("fringe_"):-len("_smoothed")].isdigit()
+    )
+    for nb_fringe in smoothed_indices:
         fringe = wrapper[f'{path_group}/fringe_{nb_fringe}']
         fringe_smoothed = wrapper[f'{path_group}/fringe_{nb_fringe}_smoothed']
 
@@ -128,7 +134,6 @@ def retrieve_refined_fringes(wrapper, path_group):
         all_x_laser_smooth.extend(fringe_smoothed[0])
         all_y_laser.extend(fringe_smoothed[1])
         all_k_laser.extend([nb_fringe] * len(fringe[0]))
-        nb_fringe += 1
 
     return (
         refined_fringes,

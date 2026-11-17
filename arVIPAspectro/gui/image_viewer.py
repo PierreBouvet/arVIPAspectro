@@ -618,7 +618,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
 
     def update_live_map_view(
         self,
-        frame: np.ndarray,
+        frame: Optional[np.ndarray],
         x_coords_um: np.ndarray,
         y_coords_um: np.ndarray,
         map_mean_shift: np.ndarray,
@@ -629,14 +629,16 @@ class ImageViewerWidget(QtWidgets.QWidget):
         ix: int,
         pos_um: Optional[Dict[str, Optional[float]]] = None,
         point_fit: Optional[Dict[str, Any]] = None,
+        step_um: Optional[tuple] = None,
     ):
         """
         Renders a side-by-side live view during spatial mapping:
           - Left subplot: Latest acquired 2D camera interferogram at `(iy, ix)`.
-          - Right subplot: Live 2D spatial heatmap `(X_um, Y_um)` of the selected Brillouin metric.
+          - Right subplot: Live 2D spatial heatmap `(X_um, Y_um)` of the selected Brillouin metric
+            with proportional physical step aspect ratio (`aspect="equal"`).
         """
         self._last_live_map_state = {
-            "frame": np.asarray(frame),
+            "frame": None if frame is None else np.asarray(frame),
             "x_coords_um": np.asarray(x_coords_um, dtype=np.float64),
             "y_coords_um": np.asarray(y_coords_um, dtype=np.float64),
             "map_mean_shift": np.array(map_mean_shift, dtype=np.float64, copy=True),
@@ -647,6 +649,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             "ix": int(ix),
             "pos_um": pos_um,
             "point_fit": point_fit,
+            "step_um": tuple(float(v) for v in step_um) if step_um is not None else None,
         }
         self._render_live_map_state()
 
@@ -673,18 +676,40 @@ class ImageViewerWidget(QtWidgets.QWidget):
         ax_img = self.figure.add_subplot(1, 2, 1)
         ax_map = self.figure.add_subplot(1, 2, 2)
 
-        cmap_img = self.combo_cmap.currentText()
-        vmin, vmax = self._compute_clim(frame)
-        im1 = ax_img.imshow(frame, cmap=cmap_img, vmin=vmin, vmax=vmax, origin="upper", aspect="equal")
-        self.figure.colorbar(im1, ax=ax_img, fraction=0.046, pad=0.04, label="Counts (ADU)")
-        x_val = pos_um.get("X", xs[min(ix, len(xs) - 1)])
-        y_val = pos_um.get("Y", ys[min(iy, len(ys) - 1)])
-        ax_img.set_title(
-            f"Point [row={iy}, col={ix}] @ ({x_val:.1f}, {y_val:.1f}) µm",
-            fontsize=10,
-        )
-        ax_img.set_xlabel("Detector X (px)")
-        ax_img.set_ylabel("Detector Y (px)")
+        x_val = pos_um.get("X")
+        if x_val is None:
+            x_val = float(xs[min(ix, len(xs) - 1)])
+        y_val = pos_um.get("Y")
+        if y_val is None:
+            y_val = float(ys[min(iy, len(ys) - 1)])
+
+        if frame is not None:
+            cmap_img = self.combo_cmap.currentText()
+            vmin, vmax = self._compute_clim(frame)
+            im1 = ax_img.imshow(frame, cmap=cmap_img, vmin=vmin, vmax=vmax, origin="upper", aspect="equal")
+            self.figure.colorbar(im1, ax=ax_img, fraction=0.046, pad=0.04, label="Counts (ADU)")
+            ax_img.set_title(
+                f"Point [row={iy}, col={ix}] @ ({x_val:.1f}, {y_val:.1f}) µm",
+                fontsize=10,
+            )
+            ax_img.set_xlabel("Detector X (px)")
+            ax_img.set_ylabel("Detector Y (px)")
+        else:
+            ax_img.set_facecolor("#1e1e1e")
+            ax_img.text(
+                0.5,
+                0.5,
+                f"Map scan started\nAcquiring [row={iy}, col={ix}] @ ({x_val:.1f}, {y_val:.1f}) µm...",
+                color="#cfd8dc",
+                ha="center",
+                va="center",
+                transform=ax_img.transAxes,
+                fontsize=10,
+            )
+            ax_img.set_xticks([])
+            ax_img.set_yticks([])
+            ax_img.set_title("Detector Frame (waiting for point 1)", fontsize=10)
+            self.lbl_stats.setText("Map initialized — acquiring first point...")
 
         metric_key = self.combo_map_metric.currentData() or "mean_shift"
         if metric_key == "v_s":
@@ -708,9 +733,22 @@ class ImageViewerWidget(QtWidgets.QWidget):
             cbar_lbl = "ν_B (GHz)"
             cmap_m = "viridis"
 
-        # Compute extent in µm for imshow
-        dx_half = 0.5 * abs(xs[1] - xs[0]) if len(xs) > 1 else 5.0
-        dy_half = 0.5 * abs(ys[1] - ys[0]) if len(ys) > 1 else 5.0
+        # Compute extent in µm using configured step sizes so pixel sizes are proportional
+        step_um = st.get("step_um")
+        if step_um is not None and len(step_um) == 2:
+            dx_step = float(abs(step_um[0])) if step_um[0] else 5.0
+            dy_step = float(abs(step_um[1])) if step_um[1] else 5.0
+        else:
+            dx_step = float(abs(xs[1] - xs[0])) if len(xs) > 1 else None
+            dy_step = float(abs(ys[1] - ys[0])) if len(ys) > 1 else None
+            if dx_step is None and dy_step is None:
+                dx_step = dy_step = 5.0
+            elif dx_step is None:
+                dx_step = dy_step
+            elif dy_step is None:
+                dy_step = dx_step
+        dx_half = 0.5 * dx_step
+        dy_half = 0.5 * dy_step
         x_min, x_max = float(np.min(xs)) - dx_half, float(np.max(xs)) + dx_half
         y_min, y_max = float(np.min(ys)) - dy_half, float(np.max(ys)) + dy_half
 
@@ -719,9 +757,11 @@ class ImageViewerWidget(QtWidgets.QWidget):
             cmap=cmap_m,
             origin="lower",
             extent=[x_min, x_max, y_min, y_max],
-            aspect="auto",
+            aspect="equal",
             interpolation="nearest",
         )
+        ax_map.set_xlim(x_min, x_max)
+        ax_map.set_ylim(y_min, y_max)
         self.figure.colorbar(im2, ax=ax_map, fraction=0.046, pad=0.04, label=cbar_lbl)
         ax_map.plot([x_val], [y_val], "r+", markersize=10, markeredgewidth=2.0)
         ax_map.set_title(metric_title, fontsize=10)
