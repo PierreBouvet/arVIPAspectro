@@ -1,7 +1,9 @@
 """
-Step 1 & Step 2 GUI:
+Step 1, Step 2 & Step 3 GUI:
   - Step 1: Hardware Connection & Status Panel (Hamamatsu Orca Flash 4.0 v3 & ASI MS-2000)
   - Step 2: Stage Movement (Jog / Absolute Go-To) + Automatic Image Acquisition & Live Display
+  - Step 3: Drivable Camera Acquisition Parameters (Exposure, Frame Averaging, Hardware Binning,
+            Sensor ROI, Readout Speed, Defect Pixel Correction, Geometry Lock, and Live Preview)
 """
 
 import time
@@ -22,14 +24,14 @@ from .image_viewer import ImageViewerWidget
 
 class HardwareActionWorker(QtCore.QThread):
     """
-    Background worker thread that executes stage movement and/or camera frame acquisition
-    without blocking the GUI event loop.
+    Background worker thread that executes stage movement, single/averaged frame capture,
+    or continuous Live Preview streaming without blocking the GUI event loop.
     """
 
     sig_log = QtCore.Signal(str)
     sig_stage_updated = QtCore.Signal()
-    sig_frame_acquired = QtCore.Signal(object, object, float)  # (np.ndarray, pos_dict, exposure_s)
-    sig_error = QtCore.Signal(str, str)                        # (title, message)
+    sig_frame_acquired = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
+    sig_error = QtCore.Signal(str, str)                                  # (title, message)
 
     def __init__(
         self,
@@ -42,11 +44,19 @@ class HardwareActionWorker(QtCore.QThread):
         super().__init__(parent)
         self.camera = camera
         self.stage = stage
-        self.action = action  # 'snap', 'move_rel', 'move_abs'
+        self.action = action  # 'snap', 'move_rel', 'move_abs', 'live'
         self.params = params or {}
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
 
     def run(self):
         try:
+            if self.action == "live":
+                self._run_live_loop()
+                return
+
             pos = None
             # 1. Execute stage movement if requested
             if self.action == "move_rel":
@@ -87,25 +97,49 @@ class HardwareActionWorker(QtCore.QThread):
                         pos = None
 
                 exp_s = self.camera.get_exposure()
-                frame = self.camera.snap_frame(stage_pos_um=pos)
-                self.sig_frame_acquired.emit(frame, pos, exp_s)
+                n_avg = self.camera.get_frame_averaging()
+                binning = self.camera.get_binning()
+                frame = self.camera.snap_frame(n_frames=n_avg, stage_pos_um=pos)
+                self.sig_frame_acquired.emit(frame, pos, exp_s, n_avg, binning)
 
         except Exception as exc:
             self.sig_error.emit("Hardware Action Error", str(exc))
 
+    def _run_live_loop(self):
+        self.sig_log.emit("Live Preview started.")
+        pos = None
+        if self.stage.is_connected:
+            try:
+                pos = self.stage.get_position()
+            except Exception:
+                pos = None
+
+        while not self._stop_requested and self.camera.is_connected:
+            exp_s = self.camera.get_exposure()
+            binning = self.camera.get_binning()
+            # In Live Preview, snap 1 frame per cycle for responsive streaming
+            frame = self.camera.snap_frame(n_frames=1, stage_pos_um=pos)
+            if self._stop_requested:
+                break
+            self.sig_frame_acquired.emit(frame, pos, exp_s, 1, binning)
+            time.sleep(0.02)
+
+        self.sig_log.emit("Live Preview stopped.")
+
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Step 1 & Step 2 Application Window: Hardware Connection, Stage Motion & Image Capture."""
+    """Step 1–3 Application Window: Connection, Stage Motion, Image Capture & Acquisition Parameters."""
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(
-            "arVIPAspectro — Step 2: Stage Motion & Image Acquisition (Orca Flash 4.0 v3 & ASI MS-2000)"
+            "arVIPAspectro — Step 3: Drivable Acquisition Parameters (Orca Flash 4.0 v3 & ASI MS-2000)"
         )
-        self.resize(1360, 820)
+        self.resize(1420, 880)
 
-        self._log_mutex = QtCore.QMutex()
         self._worker: Optional[HardwareActionWorker] = None
+        self._live_running: bool = False
+        self._syncing_cam_widgets: bool = False
 
         # Hardware driver instances
         self.camera = OrcaFlashCamera(logger=self._threadsafe_log)
@@ -130,7 +164,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Top Header Bar
         top_bar = QtWidgets.QHBoxLayout()
-        title_lbl = QtWidgets.QLabel("Step 2 — Hardware Connection, Stage Motion & Frame Capture")
+        title_lbl = QtWidgets.QLabel(
+            "Step 3 — Hardware Connection, Stage Motion & Drivable Camera Parameters"
+        )
         title_font = title_lbl.font()
         title_font.setPointSize(13)
         title_font.setBold(True)
@@ -150,7 +186,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self.btn_disconnect_all)
         main_layout.addLayout(top_bar)
 
-        # Horizontal Splitter: Left = 2D Image Viewer, Right = Controls & Log
+        # Horizontal Splitter: Left = 2D Image Viewer, Right = Scrollable Controls + Log
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         main_layout.addWidget(splitter, stretch=1)
 
@@ -162,21 +198,36 @@ class MainWindow(QtWidgets.QMainWindow):
         viewer_layout.addWidget(self.image_viewer)
         splitter.addWidget(viewer_box)
 
-        # --- RIGHT PANEL: Step 1 Connections + Step 2 Stage & Snap Controls + Log ---
+        # --- RIGHT PANEL: Steps 1, 2, 3 Controls + Log ---
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setContentsMargins(4, 0, 0, 0)
         right_layout.setSpacing(8)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_content = QtWidgets.QWidget()
+        scroll_vbox = QtWidgets.QVBoxLayout(scroll_content)
+        scroll_vbox.setContentsMargins(0, 0, 4, 0)
+        scroll_vbox.setSpacing(8)
 
         # Step 1: Side-by-side compact Camera & Stage Connection cards
         conn_row = QtWidgets.QHBoxLayout()
         conn_row.setSpacing(8)
         conn_row.addWidget(self._build_camera_card(), stretch=1)
         conn_row.addWidget(self._build_stage_card(), stretch=1)
-        right_layout.addLayout(conn_row)
+        scroll_vbox.addLayout(conn_row)
+
+        # Step 3: Drivable Camera Acquisition Parameters Card
+        scroll_vbox.addWidget(self._build_step3_camera_parameters_card())
 
         # Step 2: Stage Motion & Image Capture Card
-        right_layout.addWidget(self._build_step2_motion_and_capture_card())
+        scroll_vbox.addWidget(self._build_step2_motion_and_capture_card())
+        scroll_vbox.addStretch()
+
+        scroll.setWidget(scroll_content)
+        right_layout.addWidget(scroll, stretch=3)
 
         # Bottom Hardware Log
         log_group = QtWidgets.QGroupBox("Hardware Communication Log")
@@ -186,7 +237,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.txt_log = QtWidgets.QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setFont(QtGui.QFont("Courier", 10))
-        self.txt_log.setMinimumHeight(110)
+        self.txt_log.setMinimumHeight(100)
 
         btn_clear_log = QtWidgets.QPushButton("Clear Log")
         btn_clear_log.setFixedWidth(85)
@@ -206,7 +257,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_camera_card(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("1A. Camera — Orca Flash 4.0 v3")
         layout = QtWidgets.QVBoxLayout(box)
-        layout.setSpacing(6)
+        layout.setSpacing(5)
 
         self.lbl_cam_status = QtWidgets.QLabel("DISCONNECTED")
         self.lbl_cam_status.setAlignment(QtCore.Qt.AlignCenter)
@@ -243,7 +294,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_cam_sensor = QtWidgets.QLabel("—")
         self.lbl_cam_exposure = QtWidgets.QLabel("—")
         info_form.addRow("Model:", self.lbl_cam_model)
-        info_form.addRow("Sensor:", self.lbl_cam_sensor)
+        info_form.addRow("Frame:", self.lbl_cam_sensor)
         info_form.addRow("Exp / T:", self.lbl_cam_exposure)
         layout.addLayout(info_form)
         return box
@@ -251,7 +302,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_stage_card(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("1B. Stage — ASI MS-2000")
         layout = QtWidgets.QVBoxLayout(box)
-        layout.setSpacing(6)
+        layout.setSpacing(5)
 
         self.lbl_stage_status = QtWidgets.QLabel("DISCONNECTED")
         self.lbl_stage_status.setAlignment(QtCore.Qt.AlignCenter)
@@ -297,19 +348,138 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(info_form)
         return box
 
-    def _build_step2_motion_and_capture_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("Step 2 — Stage Navigation & Automatic Image Capture After Move")
+    def _build_step3_camera_parameters_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Step 3 — Drivable Camera Acquisition Parameters")
         layout = QtWidgets.QVBoxLayout(box)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        # A. Capture trigger & settling time row
+        # 1. Exposure Time & Frame Averaging
+        exp_row = QtWidgets.QHBoxLayout()
+        exp_row.addWidget(QtWidgets.QLabel("Exposure:"))
+        self.spin_exposure_ms = QtWidgets.QDoubleSpinBox()
+        self.spin_exposure_ms.setDecimals(2)
+        self.spin_exposure_ms.setRange(0.02, 30000.0)
+        self.spin_exposure_ms.setValue(50.0)
+        self.spin_exposure_ms.setSuffix(" ms")
+        self.spin_exposure_ms.setMinimumWidth(110)
+        self.spin_exposure_ms.editingFinished.connect(self._on_apply_exposure)
+        exp_row.addWidget(self.spin_exposure_ms)
+
+        # Quick exposure presets
+        for ms_val, lbl in [(5.0, "5ms"), (20.0, "20ms"), (50.0, "50ms"), (200.0, "200ms"), (1000.0, "1s"), (5000.0, "5s")]:
+            btn_e = QtWidgets.QPushButton(lbl)
+            btn_e.setFixedWidth(46)
+            btn_e.clicked.connect(lambda checked=False, v=ms_val: self._set_exposure_preset(v))
+            exp_row.addWidget(btn_e)
+
+        exp_row.addSpacing(10)
+        exp_row.addWidget(QtWidgets.QLabel("Frame Avg:"))
+        self.spin_frame_avg = QtWidgets.QSpinBox()
+        self.spin_frame_avg.setRange(1, 500)
+        self.spin_frame_avg.setValue(1)
+        self.spin_frame_avg.setSuffix(" frame(s)")
+        self.spin_frame_avg.valueChanged.connect(self._on_apply_frame_averaging)
+        exp_row.addWidget(self.spin_frame_avg)
+        exp_row.addStretch()
+        layout.addLayout(exp_row)
+
+        # 2. Readout Speed & Defect Pixel Correction
+        speed_row = QtWidgets.QHBoxLayout()
+        speed_row.addWidget(QtWidgets.QLabel("Readout Speed:"))
+        self.combo_readout_speed = QtWidgets.QComboBox()
+        self.combo_readout_speed.addItem("Fast (Standard Scan)", "fast")
+        self.combo_readout_speed.addItem("Slow (Ultra-Quiet Low-Noise Scan)", "slow")
+        self.combo_readout_speed.currentIndexChanged.connect(self._on_apply_readout_speed)
+        speed_row.addWidget(self.combo_readout_speed)
+
+        speed_row.addSpacing(16)
+        self.chk_defect_correct = QtWidgets.QCheckBox("On-Camera Defect Pixel Correction")
+        self.chk_defect_correct.setChecked(True)
+        self.chk_defect_correct.toggled.connect(self._on_apply_defect_correction)
+        speed_row.addWidget(self.chk_defect_correct)
+        speed_row.addStretch()
+        layout.addLayout(speed_row)
+
+        # Separator
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        layout.addWidget(line)
+
+        # 3. Hardware Binning & Sensor Sub-Array ROI (with Geometry Lock)
+        geom_hdr = QtWidgets.QHBoxLayout()
+        geom_hdr.addWidget(QtWidgets.QLabel("Hardware Binning:"))
+        self.combo_hw_binning = QtWidgets.QComboBox()
+        self.combo_hw_binning.addItem("1 × 1 (Unbinned)", 1)
+        self.combo_hw_binning.addItem("2 × 2", 2)
+        self.combo_hw_binning.addItem("4 × 4", 4)
+        geom_hdr.addWidget(self.combo_hw_binning)
+
+        geom_hdr.addSpacing(12)
+        self.btn_roi_full = QtWidgets.QPushButton("Full Sensor (2048×2048)")
+        self.btn_roi_full.clicked.connect(self._on_preset_full_roi)
+        geom_hdr.addWidget(self.btn_roi_full)
+
+        self.btn_roi_center = QtWidgets.QPushButton("Center (1024×1024)")
+        self.btn_roi_center.clicked.connect(self._on_preset_center_roi)
+        geom_hdr.addWidget(self.btn_roi_center)
+
+        geom_hdr.addStretch()
+        self.chk_lock_geometry = QtWidgets.QCheckBox("Lock ROI & Binning (preserve calibration geometry)")
+        self.chk_lock_geometry.toggled.connect(self._on_geometry_lock_toggled)
+        geom_hdr.addWidget(self.chk_lock_geometry)
+        layout.addLayout(geom_hdr)
+
+        roi_row = QtWidgets.QHBoxLayout()
+        roi_row.addWidget(QtWidgets.QLabel("ROI X [start..end]:"))
+        self.spin_roi_hstart = QtWidgets.QSpinBox()
+        self.spin_roi_hstart.setRange(0, 2044)
+        self.spin_roi_hstart.setSingleStep(4)
+        self.spin_roi_hstart.setValue(0)
+        roi_row.addWidget(self.spin_roi_hstart)
+
+        self.spin_roi_hend = QtWidgets.QSpinBox()
+        self.spin_roi_hend.setRange(4, 2048)
+        self.spin_roi_hend.setSingleStep(4)
+        self.spin_roi_hend.setValue(2048)
+        roi_row.addWidget(self.spin_roi_hend)
+
+        roi_row.addSpacing(10)
+        roi_row.addWidget(QtWidgets.QLabel("Y [start..end]:"))
+        self.spin_roi_vstart = QtWidgets.QSpinBox()
+        self.spin_roi_vstart.setRange(0, 2044)
+        self.spin_roi_vstart.setSingleStep(4)
+        self.spin_roi_vstart.setValue(0)
+        roi_row.addWidget(self.spin_roi_vstart)
+
+        self.spin_roi_vend = QtWidgets.QSpinBox()
+        self.spin_roi_vend.setRange(4, 2048)
+        self.spin_roi_vend.setSingleStep(4)
+        self.spin_roi_vend.setValue(2048)
+        roi_row.addWidget(self.spin_roi_vend)
+
+        self.btn_apply_roi = QtWidgets.QPushButton("Apply ROI & Binning")
+        self.btn_apply_roi.setStyleSheet("font-weight: bold;")
+        self.btn_apply_roi.clicked.connect(self._on_apply_roi_and_binning)
+        roi_row.addWidget(self.btn_apply_roi)
+        roi_row.addStretch()
+        layout.addLayout(roi_row)
+
+        return box
+
+    def _build_step2_motion_and_capture_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Step 2 — Stage Navigation, Snap & Live Preview")
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(8)
+
+        # A. Capture trigger, Live Preview & settling time row
         snap_row = QtWidgets.QHBoxLayout()
         self.chk_auto_snap = QtWidgets.QCheckBox("Auto-acquire image after every move")
         self.chk_auto_snap.setChecked(True)
 
         snap_row.addWidget(self.chk_auto_snap)
-        snap_row.addSpacing(12)
-        snap_row.addWidget(QtWidgets.QLabel("Settling delay:"))
+        snap_row.addSpacing(8)
+        snap_row.addWidget(QtWidgets.QLabel("Settling:"))
         self.spin_settling_ms = QtWidgets.QSpinBox()
         self.spin_settling_ms.setRange(0, 5000)
         self.spin_settling_ms.setValue(50)
@@ -317,7 +487,12 @@ class MainWindow(QtWidgets.QMainWindow):
         snap_row.addWidget(self.spin_settling_ms)
         snap_row.addStretch()
 
-        self.btn_snap_now = QtWidgets.QPushButton("Snap Single Image Now")
+        self.btn_live_preview = QtWidgets.QPushButton("▶ Start Live Preview")
+        self.btn_live_preview.setMinimumHeight(30)
+        self.btn_live_preview.clicked.connect(self._on_toggle_live_preview)
+        snap_row.addWidget(self.btn_live_preview)
+
+        self.btn_snap_now = QtWidgets.QPushButton("📷 Snap Single Image")
         self.btn_snap_now.setMinimumHeight(30)
         self.btn_snap_now.setStyleSheet("font-weight: bold;")
         self.btn_snap_now.clicked.connect(self._on_snap_now)
@@ -334,7 +509,6 @@ class MainWindow(QtWidgets.QMainWindow):
         jog_outer = QtWidgets.QHBoxLayout()
         jog_outer.setSpacing(16)
 
-        # Left side of Jog section: Step Size & Presets
         step_col = QtWidgets.QVBoxLayout()
         step_form = QtWidgets.QFormLayout()
         self.spin_jog_step = QtWidgets.QDoubleSpinBox()
@@ -360,7 +534,6 @@ class MainWindow(QtWidgets.QMainWindow):
         step_col.addStretch()
         jog_outer.addLayout(step_col)
 
-        # Right side of Jog section: 2D XY Directional Pad + Z buttons
         pad_grid = QtWidgets.QGridLayout()
         pad_grid.setSpacing(4)
 
@@ -372,7 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_jog_zm = QtWidgets.QPushButton("▼ -Z")
 
         for b in (self.btn_jog_yp, self.btn_jog_ym, self.btn_jog_xm, self.btn_jog_xp, self.btn_jog_zp, self.btn_jog_zm):
-            b.setMinimumSize(68, 30)
+            b.setMinimumSize(68, 28)
 
         self.btn_jog_yp.clicked.connect(lambda: self._on_jog(0.0, +1.0, 0.0))
         self.btn_jog_ym.clicked.connect(lambda: self._on_jog(0.0, -1.0, 0.0))
@@ -463,6 +636,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._threadsafe_log(f"Serial scan: {len(ports)} COM port(s) found.")
 
     def _on_toggle_camera(self):
+        self._stop_live_if_running()
         if self.camera.is_connected:
             self.camera.disconnect()
         else:
@@ -498,6 +672,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_toggle_stage()
 
     def _on_disconnect_all(self):
+        self._stop_live_if_running()
         if self._worker is not None and self._worker.isRunning():
             self._worker.wait(2000)
         if self.camera.is_connected:
@@ -508,18 +683,185 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_stage_ui()
 
     # ==========================================================================
-    # Step 2: Stage Motion & Image Capture Actions
+    # Step 3: Drivable Camera Parameter Handlers
     # ==========================================================================
 
-    def _is_worker_busy(self) -> bool:
+    def _set_exposure_preset(self, ms_val: float):
+        self.spin_exposure_ms.setValue(ms_val)
+        self._on_apply_exposure()
+
+    def _on_apply_exposure(self):
+        if self._syncing_cam_widgets or not self.camera.is_connected:
+            return
+        try:
+            exp_s = float(self.spin_exposure_ms.value()) / 1000.0
+            actual_s = self.camera.set_exposure(exp_s)
+            self._syncing_cam_widgets = True
+            self.spin_exposure_ms.setValue(actual_s * 1000.0)
+            self._syncing_cam_widgets = False
+            self._update_camera_ui()
+        except Exception as exc:
+            self._threadsafe_log(f"Exposure error: {exc}")
+
+    def _on_apply_frame_averaging(self, val: int):
+        if self._syncing_cam_widgets:
+            return
+        self.camera.set_frame_averaging(int(val))
+        self._update_camera_ui()
+
+    def _on_apply_readout_speed(self):
+        if self._syncing_cam_widgets or not self.camera.is_connected:
+            return
+        was_live = self._live_running
+        if was_live:
+            self._stop_live_if_running()
+        try:
+            speed = str(self.combo_readout_speed.currentData() or "fast")
+            self.camera.set_readout_speed(speed)
+            self._update_camera_ui()
+        except Exception as exc:
+            self._threadsafe_log(f"Readout speed error: {exc}")
+        if was_live:
+            self._on_toggle_live_preview()
+
+    def _on_apply_defect_correction(self, checked: bool):
+        if self._syncing_cam_widgets or not self.camera.is_connected:
+            return
+        was_live = self._live_running
+        if was_live:
+            self._stop_live_if_running()
+        try:
+            self.camera.set_defect_correct_mode(checked)
+            self._update_camera_ui()
+        except Exception as exc:
+            self._threadsafe_log(f"Defect pixel correction error: {exc}")
+        if was_live:
+            self._on_toggle_live_preview()
+
+    def _on_preset_full_roi(self):
+        if self.chk_lock_geometry.isChecked():
+            return
+        det_w, det_h = self.camera.detector_size
+        self.spin_roi_hstart.setValue(0)
+        self.spin_roi_hend.setValue(det_w)
+        self.spin_roi_vstart.setValue(0)
+        self.spin_roi_vend.setValue(det_h)
+        self._on_apply_roi_and_binning()
+
+    def _on_preset_center_roi(self):
+        if self.chk_lock_geometry.isChecked():
+            return
+        det_w, det_h = self.camera.detector_size
+        sub_w, sub_h = min(1024, det_w), min(1024, det_h)
+        hs = ((det_w - sub_w) // 2 // 4) * 4
+        vs = ((det_h - sub_h) // 2 // 4) * 4
+        self.spin_roi_hstart.setValue(hs)
+        self.spin_roi_hend.setValue(hs + sub_w)
+        self.spin_roi_vstart.setValue(vs)
+        self.spin_roi_vend.setValue(vs + sub_h)
+        self._on_apply_roi_and_binning()
+
+    def _on_apply_roi_and_binning(self):
+        if self._syncing_cam_widgets or not self.camera.is_connected:
+            return
+        if self.chk_lock_geometry.isChecked():
+            self._threadsafe_log("Geometry is locked; unlock to modify ROI or hardware binning.")
+            return
+
+        was_live = self._live_running
+        if was_live:
+            self._stop_live_if_running()
+
+        try:
+            binning = int(self.combo_hw_binning.currentData() or 1)
+            hstart = int(self.spin_roi_hstart.value())
+            hend = int(self.spin_roi_hend.value())
+            vstart = int(self.spin_roi_vstart.value())
+            vend = int(self.spin_roi_vend.value())
+
+            applied_roi = self.camera.set_roi(
+                hstart=hstart,
+                hend=hend,
+                vstart=vstart,
+                vend=vend,
+                binning=binning,
+            )
+            self._syncing_cam_widgets = True
+            self.spin_roi_hstart.setValue(applied_roi[0])
+            self.spin_roi_hend.setValue(applied_roi[1])
+            self.spin_roi_vstart.setValue(applied_roi[2])
+            self.spin_roi_vend.setValue(applied_roi[3])
+            idx_bin = self.combo_hw_binning.findData(applied_roi[4])
+            if idx_bin >= 0:
+                self.combo_hw_binning.setCurrentIndex(idx_bin)
+            self._syncing_cam_widgets = False
+            self._update_camera_ui()
+        except Exception as exc:
+            self._threadsafe_log(f"ROI / Binning error: {exc}")
+            QtWidgets.QMessageBox.warning(self, "ROI / Binning Error", str(exc))
+
+        if was_live:
+            self._on_toggle_live_preview()
+
+    def _on_geometry_lock_toggled(self, locked: bool):
+        state_msg = "LOCKED" if locked else "UNLOCKED"
+        self._threadsafe_log(f"Camera ROI & Hardware Binning {state_msg}.")
+        self._set_motion_controls_enabled(not (self._worker and self._worker.isRunning() and not self._live_running))
+
+    # ==========================================================================
+    # Step 2: Stage Motion, Single Snap & Live Preview Actions
+    # ==========================================================================
+
+    def _stop_live_if_running(self):
+        if self._live_running and self._worker is not None and self._worker.isRunning():
+            self._worker.request_stop()
+            self._worker.wait(3000)
+        self._live_running = False
+        self.btn_live_preview.setText("▶ Start Live Preview")
+        self.btn_live_preview.setStyleSheet("")
+
+    def _on_toggle_live_preview(self):
+        if self._live_running:
+            self._stop_live_if_running()
+            self._set_motion_controls_enabled(True)
+            return
+
+        if not self.camera.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Camera Not Connected", "Please connect the camera first.")
+            return
+
         if self._worker is not None and self._worker.isRunning():
-            self._threadsafe_log("Hardware action already in progress; please wait...")
-            return True
-        return False
+            return
+
+        self._live_running = True
+        self.btn_live_preview.setText("⏹ Stop Live Preview")
+        self.btn_live_preview.setStyleSheet("background-color: #ef6c00; color: white; font-weight: bold;")
+        self._worker = HardwareActionWorker(
+            camera=self.camera,
+            stage=self.stage,
+            action="live",
+            parent=self,
+        )
+        self._worker.sig_log.connect(self._append_log_slot)
+        self._worker.sig_frame_acquired.connect(self._on_frame_acquired)
+        self._worker.sig_error.connect(self._on_worker_error)
+        self._worker.finished.connect(self._on_live_worker_finished)
+        self._worker.start()
+
+    def _on_live_worker_finished(self):
+        self._live_running = False
+        self.btn_live_preview.setText("▶ Start Live Preview")
+        self.btn_live_preview.setStyleSheet("")
+        self._set_motion_controls_enabled(True)
 
     def _start_hardware_worker(self, action: str, params: Optional[Dict[str, Any]] = None):
-        if self._is_worker_busy():
+        if self._live_running:
+            self._stop_live_if_running()
+
+        if self._worker is not None and self._worker.isRunning():
+            self._threadsafe_log("Hardware action already in progress; please wait...")
             return
+
         self._set_motion_controls_enabled(False)
         self._worker = HardwareActionWorker(
             camera=self.camera,
@@ -585,9 +927,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stage.halt()
             self._update_stage_ui()
 
-    @QtCore.Slot(object, object, float)
-    def _on_frame_acquired(self, frame, pos, exposure_s: float):
-        self.image_viewer.update_image(frame, stage_pos_um=pos, exposure_s=exposure_s)
+    @QtCore.Slot(object, object, float, int, int)
+    def _on_frame_acquired(self, frame, pos, exposure_s: float, n_avg: int, binning: int):
+        self.image_viewer.update_image(
+            frame,
+            stage_pos_um=pos,
+            exposure_s=exposure_s,
+            n_avg=n_avg,
+            binning=binning,
+        )
 
     @QtCore.Slot(str, str)
     def _on_worker_error(self, title: str, message: str):
@@ -602,8 +950,25 @@ class MainWindow(QtWidgets.QMainWindow):
         cam_ok = self.camera.is_connected and enabled
         stage_ok = self.stage.is_connected and enabled
         has_z = self.stage.has_z_axis and stage_ok
+        geom_unlocked = cam_ok and (not self.chk_lock_geometry.isChecked())
 
         self.btn_snap_now.setEnabled(cam_ok)
+        self.btn_live_preview.setEnabled(self.camera.is_connected)
+        self.spin_exposure_ms.setEnabled(cam_ok or self._live_running)
+        self.spin_frame_avg.setEnabled(cam_ok)
+        self.combo_readout_speed.setEnabled(cam_ok)
+        self.chk_defect_correct.setEnabled(cam_ok)
+
+        # Geometry controls (locked when chk_lock_geometry is checked)
+        self.combo_hw_binning.setEnabled(geom_unlocked)
+        self.btn_roi_full.setEnabled(geom_unlocked)
+        self.btn_roi_center.setEnabled(geom_unlocked)
+        self.spin_roi_hstart.setEnabled(geom_unlocked)
+        self.spin_roi_hend.setEnabled(geom_unlocked)
+        self.spin_roi_vstart.setEnabled(geom_unlocked)
+        self.spin_roi_vend.setEnabled(geom_unlocked)
+        self.btn_apply_roi.setEnabled(geom_unlocked)
+
         for b in (self.btn_jog_xp, self.btn_jog_xm, self.btn_jog_yp, self.btn_jog_ym, self.btn_move_abs, self.btn_copy_pos):
             b.setEnabled(stage_ok)
         self.btn_jog_zp.setEnabled(has_z)
@@ -644,19 +1009,41 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if connected:
             self.lbl_cam_model.setText(f"{st['model']} (S/N: {st['serial_number']})")
-            det_w, det_h = st["detector_size"]
             roi = st["roi"]
-            self.lbl_cam_sensor.setText(f"{det_w}×{det_h} px (Bin {roi[4]}×{roi[5]})")
+            out_h, out_w = st["output_shape"]
+            self.lbl_cam_sensor.setText(
+                f"{out_w}×{out_h} px (ROI [{roi[0]}:{roi[1]}, {roi[2]}:{roi[3]}], Bin {roi[4]}×{roi[5]})"
+            )
             exp_ms = (st["exposure_s"] or 0.0) * 1e3
+            n_avg = st["frame_averaging"]
             temp = st["temperature_c"]
             temp_str = f"{temp:.1f} °C" if temp is not None else "N/A"
-            self.lbl_cam_exposure.setText(f"{exp_ms:.2f} ms  |  {temp_str}")
+            self.lbl_cam_exposure.setText(f"{exp_ms:.2f} ms × {n_avg} avg  |  {st['readout_speed']}  |  {temp_str}")
+
+            # Sync Step 3 controls with actual hardware values
+            self._syncing_cam_widgets = True
+            self.spin_exposure_ms.setValue(exp_ms)
+            self.spin_frame_avg.setValue(int(n_avg))
+            idx_spd = self.combo_readout_speed.findData(st["readout_speed"])
+            if idx_spd >= 0:
+                self.combo_readout_speed.setCurrentIndex(idx_spd)
+            if st["defect_correct"] is not None:
+                self.chk_defect_correct.setChecked(bool(st["defect_correct"]))
+            idx_bin = self.combo_hw_binning.findData(int(roi[4]))
+            if idx_bin >= 0:
+                self.combo_hw_binning.setCurrentIndex(idx_bin)
+            self.spin_roi_hstart.setValue(int(roi[0]))
+            self.spin_roi_hend.setValue(int(roi[1]))
+            self.spin_roi_vstart.setValue(int(roi[2]))
+            self.spin_roi_vend.setValue(int(roi[3]))
+            self._syncing_cam_widgets = False
         else:
             self.lbl_cam_model.setText("—")
             self.lbl_cam_sensor.setText("—")
             self.lbl_cam_exposure.setText("—")
 
-        self._set_motion_controls_enabled(not (self._worker and self._worker.isRunning()))
+        busy = bool(self._worker and self._worker.isRunning() and not self._live_running)
+        self._set_motion_controls_enabled(not busy)
 
     def _update_stage_ui(self):
         try:
@@ -685,7 +1072,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_stage_pos_xy.setText("—")
             self.lbl_stage_pos_z.setText("—")
 
-        self._set_motion_controls_enabled(not (self._worker and self._worker.isRunning()))
+        busy = bool(self._worker and self._worker.isRunning() and not self._live_running)
+        self._set_motion_controls_enabled(not busy)
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         """Ensure hardware connections are cleanly closed when exiting the GUI."""

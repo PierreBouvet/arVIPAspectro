@@ -81,6 +81,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
         image: np.ndarray,
         stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
         exposure_s: Optional[float] = None,
+        n_avg: Optional[int] = None,
+        binning: Optional[int] = None,
     ):
         """
         Displays a newly acquired 2D image and updates statistics and stage coordinates in the title.
@@ -89,14 +91,18 @@ class ImageViewerWidget(QtWidgets.QWidget):
         h, w = self._current_image.shape[:2]
 
         # Build title string
-        parts = [f"Frame {w}×{h} px"]
+        bin_str = f" (Bin {binning}×{binning})" if binning else ""
+        parts = [f"Frame {w}×{h} px{bin_str}"]
         if stage_pos_um is not None and stage_pos_um.get("X") is not None:
             pos_str = f"X={stage_pos_um['X']:.1f} µm, Y={stage_pos_um['Y']:.1f} µm"
             if stage_pos_um.get("Z") is not None:
                 pos_str += f", Z={stage_pos_um['Z']:.1f} µm"
             parts.append(f"Stage: ({pos_str})")
         if exposure_s is not None:
-            parts.append(f"Exp: {exposure_s * 1e3:.1f} ms")
+            exp_str = f"Exp: {exposure_s * 1e3:.2f} ms"
+            if n_avg and n_avg > 1:
+                exp_str += f" × {n_avg} avg"
+            parts.append(exp_str)
         self._current_title = "  |  ".join(parts)
 
         # Compute statistics

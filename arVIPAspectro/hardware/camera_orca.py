@@ -8,7 +8,7 @@ and UI testing.
 
 import time
 import threading
-from typing import Dict, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple, Callable
 import numpy as np
 
 
@@ -31,9 +31,17 @@ def count_dcam_cameras() -> int:
 class OrcaFlashCamera:
     """
     Hardware driver for the Hamamatsu Orca Flash 4.0 v3 sCMOS camera.
+    Supports drivable acquisition parameters:
+      - Exposure time (s / ms)
+      - Hardware binning (1x1, 2x2, 4x4)
+      - Sensor ROI (hstart, hend, vstart, vend in multiples of 4 px)
+      - Readout speed ('fast' standard scan vs 'slow' low-noise scan)
+      - Defect pixel correction (True / False)
+      - Multi-frame averaging (N frames averaged per snap)
     """
 
     DEFAULT_DETECTOR_SIZE = (2048, 2048)  # (width, height) in pixels
+    VALID_BINNINGS = (1, 2, 4)
 
     def __init__(self, logger: Optional[Callable[[str], None]] = None):
         self._log_cb = logger
@@ -50,10 +58,14 @@ class OrcaFlashCamera:
         self._camera_version: str = ""
         self._detector_size: Tuple[int, int] = self.DEFAULT_DETECTOR_SIZE
 
+        # Software-managed multi-frame averaging count
+        self._frame_averaging: int = 1
+
         # Simulated state
         self._sim_exposure_s: float = 0.050  # 50 ms default
         self._sim_roi: Tuple[int, int, int, int, int, int] = (0, 2048, 0, 2048, 1, 1)
         self._sim_readout_speed: str = "fast"
+        self._sim_defect_correct: bool = True
         self._sim_frame_counter: int = 0
         self._sim_grid_cache: Optional[Tuple[int, int, np.ndarray, np.ndarray]] = None
 
@@ -114,6 +126,7 @@ class OrcaFlashCamera:
                 self._serial_number = "SIM-ORCA-001"
                 self._camera_version = "3.00.Sim"
                 self._detector_size = self.DEFAULT_DETECTOR_SIZE
+                self._sim_roi = (0, self._detector_size[0], 0, self._detector_size[1], 1, 1)
                 self._log(
                     f"Connected in SIMULATION mode: {self._model} "
                     f"[{self._detector_size[0]}x{self._detector_size[1]} px]."
@@ -196,7 +209,7 @@ class OrcaFlashCamera:
                 self._log(f"Disconnected from {model_info}.")
 
     # ==========================================================================
-    # Status & Basic Queries
+    # Drivable Acquisition Parameters (Step 3)
     # ==========================================================================
 
     def get_exposure(self) -> float:
@@ -216,14 +229,17 @@ class OrcaFlashCamera:
             exposure_s = max(1e-5, float(exposure_s))
             if self._simulate:
                 self._sim_exposure_s = exposure_s
-                self._log(f"Set exposure (sim) to {exposure_s * 1e3:.2f} ms.")
+                self._log(f"Exposure set (sim) to {exposure_s * 1e3:.3f} ms.")
                 return self._sim_exposure_s
             actual = float(self._cam.set_exposure(exposure_s))
-            self._log(f"Set exposure to {actual * 1e3:.2f} ms.")
+            self._log(f"Exposure set to {actual * 1e3:.3f} ms.")
             return actual
 
     def get_roi(self) -> Tuple[int, int, int, int, int, int]:
-        """Returns `(hstart, hend, vstart, vend, hbin, vbin)`."""
+        """
+        Returns the active sensor ROI and hardware binning as
+        `(hstart, hend, vstart, vend, hbin, vbin)` in unbinned detector pixels.
+        """
         with self._lock:
             if not self._connected:
                 raise OrcaCameraError("Camera is not connected.")
@@ -231,6 +247,172 @@ class OrcaFlashCamera:
                 return self._sim_roi
             roi = self._cam.get_roi()
             return tuple(int(v) for v in roi)
+
+    def set_roi(
+        self,
+        hstart: int = 0,
+        hend: Optional[int] = None,
+        vstart: int = 0,
+        vend: Optional[int] = None,
+        binning: int = 1,
+    ) -> Tuple[int, int, int, int, int, int]:
+        """
+        Sets the sensor sub-array ROI and hardware binning (`1`, `2`, or `4`).
+        Coordinates `hstart, hend, vstart, vend` are automatically aligned to 4-pixel boundaries
+        required by the Orca Flash 4.0 v3 hardware.
+        """
+        with self._lock:
+            if not self._connected:
+                raise OrcaCameraError("Camera is not connected.")
+
+            det_w, det_h = self._detector_size
+            if hend is None:
+                hend = det_w
+            if vend is None:
+                vend = det_h
+
+            # Quantize to valid binning (1, 2, 4)
+            binning = int(binning)
+            if binning not in self.VALID_BINNINGS:
+                binning = min(self.VALID_BINNINGS, key=lambda b: abs(b - binning))
+
+            # Align ROI limits to multiples of 4 pixels (minimum 4x4 subarray size)
+            hstart = max(0, min((int(hstart) // 4) * 4, det_w - 4))
+            hend = max(hstart + 4, min(((int(hend) + 3) // 4) * 4, det_w))
+            vstart = max(0, min((int(vstart) // 4) * 4, det_h - 4))
+            vend = max(vstart + 4, min(((int(vend) + 3) // 4) * 4, det_h))
+
+            if self._simulate:
+                self._sim_roi = (hstart, hend, vstart, vend, binning, binning)
+                self._sim_grid_cache = None
+                out_w = (hend - hstart) // binning
+                out_h = (vend - vstart) // binning
+                self._log(
+                    f"ROI & Binning set (sim): X=[{hstart}:{hend}], Y=[{vstart}:{vend}], "
+                    f"Bin={binning}x{binning} -> Frame {out_w}x{out_h} px."
+                )
+                return self._sim_roi
+
+            applied = self._cam.set_roi(
+                hstart=hstart,
+                hend=hend,
+                vstart=vstart,
+                vend=vend,
+                hbin=binning,
+                vbin=binning,
+            )
+            roi_tuple = tuple(int(v) for v in applied)
+            out_w = (roi_tuple[1] - roi_tuple[0]) // max(1, roi_tuple[4])
+            out_h = (roi_tuple[3] - roi_tuple[2]) // max(1, roi_tuple[5])
+            self._log(
+                f"ROI & Binning set: X=[{roi_tuple[0]}:{roi_tuple[1]}], Y=[{roi_tuple[2]}:{roi_tuple[3]}], "
+                f"Bin={roi_tuple[4]}x{roi_tuple[5]} -> Frame {out_w}x{out_h} px."
+            )
+            return roi_tuple
+
+    def get_binning(self) -> int:
+        """Returns the current hardware binning factor (`1`, `2`, or `4`)."""
+        roi = self.get_roi()
+        return int(roi[4])
+
+    def set_binning(self, binning: int) -> Tuple[int, int, int, int, int, int]:
+        """Updates the hardware binning factor (`1`, `2`, or `4`) while preserving the current ROI bounds."""
+        hstart, hend, vstart, vend, _, _ = self.get_roi()
+        return self.set_roi(hstart=hstart, hend=hend, vstart=vstart, vend=vend, binning=binning)
+
+    def reset_full_roi(self, binning: Optional[int] = None) -> Tuple[int, int, int, int, int, int]:
+        """Resets the sensor ROI to the full detector area (`2048x2048`)."""
+        if binning is None:
+            binning = self.get_binning()
+        det_w, det_h = self._detector_size
+        return self.set_roi(hstart=0, hend=det_w, vstart=0, vend=det_h, binning=binning)
+
+    def get_available_readout_speeds(self) -> List[str]:
+        """Returns the list of supported readout speeds (e.g. `['slow', 'fast']`)."""
+        with self._lock:
+            if not self._connected or self._simulate:
+                return ["fast", "slow"]
+            try:
+                speeds = list(self._cam.get_all_readout_speeds())
+                return speeds if speeds else ["fast", "slow"]
+            except Exception:
+                return ["fast", "slow"]
+
+    def get_readout_speed(self) -> str:
+        """Returns the current readout speed (`'fast'` or `'slow'`)."""
+        with self._lock:
+            if not self._connected:
+                raise OrcaCameraError("Camera is not connected.")
+            if self._simulate:
+                return self._sim_readout_speed
+            try:
+                return str(self._cam.get_readout_speed())
+            except Exception:
+                return "fast"
+
+    def set_readout_speed(self, speed: str) -> str:
+        """Sets the camera readout speed (`'fast'` standard scan or `'slow'` low-noise scan)."""
+        with self._lock:
+            if not self._connected:
+                raise OrcaCameraError("Camera is not connected.")
+            speed = str(speed).lower().strip()
+            if self._simulate:
+                self._sim_readout_speed = speed if speed in ("fast", "slow", "normal") else "fast"
+                self._log(f"Readout speed set (sim) to '{self._sim_readout_speed}'.")
+                return self._sim_readout_speed
+            actual = str(self._cam.set_readout_speed(speed))
+            self._log(f"Readout speed set to '{actual}'.")
+            return actual
+
+    def get_defect_correct_mode(self) -> bool:
+        """Returns True if on-camera defect pixel correction is enabled."""
+        with self._lock:
+            if not self._connected:
+                raise OrcaCameraError("Camera is not connected.")
+            if self._simulate:
+                return self._sim_defect_correct
+            try:
+                return bool(self._cam.get_defect_correct_mode())
+            except Exception:
+                return True
+
+    def set_defect_correct_mode(self, enabled: bool) -> bool:
+        """Enables or disables on-camera defect pixel correction."""
+        with self._lock:
+            if not self._connected:
+                raise OrcaCameraError("Camera is not connected.")
+            enabled = bool(enabled)
+            if self._simulate:
+                self._sim_defect_correct = enabled
+                self._log(f"Defect pixel correction set (sim) to {enabled}.")
+                return self._sim_defect_correct
+            actual = bool(self._cam.set_defect_correct_mode(enabled))
+            self._log(f"Defect pixel correction set to {actual}.")
+            return actual
+
+    def get_frame_averaging(self) -> int:
+        """Returns the number of frames averaged per acquisition (`>= 1`)."""
+        with self._lock:
+            return int(self._frame_averaging)
+
+    def set_frame_averaging(self, n_frames: int) -> int:
+        """Sets the number of frames (`1..100`) to average per acquisition."""
+        with self._lock:
+            self._frame_averaging = max(1, min(int(n_frames), 500))
+            self._log(f"Frame averaging set to {self._frame_averaging} frame(s) per acquisition.")
+            return self._frame_averaging
+
+    def get_frame_readout_time(self) -> Optional[float]:
+        """Returns the sensor frame readout time in seconds."""
+        with self._lock:
+            if not self._connected:
+                return None
+            if self._simulate:
+                return 0.010 if self._sim_readout_speed == "fast" else 0.030
+            try:
+                return float(self._cam.get_frame_readout_time())
+            except Exception:
+                return None
 
     def get_sensor_temperature(self) -> Optional[float]:
         """Returns the sensor temperature in °C if supported by the camera."""
@@ -251,19 +433,23 @@ class OrcaFlashCamera:
 
     def snap_frame(
         self,
+        n_frames: Optional[int] = None,
         timeout_s: Optional[float] = None,
         stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
     ) -> np.ndarray:
         """
-        Acquires a single 2D image frame (`uint16`) from the camera.
+        Acquires a 2D image frame (`uint16`) from the camera.
+        If `n_frames` (or `self.get_frame_averaging()`) > 1, acquires `n_frames`
+        consecutive frames and returns their pixel-wise average as `uint16`.
 
         Parameters
         ----------
+        n_frames : int, optional
+            Number of frames to average. Defaults to `self.get_frame_averaging()`.
         timeout_s : float, optional
-            Maximum time to wait for the frame in seconds. Defaults to `max(5.0, exposure_s + 5.0)`.
+            Per-frame timeout in seconds. Defaults to `max(5.0, exposure_s * 1.5 + 5.0)`.
         stage_pos_um : dict, optional
-            Optional stage coordinates `{'X': x, 'Y': y, 'Z': z}` (used in Simulation Mode
-            to modulate synthetic Brillouin shift and fringe intensity with stage position).
+            Optional stage coordinates `{'X': x, 'Y': y, 'Z': z}` (used in Simulation Mode).
 
         Returns
         -------
@@ -274,26 +460,50 @@ class OrcaFlashCamera:
             if not self._connected:
                 raise OrcaCameraError("Camera is not connected.")
 
+            if n_frames is None:
+                n_frames = self._frame_averaging
+            n_frames = max(1, int(n_frames))
+
             exp_s = self.get_exposure()
             if timeout_s is None:
                 timeout_s = max(5.0, exp_s * 1.5 + 5.0)
 
             if self._simulate:
-                time.sleep(min(exp_s, 0.25))  # Cap simulated wait for responsive UI testing
-                frame = self._generate_simulated_frame(stage_pos_um=stage_pos_um)
+                t0 = time.time()
+                time.sleep(min(exp_s * n_frames, 0.25))
+                if n_frames == 1:
+                    frame = self._generate_simulated_frame(stage_pos_um=stage_pos_um)
+                else:
+                    acc = np.zeros_like(
+                        self._generate_simulated_frame(stage_pos_um=stage_pos_um),
+                        dtype=np.float64,
+                    )
+                    for _ in range(n_frames):
+                        acc += self._generate_simulated_frame(stage_pos_um=stage_pos_um)
+                    frame = np.clip(np.rint(acc / n_frames), 0, 65535).astype(np.uint16)
+
+                elapsed_ms = (time.time() - t0) * 1e3
                 self._log(
-                    f"Acquired simulated frame #{self._sim_frame_counter} "
-                    f"({frame.shape[1]}x{frame.shape[0]} px, uint16, min={frame.min()}, max={frame.max()})."
+                    f"Acquired simulated frame ({frame.shape[1]}x{frame.shape[0]} px, "
+                    f"avg={n_frames}, {elapsed_ms:.1f} ms) [min={frame.min()}, max={frame.max()}]."
                 )
                 return frame
 
             try:
                 t0 = time.time()
-                raw_frame = self._cam.snap(timeout=timeout_s)
+                if n_frames == 1:
+                    raw_frame = self._cam.snap(timeout=timeout_s)
+                    frame = np.asarray(raw_frame, dtype=np.uint16)
+                else:
+                    frames = self._cam.grab(nframes=n_frames, frame_timeout=timeout_s)
+                    if not frames:
+                        raise OrcaCameraError("Camera grab returned 0 frames.")
+                    acc = np.mean(np.asarray(frames, dtype=np.float64), axis=0)
+                    frame = np.clip(np.rint(acc), 0, 65535).astype(np.uint16)
+
                 elapsed_ms = (time.time() - t0) * 1e3
-                frame = np.asarray(raw_frame, dtype=np.uint16)
                 self._log(
-                    f"Acquired frame ({frame.shape[1]}x{frame.shape[0]} px, uint16) "
+                    f"Acquired frame ({frame.shape[1]}x{frame.shape[0]} px, uint16, avg={n_frames}) "
                     f"in {elapsed_ms:.1f} ms [min={frame.min()}, max={frame.max()}]."
                 )
                 return frame
@@ -305,15 +515,20 @@ class OrcaFlashCamera:
     ) -> np.ndarray:
         """
         Generates a realistic synthetic 2D ar-VIPA Brillouin interferogram (`uint16`)
-        whose Brillouin satellite splitting and envelope vary smoothly with `(X, Y)` stage coordinates.
+        whose dimensions match the active ROI & hardware binning, and whose fringes
+        vary smoothly with `(X, Y)` stage coordinates and exposure time.
         """
         self._sim_frame_counter += 1
+        det_w, det_h = self._detector_size
         hstart, hend, vstart, vend, hbin, vbin = self._sim_roi
         w = max(1, (hend - hstart) // max(1, hbin))
         h = max(1, (vend - vstart) // max(1, vbin))
 
         if self._sim_grid_cache is None or self._sim_grid_cache[0] != h or self._sim_grid_cache[1] != w:
-            yy, xx = np.indices((h, w), dtype=np.float32)
+            # Map binned ROI pixel indices back to full-sensor pixel coordinates
+            y_sensor = vstart + (np.arange(h, dtype=np.float32) + 0.5) * vbin
+            x_sensor = hstart + (np.arange(w, dtype=np.float32) + 0.5) * hbin
+            yy, xx = np.meshgrid(y_sensor, x_sensor, indexing="ij")
             self._sim_grid_cache = (h, w, xx, yy)
         else:
             _, _, xx, yy = self._sim_grid_cache
@@ -321,34 +536,33 @@ class OrcaFlashCamera:
         x_um = float((stage_pos_um or {}).get("X") or 0.0)
         y_um = float((stage_pos_um or {}).get("Y") or 0.0)
 
-        # Normalize detector coordinates to [-1, 1]
-        xn = (xx - 0.5 * w) / (0.5 * w)
-        yn = (yy - 0.5 * h) / (0.5 * h)
+        # Normalize detector coordinates to [-1, 1] relative to full sensor center
+        xn = (xx - 0.5 * det_w) / (0.5 * det_w)
+        yn = (yy - 0.5 * det_h) / (0.5 * det_h)
 
         # Curved VIPA orders (parabolic curvature along y + non-linear dispersion along x)
         order_phase = 6.0 * (xn + 1.05) - 0.45 * (xn + 1.05) ** 2 + 0.18 * (yn ** 2)
-        frac = order_phase - np.floor(order_phase)  # [0, 1) within each FSR
+        frac = order_phase - np.floor(order_phase)
 
-        # Modulate Brillouin shift ratio slightly with stage (X, Y) so movement is visible
+        # Modulate Brillouin shift ratio slightly with stage (X, Y)
         shift_frac = 0.18 + 0.03 * np.sin(x_um / 50.0) * np.cos(y_um / 50.0)
-        # Angular dependence along vertical axis yn
         shift_y = shift_frac * np.sqrt(np.clip(1.0 - 0.25 * yn ** 2, 0.2, 1.0))
 
-        # Elastic Rayleigh peak at frac ~ 0 / 1 + Stokes & Anti-Stokes doublets at +/- shift_y
+        # Elastic Rayleigh peak + Stokes & Anti-Stokes doublets
         elastic = np.exp(-0.5 * (np.minimum(frac, 1.0 - frac) / 0.018) ** 2)
         stokes = 0.42 * np.exp(-0.5 * ((frac - shift_y) / 0.026) ** 2)
         antistokes = 0.42 * np.exp(-0.5 * ((frac - (1.0 - shift_y)) / 0.026) ** 2)
 
-        # 2D Gaussian illumination envelope (shifted slightly by stage position)
         env_x0 = 0.08 * np.sin(x_um / 100.0)
         env_y0 = 0.08 * np.cos(y_um / 100.0)
         envelope = np.exp(-0.6 * ((xn - env_x0) ** 2 + (yn - env_y0) ** 2))
 
-        exp_scale = np.clip(self._sim_exposure_s / 0.050, 0.1, 10.0)
+        exp_scale = np.clip(self._sim_exposure_s / 0.050, 0.02, 20.0) * (hbin * vbin)
         signal = (120.0 + 18000.0 * exp_scale * envelope * (elastic + stokes + antistokes)).astype(np.float32)
 
+        noise_std = 12.0 if self._sim_readout_speed == "slow" else 25.0
         rng = np.random.default_rng(seed=1000 + self._sim_frame_counter)
-        noise = rng.normal(loc=0.0, scale=25.0, size=(h, w)).astype(np.float32)
+        noise = rng.normal(loc=0.0, scale=noise_std, size=(h, w)).astype(np.float32)
         frame = np.clip(signal + noise, 0, 65535).astype(np.uint16)
         return frame
 
@@ -366,9 +580,19 @@ class OrcaFlashCamera:
                     "camera_version": "",
                     "detector_size": self.DEFAULT_DETECTOR_SIZE,
                     "roi": None,
+                    "binning": 1,
+                    "output_shape": None,
                     "exposure_s": None,
+                    "readout_speed": None,
+                    "available_readout_speeds": ["fast", "slow"],
+                    "defect_correct": None,
+                    "frame_averaging": self._frame_averaging,
+                    "readout_time_s": None,
                     "temperature_c": None,
                 }
+            roi = self.get_roi()
+            out_w = (roi[1] - roi[0]) // max(1, roi[4])
+            out_h = (roi[3] - roi[2]) // max(1, roi[5])
             return {
                 "connected": True,
                 "simulate": self._simulate,
@@ -378,7 +602,14 @@ class OrcaFlashCamera:
                 "serial_number": self._serial_number,
                 "camera_version": self._camera_version,
                 "detector_size": self._detector_size,
-                "roi": self.get_roi(),
+                "roi": roi,
+                "binning": int(roi[4]),
+                "output_shape": (out_h, out_w),
                 "exposure_s": self.get_exposure(),
+                "readout_speed": self.get_readout_speed(),
+                "available_readout_speeds": self.get_available_readout_speeds(),
+                "defect_correct": self.get_defect_correct_mode(),
+                "frame_averaging": self._frame_averaging,
+                "readout_time_s": self.get_frame_readout_time(),
                 "temperature_c": self.get_sensor_temperature(),
             }
