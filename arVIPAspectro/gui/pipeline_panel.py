@@ -208,6 +208,62 @@ class RbCalibrationWorker(QtCore.QThread):
             self.sig_error.emit("Step 5.2 Rubidium Calibration Error", str(exc))
 
 
+class SampleTreatmentWorker(QtCore.QThread):
+    """
+    Background worker for Step 5.3: Executes `session.run_sample_treatment_and_q_calibration(...)`
+    (Step 11 in-situ 2D frequency map calibration, Step 12 spatial binning & vectorized DHO fitting,
+    and Step 14 2D concentric ellipse & q-vector / speed-of-sound V_s extraction).
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_fitted = QtCore.Signal(object)  # sample_res dict
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(
+        self,
+        session: AcquisitionSession,
+        params: Dict[str, Any],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.session = session
+        self.params = params
+
+    def run(self):
+        try:
+            t0 = time.time()
+            self.sig_log.emit(
+                "Step 5.3 — Running Sample In-Situ Calibration, Vectorized DHO Fit & q-Vector (Steps 11–14)..."
+            )
+            res = self.session.run_sample_treatment_and_q_calibration(
+                bin_val_h=int(self.params.get("bin_val_h", 4)),
+                bin_val_w=int(self.params.get("bin_val_w", 2)),
+                expected_shift_ghz=float(self.params.get("expected_shift_ghz", 5.1)),
+                shift_tol_ghz=float(self.params.get("shift_tol_ghz", 2.0)),
+                expected_lw_ghz=float(self.params.get("expected_lw_ghz", 0.8)),
+                lw_bounds_ghz=tuple(self.params.get("lw_bounds_ghz", (0.4, 1.3))),
+                run_q_calibration=bool(self.params.get("run_q_calibration", True)),
+                refractive_index=float(self.params.get("refractive_index", 1.33)),
+                shift_filter_bounds=tuple(self.params.get("shift_filter_bounds", (4.8, 5.3))),
+                lw_filter_bounds=tuple(self.params.get("lw_bounds_ghz", (0.4, 1.3))),
+            )
+            dt = time.time() - t0
+            dho = res["dho_results"]
+            q_res = res.get("q_results")
+            vs_msg = (
+                f" | S(0)={q_res['Shift_0']:.4f} GHz, M_θ={q_res['M_theta']:.1f} px, V_s={q_res['V_s']:.2f} m/s"
+                if q_res is not None
+                else ""
+            )
+            self.sig_log.emit(
+                f"Step 5.3 Completed in {dt:.2f} s: {dho['n_fringes']} orders fitted ({dho['bin_val_h']}x{dho['bin_val_w']} bin) | "
+                f"S/AS RMS={dho['stokes_antistokes_rms_mhz']:.2f} MHz{vs_msg}."
+            )
+            self.sig_fitted.emit(res)
+        except Exception as exc:
+            self.sig_error.emit("Step 5.3 Sample Fitting Error", str(exc))
+
+
 class MapScanWorker(QtCore.QThread):
     """
     Background worker that executes the 2D spatial map scan across the ASI MS-2000 grid,
@@ -355,6 +411,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     sig_display_frame = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
     sig_show_laser_diagnostics = QtCore.Signal(object, str)             # (calib_res, view_mode)
     sig_show_rb_diagnostics = QtCore.Signal(object, str)                # (rb_res, view_mode)
+    sig_show_sample_diagnostics = QtCore.Signal(object, str)            # (sample_res, view_mode)
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
     sig_lock_geometry = QtCore.Signal(bool)
@@ -375,6 +432,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
         self._laser_calib_worker: Optional[LaserCalibrationWorker] = None
         self._rb_calib_worker: Optional[RbCalibrationWorker] = None
+        self._sample_fit_worker: Optional[SampleTreatmentWorker] = None
         self._map_worker: Optional[MapScanWorker] = None
         self._map_paused: bool = False
 
@@ -406,6 +464,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         layout.addWidget(self._build_calibration_prompt_card())
         layout.addWidget(self._build_step5_1_laser_calib_card())
         layout.addWidget(self._build_step5_2_rb_calib_card())
+        layout.addWidget(self._build_step5_3_sample_fit_card())
         layout.addWidget(self._build_map_configuration_card())
         layout.addStretch()
 
@@ -751,6 +810,153 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
         return box
 
+    def _build_step5_3_sample_fit_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox(
+            "Step 5.3 — Sample DHO Fitting & Reference Geometry Calibration (Steps 11–14)"
+        )
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(6)
+
+        # Row 1: Auto-fit toggle + Presets + Status badge
+        top_row = QtWidgets.QHBoxLayout()
+        self.chk_auto_fit_ref = QtWidgets.QCheckBox("Auto-fit after acquiring Ref Sample")
+        self.chk_auto_fit_ref.setChecked(True)
+        top_row.addWidget(self.chk_auto_fit_ref)
+
+        btn_water = QtWidgets.QPushButton("Water (5.1 GHz, n=1.33)")
+        btn_water.clicked.connect(lambda: self._apply_sample_preset(5.1, 2.0, 0.8, 0.4, 1.3, 1.33, 4.8, 5.3))
+        top_row.addWidget(btn_water)
+
+        btn_plastic = QtWidgets.QPushButton("Plastic (9.7 GHz, n=1.59)")
+        btn_plastic.clicked.connect(lambda: self._apply_sample_preset(9.7, 2.0, 0.8, 0.4, 1.3, 1.59, 9.3, 9.9))
+        top_row.addWidget(btn_plastic)
+
+        top_row.addStretch()
+        self.lbl_sample_fit_status = QtWidgets.QLabel("NOT FITTED")
+        self.lbl_sample_fit_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_sample_fit_status.setMinimumWidth(140)
+        top_row.addWidget(self.lbl_sample_fit_status)
+        layout.addLayout(top_row)
+
+        # Row 2: Spatial Binning & DHO Fitting Parameters
+        dho_row = QtWidgets.QHBoxLayout()
+        dho_row.addWidget(QtWidgets.QLabel("Bin H×W:"))
+        self.spin_bin_h = QtWidgets.QSpinBox()
+        self.spin_bin_h.setRange(1, 32)
+        self.spin_bin_h.setValue(4)
+        dho_row.addWidget(self.spin_bin_h)
+
+        self.spin_bin_w = QtWidgets.QSpinBox()
+        self.spin_bin_w.setRange(1, 32)
+        self.spin_bin_w.setValue(2)
+        dho_row.addWidget(self.spin_bin_w)
+
+        dho_row.addSpacing(6)
+        dho_row.addWidget(QtWidgets.QLabel("Shift ν_B:"))
+        self.spin_dho_shift = QtWidgets.QDoubleSpinBox()
+        self.spin_dho_shift.setDecimals(2)
+        self.spin_dho_shift.setRange(0.5, 25.0)
+        self.spin_dho_shift.setValue(5.10)
+        self.spin_dho_shift.setSuffix(" GHz")
+        dho_row.addWidget(self.spin_dho_shift)
+
+        dho_row.addWidget(QtWidgets.QLabel("±Tol:"))
+        self.spin_dho_tol = QtWidgets.QDoubleSpinBox()
+        self.spin_dho_tol.setDecimals(2)
+        self.spin_dho_tol.setRange(0.2, 10.0)
+        self.spin_dho_tol.setValue(2.00)
+        self.spin_dho_tol.setSuffix(" GHz")
+        dho_row.addWidget(self.spin_dho_tol)
+
+        dho_row.addSpacing(6)
+        dho_row.addWidget(QtWidgets.QLabel("LW Γ_B:"))
+        self.spin_dho_lw = QtWidgets.QDoubleSpinBox()
+        self.spin_dho_lw.setDecimals(2)
+        self.spin_dho_lw.setRange(0.05, 5.0)
+        self.spin_dho_lw.setValue(0.80)
+        self.spin_dho_lw.setSuffix(" GHz")
+        dho_row.addWidget(self.spin_dho_lw)
+
+        dho_row.addWidget(QtWidgets.QLabel("[min..max]:"))
+        self.spin_dho_lw_min = QtWidgets.QDoubleSpinBox()
+        self.spin_dho_lw_min.setDecimals(2)
+        self.spin_dho_lw_min.setRange(0.05, 5.0)
+        self.spin_dho_lw_min.setValue(0.40)
+        dho_row.addWidget(self.spin_dho_lw_min)
+
+        self.spin_dho_lw_max = QtWidgets.QDoubleSpinBox()
+        self.spin_dho_lw_max.setDecimals(2)
+        self.spin_dho_lw_max.setRange(0.10, 10.0)
+        self.spin_dho_lw_max.setValue(1.30)
+        dho_row.addWidget(self.spin_dho_lw_max)
+        dho_row.addStretch()
+        layout.addLayout(dho_row)
+
+        # Row 3: Step 14 Ellipse & Wavevector Parameters
+        q_row = QtWidgets.QHBoxLayout()
+        self.chk_run_q_calib = QtWidgets.QCheckBox("Step 14: Fit 2D Coaxial Ellipse & q-Vector (M_θ, V_s)")
+        self.chk_run_q_calib.setChecked(True)
+        q_row.addWidget(self.chk_run_q_calib)
+
+        q_row.addSpacing(8)
+        q_row.addWidget(QtWidgets.QLabel("Index n:"))
+        self.spin_q_n = QtWidgets.QDoubleSpinBox()
+        self.spin_q_n.setDecimals(3)
+        self.spin_q_n.setRange(1.000, 3.000)
+        self.spin_q_n.setValue(1.330)
+        q_row.addWidget(self.spin_q_n)
+
+        q_row.addSpacing(8)
+        q_row.addWidget(QtWidgets.QLabel("Shift Filter [min..max]:"))
+        self.spin_q_smin = QtWidgets.QDoubleSpinBox()
+        self.spin_q_smin.setDecimals(2)
+        self.spin_q_smin.setRange(0.5, 25.0)
+        self.spin_q_smin.setValue(4.80)
+        self.spin_q_smin.setSuffix(" GHz")
+        q_row.addWidget(self.spin_q_smin)
+
+        self.spin_q_smax = QtWidgets.QDoubleSpinBox()
+        self.spin_q_smax.setDecimals(2)
+        self.spin_q_smax.setRange(0.5, 25.0)
+        self.spin_q_smax.setValue(5.30)
+        self.spin_q_smax.setSuffix(" GHz")
+        q_row.addWidget(self.spin_q_smax)
+        q_row.addStretch()
+        layout.addLayout(q_row)
+
+        # Row 4: Execute Fit button + 3 Diagnostic Plot Viewers
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_run_sample_fit = QtWidgets.QPushButton("⚙ Fit Ref / Test Sample (Steps 11–14)")
+        self.btn_run_sample_fit.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_run_sample_fit.clicked.connect(self._on_run_sample_fit)
+        btn_row.addWidget(self.btn_run_sample_fit)
+
+        self.btn_diag_s_freq = QtWidgets.QPushButton("📊 5.3A: In-Situ Freq & Windows")
+        self.btn_diag_s_freq.clicked.connect(lambda: self._on_show_sample_diag("insitu_freq"))
+        btn_row.addWidget(self.btn_diag_s_freq)
+
+        self.btn_diag_s_dho = QtWidgets.QPushButton("📊 5.3B: 2D DHO Shift & LW")
+        self.btn_diag_s_dho.clicked.connect(lambda: self._on_show_sample_diag("dho_maps"))
+        btn_row.addWidget(self.btn_diag_s_dho)
+
+        self.btn_diag_s_q = QtWidgets.QPushButton("📊 5.3C: Ellipse & Dispersion (Vs)")
+        self.btn_diag_s_q.clicked.connect(lambda: self._on_show_sample_diag("q_dispersion"))
+        btn_row.addWidget(self.btn_diag_s_q)
+        layout.addLayout(btn_row)
+
+        # Row 5: Fitted Summary Banner
+        self.lbl_sample_fit_summary = QtWidgets.QLabel(
+            "Complete Step 5.2 (Rb Calibration), acquire a Reference Sample (Row 3 in 4B), then click 'Fit Ref / Test Sample'."
+        )
+        self.lbl_sample_fit_summary.setStyleSheet(
+            "background-color: #1e293b; color: #e2e8f0; font-family: monospace; "
+            "font-size: 11px; padding: 5px; border-radius: 4px;"
+        )
+        self.lbl_sample_fit_summary.setWordWrap(True)
+        layout.addWidget(self.lbl_sample_fit_summary)
+
+        return box
+
     def _build_map_configuration_card(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("4C. Spatial Map Configuration & Scan Execution (Brillouin/<Map_name>)")
         layout = QtWidgets.QVBoxLayout(box)
@@ -1011,6 +1217,13 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             and self.session.laser_calib_result is not None
         ):
             QtCore.QTimer.singleShot(50, self._on_run_rb_calibration)
+        # If Ref Sample was just acquired and auto-fit is enabled, trigger Step 5.3
+        elif (
+            role == AcquisitionSession.ROLE_REF_SAMPLE
+            and self.chk_auto_fit_ref.isChecked()
+            and self.session.rb_calib_result is not None
+        ):
+            QtCore.QTimer.singleShot(50, self._on_run_sample_fit)
 
     def _on_run_laser_calibration(self):
         if not self._ensure_h5_open():
@@ -1114,6 +1327,86 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             )
             return
         self.sig_show_rb_diagnostics.emit(res, view_mode)
+
+    def _apply_sample_preset(
+        self,
+        shift_ghz: float,
+        tol_ghz: float,
+        lw_ghz: float,
+        lw_min: float,
+        lw_max: float,
+        n_idx: float,
+        s_min: float,
+        s_max: float,
+    ):
+        self.spin_dho_shift.setValue(shift_ghz)
+        self.spin_dho_tol.setValue(tol_ghz)
+        self.spin_dho_lw.setValue(lw_ghz)
+        self.spin_dho_lw_min.setValue(lw_min)
+        self.spin_dho_lw_max.setValue(lw_max)
+        self.spin_q_n.setValue(n_idx)
+        self.spin_q_smin.setValue(s_min)
+        self.spin_q_smax.setValue(s_max)
+
+    def _on_run_sample_fit(self):
+        if not self._ensure_h5_open():
+            return
+        if self.session.laser_calib_result is None or self.session.rb_calib_result is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Calibration Required",
+                "Please complete Steps 5.1 (Laser) and 5.2 (Rubidium) before running Step 5.3.",
+            )
+            return
+        if self.session.ref_sample_image is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Reference Sample Image Missing",
+                "Please click '📷 Acquire Ref' in Section 4B (Row 3) to acquire a Reference/Test Sample image first.",
+            )
+            return
+        if self._is_busy():
+            return
+
+        params = {
+            "bin_val_h": int(self.spin_bin_h.value()),
+            "bin_val_w": int(self.spin_bin_w.value()),
+            "expected_shift_ghz": float(self.spin_dho_shift.value()),
+            "shift_tol_ghz": float(self.spin_dho_tol.value()),
+            "expected_lw_ghz": float(self.spin_dho_lw.value()),
+            "lw_bounds_ghz": (float(self.spin_dho_lw_min.value()), float(self.spin_dho_lw_max.value())),
+            "run_q_calibration": bool(self.chk_run_q_calib.isChecked()),
+            "refractive_index": float(self.spin_q_n.value()),
+            "shift_filter_bounds": (float(self.spin_q_smin.value()), float(self.spin_q_smax.value())),
+        }
+        self._set_controls_busy(True)
+        self._sample_fit_worker = SampleTreatmentWorker(
+            session=self.session,
+            params=params,
+            parent=self,
+        )
+        self._sample_fit_worker.sig_log.connect(self.sig_log.emit)
+        self._sample_fit_worker.sig_fitted.connect(self._on_sample_fitted)
+        self._sample_fit_worker.sig_error.connect(self._on_worker_error)
+        self._sample_fit_worker.finished.connect(lambda: self._set_controls_busy(False))
+        self._sample_fit_worker.start()
+
+    @QtCore.Slot(object)
+    def _on_sample_fitted(self, res: dict):
+        self._update_calibration_badges()
+        default_view = "q_dispersion" if res.get("q_results") is not None else "dho_maps"
+        self.sig_show_sample_diagnostics.emit(res, default_view)
+
+    def _on_show_sample_diag(self, view_mode: str):
+        res = self.session.ref_sample_calib_result
+        if res is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Not Fitted Yet",
+                "Run 'Fit Ref / Test Sample (Steps 11–14)' first to view diagnostic plots.",
+            )
+            return
+        self.sig_show_sample_diagnostics.emit(res, view_mode)
 
     def _on_view_calibration(self, role: str):
         img = None
@@ -1225,6 +1518,47 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_diag_rb_rad.setEnabled(has_rb_cal)
         self.btn_diag_rb_fsr.setEnabled(has_rb_cal)
         self.btn_diag_rb_fmap.setEnabled(has_rb_cal)
+
+        # Update Step 5.3 Sample Fit & Reference Geometry badge & summary
+        sf_res = self.session.ref_sample_calib_result
+        has_sf = sf_res is not None
+        if has_sf:
+            dho = sf_res["dho_results"]
+            q_res = sf_res.get("q_results")
+            self.lbl_sample_fit_status.setText("✓ FITTED & CALIBRATED")
+            self.lbl_sample_fit_status.setStyleSheet(
+                "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+            )
+            line1 = (
+                f"DHO Fit ({dho['bin_val_h']}×{dho['bin_val_w']} bin): {dho['n_fringes']} orders  |  "
+                f"Mean Shift = {float(np.nanmean(dho['shift_clipped_averaged'])):.3f} GHz  |  "
+                f"Mean LW = {float(np.nanmean(dho['linewidth_clipped_averaged'])):.3f} GHz  |  "
+                f"S/AS RMS = {dho['stokes_antistokes_rms_mhz']:.1f} MHz"
+            )
+            if q_res is not None:
+                opt = q_res["opt_params"]
+                vs_err = q_res.get("V_s_err") or 0.0
+                line2 = (
+                    f"\nEllipse Center=({opt['xc']:.1f}, {opt['yc']:.1f}) px, γ={opt['gamma']:.3f}  |  "
+                    f"S(0)={q_res['Shift_0']:.4f} GHz  |  M_θ={q_res['M_theta']:.1f} px  |  "
+                    f"V_s = {q_res['V_s']:.2f} ± {vs_err:.2f} m/s"
+                )
+            else:
+                line2 = ""
+            self.lbl_sample_fit_summary.setText(line1 + line2)
+        else:
+            self.lbl_sample_fit_status.setText("NOT FITTED")
+            self.lbl_sample_fit_status.setStyleSheet(
+                "background-color: #455a64; color: #cfd8dc; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+            )
+            self.lbl_sample_fit_summary.setText(
+                "Complete Step 5.2 (Rb Calibration), acquire a Reference Sample (Row 3 in 4B), then click 'Fit Ref / Test Sample'."
+            )
+
+        self.btn_run_sample_fit.setEnabled(has_rb_cal and has_ref)
+        self.btn_diag_s_freq.setEnabled(has_sf)
+        self.btn_diag_s_dho.setEnabled(has_sf)
+        self.btn_diag_s_q.setEnabled(has_sf and (sf_res.get("q_results") is not None))
 
     # ==========================================================================
     # Event Handlers: Spatial Map Grid & Teaching
@@ -1441,6 +1775,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             return True
         if self._rb_calib_worker is not None and self._rb_calib_worker.isRunning():
             return True
+        if self._sample_fit_worker is not None and self._sample_fit_worker.isRunning():
+            return True
         if self._map_worker is not None and self._map_worker.isRunning():
             return True
         return False
@@ -1454,6 +1790,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             self.btn_acq_ref,
             self.btn_run_laser_calib,
             self.btn_run_rb_calib,
+            self.btn_run_sample_fit,
             self.btn_start_map,
             self.btn_set_start_current,
             self.btn_teach_a,

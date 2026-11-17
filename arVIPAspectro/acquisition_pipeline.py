@@ -24,6 +24,8 @@ from HDF5_BLS import Wrapper
 from . import config
 from . import laser_calib
 from . import Rb_calib
+from . import spectrum_fitting
+from . import q_vector
 
 
 @dataclass
@@ -166,6 +168,9 @@ class AcquisitionSession:
         # Step 5.2: Rubidium Absorption & 2D Frequency Map Calibration results dictionary
         self.rb_calib_result: Optional[Dict[str, Any]] = None
 
+        # Step 5.3: Reference / Test Sample DHO Fitting & Elliptical q-Vector Calibration results
+        self.ref_sample_calib_result: Optional[Dict[str, Any]] = None
+
     @property
     def is_open(self) -> bool:
         return self.wrapper is not None and self.h5_path is not None
@@ -289,6 +294,7 @@ class AcquisitionSession:
         elif role == self.ROLE_REF_SAMPLE:
             self.ref_sample_image = np.asarray(image)
             self.ref_sample_meta = attrs
+            self.ref_sample_calib_result = None
 
     # ==========================================================================
     # Step 5.1: Laser Reference Calibration (Steps 2 to 6 of arVIPAspectro)
@@ -711,6 +717,165 @@ class AcquisitionSession:
         }
         result.update(fsr_res)
         self.rb_calib_result = result
+        return result
+
+    # ==========================================================================
+    # Step 5.3: Sample In-Situ Calibration, DHO Fitting & q-Vector (Steps 11–14)
+    # ==========================================================================
+
+    def run_sample_treatment_and_q_calibration(
+        self,
+        sample_image: Optional[np.ndarray] = None,
+        bin_val_h: int = 4,
+        bin_val_w: int = 2,
+        expected_shift_ghz: float = 5.1,
+        shift_tol_ghz: float = 2.0,
+        expected_lw_ghz: float = 0.8,
+        lw_bounds_ghz: Tuple[float, float] = (0.4, 1.3),
+        run_q_calibration: bool = True,
+        refractive_index: float = 1.33,
+        shift_filter_bounds: Tuple[float, float] = (4.8, 5.3),
+        lw_filter_bounds: Tuple[float, float] = (0.5, 1.2),
+        fixed_ellipse_angle_deg: Optional[float] = 90.0,
+        initial_m_theta: float = 3000.0,
+        persist_to_ref_group: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Executes Steps 11–14 of `arVIPAspectro` (`spectrum_fitting` and `q_vector`) on the
+        Reference Sample (`Brillouin/Calibration/reference_sample`) or a provided test sample frame:
+          - Step 11 (`calibrate_sample_frequency_map`): Two-stage in-situ 2D frequency map
+            self-calibration (`df_coarse`, `dz_map_2d`, `dinst_map_2d`, `freq_corrected`).
+          - Step 12 (`fit_sample_dho`): Spatial binning (`bin_val_h x bin_val_w`) & vectorized
+            DHO fitting across all Stokes/Anti-Stokes orders (`Shift`, `Linewidth`, `Errors`, `x/y`).
+          - Step 14 (`extract_q_vector`, optional): 2D concentric coaxial ellipse & angular
+            magnification `M_theta` calibration, computing `q_vector`, `theta`, `Shift_0`, and `V_s`.
+        """
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+        if self.laser_calib_result is None or self.rb_calib_result is None:
+            raise RuntimeError(
+                "Steps 5.1 (Laser Calibration) and 5.2 (Rb Calibration) must be completed before Step 5.3."
+            )
+
+        if sample_image is None:
+            sample_image = self.ref_sample_image
+        if sample_image is None:
+            raise RuntimeError("No Reference Sample or test frame available to fit.")
+
+        data_sample = np.asarray(sample_image, dtype=np.float64)
+        freq_map_base = self.rb_calib_result["freq_map"]
+        fsr_cal = float(self.rb_calib_result["FSR_cal"])
+        y0_fit = float(self.laser_calib_result["y0_fit"])
+
+        if data_sample.shape != freq_map_base.shape:
+            raise ValueError(
+                f"Sample image shape {data_sample.shape} does not match calibrated frequency map {freq_map_base.shape}."
+            )
+
+        yy, xx = np.indices(data_sample.shape, dtype=np.float64)
+
+        # Step 11: In-situ 2D Frequency Map Self-Calibration
+        (
+            freq_corrected,
+            df_coarse,
+            dz_map_2d,
+            dinst_map_2d,
+            bls_peaks,
+            avg_data_sample,
+            freq_avg_data_sample,
+        ) = spectrum_fitting.calibrate_sample_frequency_map(
+            freq_map_base=freq_map_base,
+            data_clean_in=data_sample,
+            xx_in=xx,
+            yy_in=yy,
+            fsr_val=fsr_cal,
+            y0_center=y0_fit,
+            bin_val_h=int(bin_val_h),
+            bin_val_w=int(bin_val_w),
+            expected_shift=float(expected_shift_ghz),
+            shift_tol=float(shift_tol_ghz),
+        )
+
+        # Step 12: Spatial Binning & Vectorized DHO Peak Fitting
+        dho_results = spectrum_fitting.fit_sample_dho(
+            data_sample=data_sample,
+            freq_corrected=freq_corrected,
+            xx=xx,
+            yy=yy,
+            fsr_val=fsr_cal,
+            bin_val_h=int(bin_val_h),
+            bin_val_w=int(bin_val_w),
+            ds_init=float(expected_shift_ghz),
+            shift_tol=float(shift_tol_ghz),
+            gamma_init=float(expected_lw_ghz),
+            gamma_bounds=(float(lw_bounds_ghz[0]), float(lw_bounds_ghz[1])),
+            verbose=False,
+        )
+
+        path_ref = f"{self.CALIBRATION_GROUP}/{self.ROLE_REF_SAMPLE}"
+        if persist_to_ref_group and self.ref_sample_image is not None:
+            spectrum_fitting.save_treated_data(
+                wrapper=self.wrapper,
+                path_sample=path_ref,
+                bin_val_h=int(bin_val_h),
+                bin_val_w=int(bin_val_w),
+                shift_rel=dho_results["shift_clipped"],
+                shift_err=dho_results["shift_error"],
+                lw_rel=dho_results["linewidth_clipped"],
+                lw_err=dho_results["linewidth_error"],
+                x_coords=dho_results["x_coords"],
+                y_coords=dho_results["y_coords"],
+            )
+
+        # Step 14: Acoustic Wavevector (q-vector) & 2D Concentric Ellipse Extraction
+        q_results = None
+        if run_q_calibration:
+            q_results = q_vector.extract_q_vector(
+                data_source=dho_results,
+                path_sample=path_ref if (persist_to_ref_group and self.ref_sample_image is not None) else None,
+                wrapper=self.wrapper if (persist_to_ref_group and self.ref_sample_image is not None) else None,
+                bin_val_h=int(bin_val_h),
+                bin_val_w=int(bin_val_w),
+                refractive_index=float(refractive_index),
+                laser_wavelength=config.lambda_0,
+                use_errors=True,
+                error_percentile_floor=1.0,
+                average_pairs=True,
+                shift_bounds=(float(shift_filter_bounds[0]), float(shift_filter_bounds[1])),
+                linewidth_bounds=(float(lw_filter_bounds[0]), float(lw_filter_bounds[1])),
+                initial_M_theta=float(initial_m_theta),
+                fixed_ellipse_angle_deg=fixed_ellipse_angle_deg,
+                verbose=False,
+            )
+            if persist_to_ref_group and self.ref_sample_image is not None:
+                q_vector.save_q_vector_results(
+                    wrapper=self.wrapper,
+                    path_sample=path_ref,
+                    bin_val_h=int(bin_val_h),
+                    bin_val_w=int(bin_val_w),
+                    q_results=q_results,
+                )
+
+        result = {
+            "data_sample": data_sample,
+            "freq_corrected": freq_corrected,
+            "df_coarse": float(df_coarse),
+            "dz_map_2d": dz_map_2d,
+            "dinst_map_2d": dinst_map_2d,
+            "bls_peaks": bls_peaks,
+            "avg_data_sample": avg_data_sample,
+            "freq_avg_data_sample": freq_avg_data_sample,
+            "dho_results": dho_results,
+            "q_results": q_results,
+            "bin_val_h": int(bin_val_h),
+            "bin_val_w": int(bin_val_w),
+            "expected_shift_ghz": float(expected_shift_ghz),
+            "shift_tol_ghz": float(shift_tol_ghz),
+            "expected_lw_ghz": float(expected_lw_ghz),
+            "lw_bounds_ghz": (float(lw_bounds_ghz[0]), float(lw_bounds_ghz[1])),
+            "refractive_index": float(refractive_index),
+        }
+        self.ref_sample_calib_result = result
         return result
 
     def list_map_groups(self) -> List[str]:

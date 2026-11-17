@@ -560,14 +560,14 @@ class OrcaFlashCamera:
             g_2d = bck.g_from_xy(
                 xx,
                 yy,
-                x0=100.0,
+                x0=1800.0,
                 y0=1150.0,
                 f=config.F_PX_DEFAULT,
                 phi=config.VIPA_TILT_ANGLE,
                 n_r=config.N_FUSED_SILICA_780,
             )
-            dg_order = 1.45085 * (30.0 / (config.nu_0 * 1e-9))
-            order_phase = (1.45158 - g_2d) / dg_order
+            dg_order = 1.45265 * (30.0 / (config.nu_0 * 1e-9))
+            order_phase = (float(g_2d[min(1150, h - 1), 0]) - g_2d) / dg_order + 0.42
         except Exception:
             order_phase = 6.0 * (xn + 1.05) - 0.45 * (xn + 1.05) ** 2 + 0.18 * (yn ** 2)
 
@@ -594,15 +594,25 @@ class OrcaFlashCamera:
             spectral_profile = continuum * trans_rb
             env_x0, env_y0 = 0.0, 0.0
         else:
-            # Sample spectrum: Elastic Rayleigh peak + Stokes & Anti-Stokes Brillouin doublets (~5.1 GHz)
-            shift_ghz = 5.10 + 0.45 * np.sin(x_um / 50.0) * np.cos(y_um / 50.0)
-            shift_y_ghz = shift_ghz * np.sqrt(np.clip(1.0 - 0.22 * yn ** 2, 0.25, 1.0))
-            elastic = np.exp(-0.5 * (f_rel_ghz / 0.48) ** 2)
-            stokes = 0.42 * np.exp(-0.5 * ((f_rel_ghz - shift_y_ghz) / 0.55) ** 2)
-            antistokes = 0.42 * np.exp(-0.5 * ((f_rel_ghz + shift_y_ghz) / 0.55) ** 2)
-            spectral_profile = elastic + stokes + antistokes
-            env_x0 = 0.08 * np.sin(x_um / 100.0)
-            env_y0 = 0.08 * np.cos(y_um / 100.0)
+            # Sample spectrum: Elastic Rayleigh peak + true DHO Stokes & Anti-Stokes Brillouin doublets
+            # with 2D coaxial elliptical angular dispersion (Shift_0 ~ 5.10 GHz, M_theta ~ 3200 px, gamma ~ 1.25)
+            dx_c = xx - 0.5 * det_w
+            dy_c = yy - 1150.0
+            r_sph = np.sqrt(dy_c ** 2 + (dx_c / 1.25) ** 2)
+            u_ang = np.clip(r_sph / 3200.0, 0.0, 0.98)
+
+            s0_ghz = 5.10 + 0.15 * np.sin(x_um / 60.0) * np.cos(y_um / 60.0)
+            nu_b = s0_ghz * np.cos(0.5 * np.arcsin(u_ang))
+            gamma_b = 0.78 + 0.06 * (u_ang ** 2)
+
+            elastic = np.exp(-0.5 * (f_rel_ghz / 0.42) ** 2)
+            nu_abs = np.abs(f_rel_ghz)
+            dho_num = (gamma_b * nu_b) ** 2
+            dho_den = (nu_abs ** 2 - nu_b ** 2) ** 2 + (gamma_b * nu_abs) ** 2 + 1e-9
+            brillouin_dho = 0.38 * (dho_num / dho_den)
+            spectral_profile = elastic + brillouin_dho
+            env_x0 = 0.04 * np.sin(x_um / 120.0)
+            env_y0 = 0.04 * np.cos(y_um / 120.0)
 
         envelope = np.exp(-0.95 * ((xn - env_x0) ** 2) - 0.55 * ((yn - env_y0) ** 2))
 

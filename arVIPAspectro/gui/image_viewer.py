@@ -426,6 +426,168 @@ class ImageViewerWidget(QtWidgets.QWidget):
         )
         self.canvas.draw_idle()
 
+    # ==========================================================================
+    # Step 5.3: Sample In-Situ Calibration, DHO Fit & q-Vector Diagnostic Views
+    # ==========================================================================
+
+    def show_sample_treatment_diagnostics(
+        self,
+        sample_res: Dict[str, Any],
+        view_mode: str = "dho_maps",
+    ):
+        """
+        Renders diagnostic plots for Step 5.3 (Sample DHO Fitting & Reference Geometry):
+          - `'insitu_freq'`: Step 11 In-situ frequency self-calibration & Brillouin windows.
+          - `'dho_maps'`: Step 12–13 2D Fitted Brillouin Shift & Linewidth maps.
+          - `'q_dispersion'`: Step 14 2D Coaxial Ellipse Geometry & Acoustic Dispersion V_s.
+        """
+        self._in_diagnostic_view = True
+        self._im_artist = None
+        self.figure.clear()
+
+        dho = sample_res["dho_results"]
+        q_res = sample_res.get("q_results")
+
+        if view_mode == "insitu_freq":
+            gs = self.figure.add_gridspec(2, 2, height_ratios=[1.1, 1.1])
+            ax_prof = self.figure.add_subplot(gs[0, :])
+            ax_dz = self.figure.add_subplot(gs[1, 0])
+            ax_di = self.figure.add_subplot(gs[1, 1])
+
+            f_avg = sample_res["freq_avg_data_sample"]
+            d_avg = sample_res["avg_data_sample"]
+            ax_prof.plot(f_avg, d_avg, color="#1e88e5", linewidth=1.2, label="Central row-averaged spectrum")
+            for idx_p, (f_as, f_s) in enumerate(sample_res["bls_peaks"]):
+                lbl_as = "Expected Anti-Stokes / Stokes" if idx_p == 0 else None
+                ax_prof.axvline(f_as, color="#e53935", linestyle="--", alpha=0.6, linewidth=0.9, label=lbl_as)
+                ax_prof.axvline(f_s, color="#43a047", linestyle="--", alpha=0.6, linewidth=0.9)
+            ax_prof.set_title(
+                f"Step 5.3A — Central Spectrum & Brillouin Search Windows (Coarse df = {sample_res['df_coarse']*1e3:+.1f} MHz)",
+                fontsize=10,
+            )
+            ax_prof.set_xlabel("Calibrated Frequency (GHz)")
+            ax_prof.set_ylabel("Intensity (ADU)")
+            ax_prof.grid(True, alpha=0.3)
+            ax_prof.legend(loc="upper right", fontsize=8)
+
+            dz_mhz = sample_res["dz_map_2d"] * 1e3
+            im_dz = ax_dz.imshow(dz_mhz, cmap="coolwarm", origin="upper", aspect="auto")
+            self.figure.colorbar(im_dz, ax=ax_dz, fraction=0.046, pad=0.04, label="MHz")
+            ax_dz.set_title(f"2D Zero-Offset Map (RMS={np.std(dz_mhz):.1f} MHz)", fontsize=9)
+            ax_dz.set_xlabel("Detector X (px)")
+            ax_dz.set_ylabel("Detector Y (px)")
+
+            di_mhz = sample_res["dinst_map_2d"] * 1e3
+            im_di = ax_di.imshow(di_mhz, cmap="coolwarm", origin="upper", aspect="auto")
+            self.figure.colorbar(im_di, ax=ax_di, fraction=0.046, pad=0.04, label="MHz")
+            ax_di.set_title(f"Higher-Order Dispersion Residual (RMS={np.std(di_mhz):.1f} MHz)", fontsize=9)
+            ax_di.set_xlabel("Detector X (px)")
+            ax_di.set_ylabel("Detector Y (px)")
+            self.ax = ax_prof
+
+        elif view_mode == "q_dispersion" and q_res is not None:
+            ax1 = self.figure.add_subplot(1, 2, 1)
+            ax2 = self.figure.add_subplot(1, 2, 2)
+
+            x_f = q_res["x_coords"]
+            y_f = q_res["y_coords"]
+            s_f = q_res["shift"]
+            opt = q_res["opt_params"]
+
+            sc1 = ax1.scatter(x_f, y_f, c=s_f, s=6, cmap="viridis")
+            self.figure.colorbar(sc1, ax=ax1, fraction=0.046, pad=0.04, label="Shift ν_B (GHz)")
+
+            # Overlay fitted concentric coaxial ellipses
+            theta_t = np.linspace(0.0, 2.0 * np.pi, 200)
+            ct = np.cos(opt["phi_rad"])
+            st = np.sin(opt["phi_rad"])
+            for r_iso in (300.0, 600.0, 900.0, 1200.0):
+                xp = r_iso * np.cos(theta_t)
+                yp = opt["gamma"] * r_iso * np.sin(theta_t)
+                xe = opt["xc"] + xp * ct - yp * st
+                ye = opt["yc"] + xp * st + yp * ct
+                ax1.plot(xe, ye, "r--", linewidth=1.0, alpha=0.8)
+            ax1.plot([opt["xc"]], [opt["yc"]], "r+", markersize=12, markeredgewidth=2.0)
+            ax1.invert_yaxis()
+            ax1.set_title(
+                f"Step 5.3C — Coaxial Ellipses: Center=({opt['xc']:.1f}, {opt['yc']:.1f}), γ={opt['gamma']:.3f}",
+                fontsize=9,
+            )
+            ax1.set_xlabel("Detector X (px)")
+            ax1.set_ylabel("Detector Y (px)")
+            ax1.grid(True, alpha=0.25)
+
+            theta_deg = q_res["theta_deg"]
+            ax2.scatter(theta_deg, s_f, s=5, alpha=0.4, color="#1e88e5", label="Measured DHO Shift")
+            th_grid = np.linspace(0.0, max(float(np.max(theta_deg)), 5.0), 200)
+            s_curve = q_res["Shift_0"] * np.cos(0.5 * np.deg2rad(th_grid))
+            ax2.plot(
+                th_grid,
+                s_curve,
+                "r-",
+                linewidth=1.8,
+                label=f"Fit: S(0)={q_res['Shift_0']:.3f} GHz, M_θ={q_res['M_theta']:.0f} px",
+            )
+            vs = q_res["V_s"]
+            vs_err = q_res.get("V_s_err") or 0.0
+            ax2.set_title(
+                f"Acoustic Dispersion: V_s = {vs:.1f} ± {vs_err:.1f} m/s",
+                fontsize=10,
+            )
+            ax2.set_xlabel("Internal Scattering Angle θ (deg)")
+            ax2.set_ylabel("Brillouin Shift ν_B (GHz)")
+            ax2.grid(True, alpha=0.3)
+            ax2.legend(loc="upper right", fontsize=8)
+            self.ax = ax1
+
+        else:
+            # Default: 'dho_maps' — 2D Fitted Brillouin Shift & Linewidth maps
+            ax1 = self.figure.add_subplot(1, 2, 1)
+            ax2 = self.figure.add_subplot(1, 2, 2)
+
+            xa = dho["x_coords_averaged"]
+            ya = dho["y_coords_averaged"]
+            sa = dho["shift_clipped_averaged"]
+            la = dho["linewidth_clipped_averaged"]
+            valid = np.isfinite(sa) & np.isfinite(la) & np.isfinite(xa) & np.isfinite(ya)
+
+            if np.any(valid):
+                sc1 = ax1.scatter(xa[valid], ya[valid], c=sa[valid], s=6, cmap="viridis")
+                self.figure.colorbar(sc1, ax=ax1, fraction=0.046, pad=0.04, label="Shift ν_B (GHz)")
+                sc2 = ax2.scatter(xa[valid], ya[valid], c=la[valid], s=6, cmap="magma")
+                self.figure.colorbar(sc2, ax=ax2, fraction=0.046, pad=0.04, label="Linewidth Γ_B (GHz)")
+
+            ax1.invert_yaxis()
+            ax1.set_title(
+                f"Step 5.3B — Order-Averaged Brillouin Shift ({dho['bin_val_h']}×{dho['bin_val_w']} bin)",
+                fontsize=9,
+            )
+            ax1.set_xlabel("Detector X (px)")
+            ax1.set_ylabel("Detector Y (px)")
+            ax1.grid(True, alpha=0.25)
+
+            ax2.invert_yaxis()
+            ax2.set_title(
+                f"Brillouin Linewidth (S/AS Splitting RMS = {dho['stokes_antistokes_rms_mhz']:.1f} MHz)",
+                fontsize=9,
+            )
+            ax2.set_xlabel("Detector X (px)")
+            ax2.set_ylabel("Detector Y (px)")
+            ax2.grid(True, alpha=0.25)
+            self.ax = ax1
+
+        vs_str = (
+            f"  |  V_s = {q_res['V_s']:.1f} ± {(q_res.get('V_s_err') or 0.0):.1f} m/s"
+            if q_res is not None and "V_s" in q_res
+            else ""
+        )
+        self.lbl_stats.setText(
+            f"DHO Fit ({dho['bin_val_h']}×{dho['bin_val_w']}): {dho['n_fringes']} orders  |  "
+            f"Mean Shift = {float(np.nanmean(dho['shift_clipped_averaged'])):.3f} GHz  |  "
+            f"Mean LW = {float(np.nanmean(dho['linewidth_clipped_averaged'])):.3f} GHz{vs_str}"
+        )
+        self.canvas.draw_idle()
+
     def _on_mouse_move(self, event):
         if event.inaxes is None or event.xdata is None or event.ydata is None:
             self.lbl_cursor.setText("Cursor: —")
