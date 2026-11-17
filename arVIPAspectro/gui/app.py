@@ -247,6 +247,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_panel.sig_show_sample_diagnostics.connect(
             self.image_viewer.show_sample_treatment_diagnostics
         )
+        self.pipeline_panel.sig_update_live_map.connect(
+            self.image_viewer.update_live_map_view
+        )
         self.pipeline_panel.sig_stage_updated.connect(self._update_stage_ui)
         self.pipeline_panel.sig_camera_updated.connect(self._update_camera_ui)
         self.pipeline_panel.sig_lock_geometry.connect(self.chk_lock_geometry.setChecked)

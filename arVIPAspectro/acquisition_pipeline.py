@@ -878,17 +878,180 @@ class AcquisitionSession:
         self.ref_sample_calib_result = result
         return result
 
+    def determine_n_orders(self, bin_val_h: int = 4, bin_val_w: int = 2) -> int:
+        """Determines the number of VIPA interference orders present on the calibrated frequency map."""
+        if self.rb_calib_result is None:
+            return 11
+        freq_map = self.rb_calib_result["freq_map"]
+        fsr_val = float(self.rb_calib_result["FSR_cal"])
+        f_bin = bck.bin_2d_array(freq_map, int(bin_val_h), int(bin_val_w))
+        n_rows = f_bin.shape[0]
+        yc_idx = n_rows // 2
+        f_mid = np.nanmean(f_bin[max(0, yc_idx - 25) : min(n_rows, yc_idx + 25), :], axis=0)
+        return min(11, max(int(np.floor(np.nanmax(f_mid) / fsr_val)), 1))
+
+    def treat_single_map_point(
+        self,
+        frame: np.ndarray,
+        bin_val_h: int = 4,
+        bin_val_w: int = 2,
+        n_orders: Optional[int] = None,
+        expected_shift_ghz: float = 5.1,
+        shift_tol_ghz: float = 2.0,
+        expected_lw_ghz: float = 0.8,
+        lw_bounds_ghz: Tuple[float, float] = (0.4, 1.3),
+        refractive_index: float = 1.33,
+        fast_drift_only: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Step 5.4: On-the-fly treatment of a single spatial map frame `(iy, ix)`:
+          1. Fast coarse elastic frequency drift tracking (`df_coarse`) on the calibrated
+             2D frequency map (using the Step 5.3 aberration-corrected map if available,
+             or the Step 5.2 Rb frequency map).
+          2. Spatial binning (`bin_val_h x bin_val_w`) & vectorized DHO peak fitting (`fit_sample_dho`).
+          3. Fast normal backscattering shift `Shift_0` (GHz) and acoustic velocity `V_s` (m/s)
+             deduction using the locked coaxial ellipse & `M_theta` geometry.
+        """
+        if self.laser_calib_result is None or self.rb_calib_result is None:
+            raise RuntimeError("Laser and Rb calibrations are required for on-the-fly map treatment.")
+
+        data_sample = np.asarray(frame, dtype=np.float64)
+        h, w = data_sample.shape
+        fsr_val = float(self.rb_calib_result["FSR_cal"])
+        y0_fit = float(self.laser_calib_result["y0_fit"])
+
+        if self.ref_sample_calib_result is not None and (
+            self.ref_sample_calib_result["freq_corrected"].shape == (h, w)
+        ):
+            freq_base = self.ref_sample_calib_result["freq_corrected"]
+        else:
+            freq_base = self.rb_calib_result["freq_map"]
+
+        yy, xx = np.indices((h, w), dtype=np.float64)
+
+        if fast_drift_only:
+            # Fast elastic drift tracking along central strip (~1-2 ms)
+            dy_strip = min(100, h // 4)
+            yc_int = int(round(min(max(y0_fit, dy_strip), h - dy_strip - 1)))
+            avg_d = np.mean(data_sample[yc_int - dy_strip : yc_int + dy_strip, :], axis=0)
+            avg_f = np.mean(freq_base[yc_int - dy_strip : yc_int + dy_strip, :], axis=0)
+
+            q_cand = avg_f / fsr_val
+            k_min = max(1, int(np.floor(np.nanmin(q_cand))))
+            k_max = int(np.floor(np.nanmax(q_cand)))
+
+            df_orders = []
+            s_min_b = max(0.5, float(expected_shift_ghz) - 2.0 * float(shift_tol_ghz))
+            s_max_b = float(expected_shift_ghz) + 2.0 * float(shift_tol_ghz)
+            for k_ord in range(k_min, k_max + 1):
+                f_el = k_ord * fsr_val
+                m_as = (avg_f > f_el - s_max_b) & (avg_f < f_el - s_min_b)
+                m_s = (avg_f > f_el + s_min_b) & (avg_f < f_el + s_max_b)
+                if np.sum(m_as) > 5 and np.sum(m_s) > 5:
+                    w_as = np.maximum(avg_d[m_as] - np.percentile(avg_d[m_as], 15), 0.0) ** 2
+                    w_s = np.maximum(avg_d[m_s] - np.percentile(avg_d[m_s], 15), 0.0) ** 2
+                    if np.sum(w_as) > 0 and np.sum(w_s) > 0:
+                        f_as_c = np.sum(avg_f[m_as] * w_as) / np.sum(w_as)
+                        f_s_c = np.sum(avg_f[m_s] * w_s) / np.sum(w_s)
+                        val = 0.5 * (f_as_c + f_s_c) - f_el
+                        if np.isfinite(val) and np.abs(val) < 2.0:
+                            df_orders.append(val)
+            df_coarse = float(np.median(df_orders)) if len(df_orders) > 0 else 0.0
+            freq_point = freq_base - df_coarse
+        else:
+            freq_point, df_coarse, _, _, _, _, _ = spectrum_fitting.calibrate_sample_frequency_map(
+                freq_map_base=freq_base,
+                data_clean_in=data_sample,
+                xx_in=xx,
+                yy_in=yy,
+                fsr_val=fsr_val,
+                y0_center=y0_fit,
+                bin_val_h=int(bin_val_h),
+                bin_val_w=int(bin_val_w),
+                n_orders=n_orders,
+                expected_shift=float(expected_shift_ghz),
+                shift_tol=float(shift_tol_ghz),
+            )
+
+        if n_orders is None:
+            n_orders = self.determine_n_orders(bin_val_h=bin_val_h, bin_val_w=bin_val_w)
+
+        dho = spectrum_fitting.fit_sample_dho(
+            data_sample=data_sample,
+            freq_corrected=freq_point,
+            xx=xx,
+            yy=yy,
+            fsr_val=fsr_val,
+            bin_val_h=int(bin_val_h),
+            bin_val_w=int(bin_val_w),
+            n_orders=int(n_orders),
+            ds_init=float(expected_shift_ghz),
+            shift_tol=float(shift_tol_ghz),
+            gamma_init=float(expected_lw_ghz),
+            gamma_bounds=(float(lw_bounds_ghz[0]), float(lw_bounds_ghz[1])),
+            verbose=False,
+        )
+
+        sa = dho["shift_clipped_averaged"]
+        la = dho["linewidth_clipped_averaged"]
+        xa = dho["x_coords_averaged"]
+        ya = dho["y_coords_averaged"]
+        va = dho["shift_err_averaged"]
+
+        mean_shift = float(np.nanmean(sa)) if np.any(np.isfinite(sa)) else float("nan")
+        mean_lw = float(np.nanmean(la)) if np.any(np.isfinite(la)) else float("nan")
+
+        # Fast locked-geometry S(0) and V_s deduction
+        q_ref = (
+            self.ref_sample_calib_result.get("q_results")
+            if self.ref_sample_calib_result is not None
+            else None
+        )
+        if q_ref is not None:
+            opt = q_ref["opt_params"]
+            xc_e, yc_e, phi_e, gam_e = opt["xc"], opt["yc"], opt["phi_rad"], opt["gamma"]
+            m_theta = float(q_ref["M_theta"])
+        else:
+            xc_e, yc_e, phi_e, gam_e = 0.5 * w, y0_fit, 0.5 * np.pi, 1.25
+            m_theta = 3200.0
+
+        valid = np.isfinite(sa) & np.isfinite(xa) & np.isfinite(ya)
+        shift_0 = float("nan")
+        v_s = float("nan")
+        if np.sum(valid) >= 3:
+            _, _, r_sph = bck.transform_to_spherical_coordinates(
+                xa[valid], ya[valid], xc_e, yc_e, phi_e, gam_e
+            )
+            u_ang = np.clip(r_sph / max(m_theta, 1.0), -0.999, 0.999)
+            cos_half_theta = np.cos(0.5 * np.arcsin(u_ang))
+            v_w = va[valid]
+            weights = np.where(np.isfinite(v_w) & (v_w > 1e-10), 1.0 / v_w, 1.0)
+            denom = float(np.sum(weights * (cos_half_theta ** 2)))
+            if denom > 0:
+                shift_0 = float(np.sum(weights * sa[valid] * cos_half_theta) / denom)
+                v_s = float((config.lambda_0 * (shift_0 * 1e9)) / (2.0 * float(refractive_index)))
+
+        return {
+            "dho_results": dho,
+            "df_coarse": float(df_coarse),
+            "mean_shift_ghz": mean_shift,
+            "mean_lw_ghz": mean_lw,
+            "Shift_0_ghz": shift_0,
+            "V_s_ms": v_s,
+        }
+
     def list_map_groups(self) -> List[str]:
         """Lists existing `Measure` map groups under `Brillouin/`."""
         if not self.is_open:
             return []
         maps = []
-        with h5py.File(self.h5_path, "r") as f:
-            if "Brillouin" not in f:
-                return []
-            for k, item in f["Brillouin"].items():
-                if isinstance(item, h5py.Group) and k != "Calibration":
-                    maps.append(k)
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "r") as f:
+                if "Brillouin" not in f:
+                    return []
+                for k, item in f["Brillouin"].items():
+                    if isinstance(item, h5py.Group) and k != "Calibration":
+                        maps.append(k)
         return sorted(maps)
 
     def initialize_map_group(
@@ -900,13 +1063,20 @@ class AcquisitionSession:
         n_avg: int,
         roi: Tuple[int, int, int, int, int, int],
         save_raw_data: bool,
+        on_the_fly_treatment: bool = True,
+        bin_val_h: int = 4,
+        bin_val_w: int = 2,
+        refractive_index: float = 1.33,
         overwrite: bool = True,
-    ) -> str:
+    ) -> Tuple[str, Optional[str], int]:
         """
         Creates `Brillouin/<map_name>` (`Brillouin_type = 'Measure'`) in the HDF5 file,
         stores `Y_um` (`Abscissa_0_1`) and `X_um` (`Abscissa_1_2`) coordinate vectors,
         allocates 2D measured stage coordinate grids (`stage_X_measured_um`, `stage_Y_measured_um`),
-        and optionally pre-allocates a chunked 4D `Raw_data` dataset `(Ny, Nx, H, W)` (`uint16`).
+        optionally pre-allocates a chunked 4D `Raw_data` dataset `(Ny, Nx, H, W)` (`uint16`),
+        and when `on_the_fly_treatment=True`, pre-allocates `Brillouin/<map_name>/Treated HxW bins`
+        (`Brillouin_type = 'Treatment'`) with chunked 4D DHO parameter arrays `(Ny, Nx, n_rows, 2*n_orders)`
+        and 2D spatial summary maps `(Ny, Nx)`.
         """
         if not self.is_open:
             raise RuntimeError("No HDF5 session file is open.")
@@ -918,6 +1088,10 @@ class AcquisitionSession:
 
         ny, nx = max(1, int(grid.ny)), max(1, int(grid.nx))
         h, w = int(frame_shape[0]), int(frame_shape[1])
+        bin_h, bin_w = max(1, int(bin_val_h)), max(1, int(bin_val_w))
+        n_rows = h // bin_h
+        n_orders = self.determine_n_orders(bin_val_h=bin_h, bin_val_w=bin_w)
+        n_cols_dho = 2 * n_orders
 
         attrs = {
             "timestamp_start": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -939,70 +1113,120 @@ class AcquisitionSession:
             "roi_vend": int(roi[3]),
             "hardware_binning": int(roi[4]),
             "save_raw_data": bool(save_raw_data),
+            "on_the_fly_treatment": bool(on_the_fly_treatment),
         }
 
-        self.wrapper.add_dictionary(
-            {
-                "Abscissa_0_1": {
-                    "Name": "Y_um",
-                    "Data": grid.y_coords_um,
-                    "Units": "um",
-                    "Dim_start": 0,
-                    "Dim_end": 1,
+        with self._h5_lock:
+            self.wrapper.add_dictionary(
+                {
+                    "Abscissa_0_1": {
+                        "Name": "Y_um",
+                        "Data": grid.y_coords_um,
+                        "Units": "um",
+                        "Dim_start": 0,
+                        "Dim_end": 1,
+                    },
+                    "Abscissa_1_2": {
+                        "Name": "X_um",
+                        "Data": grid.x_coords_um,
+                        "Units": "um",
+                        "Dim_start": 1,
+                        "Dim_end": 2,
+                    },
+                    "Attributes": attrs,
                 },
-                "Abscissa_1_2": {
-                    "Name": "X_um",
-                    "Data": grid.x_coords_um,
-                    "Units": "um",
-                    "Dim_start": 1,
-                    "Dim_end": 2,
-                },
-                "Attributes": attrs,
-            },
-            parent_group=parent_group,
-            create_group=True,
-            Brillouin_type_parent_group="Measure",
-            overwrite=overwrite,
-        )
-
-        # Pre-allocate measured stage position arrays and optional 4D chunked Raw_data
-        with h5py.File(self.h5_path, "a") as f:
-            grp = f[parent_group]
-
-            for ds_name in ("stage_X_measured_um", "stage_Y_measured_um", "Raw_data"):
-                if ds_name in grp:
-                    del grp[ds_name]
-
-            ds_x = grp.create_dataset(
-                "stage_X_measured_um",
-                shape=(ny, nx),
-                dtype=np.float64,
-                fillvalue=np.nan,
+                parent_group=parent_group,
+                create_group=True,
+                Brillouin_type_parent_group="Measure",
+                overwrite=overwrite,
             )
-            ds_x.attrs["Brillouin_type"] = "Other"
-            ds_x.attrs["Units"] = "um"
 
-            ds_y = grp.create_dataset(
-                "stage_Y_measured_um",
-                shape=(ny, nx),
-                dtype=np.float64,
-                fillvalue=np.nan,
-            )
-            ds_y.attrs["Brillouin_type"] = "Other"
-            ds_y.attrs["Units"] = "um"
+            treated_group_path: Optional[str] = None
+            with h5py.File(self.h5_path, "a") as f:
+                grp = f[parent_group]
 
-            if save_raw_data:
-                ds_raw = grp.create_dataset(
-                    "Raw_data",
-                    shape=(ny, nx, h, w),
-                    dtype=np.uint16,
-                    chunks=(1, 1, h, w),
+                for ds_name in ("stage_X_measured_um", "stage_Y_measured_um", "Raw_data"):
+                    if ds_name in grp:
+                        del grp[ds_name]
+
+                ds_x = grp.create_dataset(
+                    "stage_X_measured_um",
+                    shape=(ny, nx),
+                    dtype=np.float64,
+                    fillvalue=np.nan,
                 )
-                ds_raw.attrs["Brillouin_type"] = "Raw_data"
+                ds_x.attrs["Brillouin_type"] = "Other"
+                ds_x.attrs["Units"] = "um"
 
-            f.flush()
+                ds_y = grp.create_dataset(
+                    "stage_Y_measured_um",
+                    shape=(ny, nx),
+                    dtype=np.float64,
+                    fillvalue=np.nan,
+                )
+                ds_y.attrs["Brillouin_type"] = "Other"
+                ds_y.attrs["Units"] = "um"
 
-        return parent_group
+                if save_raw_data:
+                    ds_raw = grp.create_dataset(
+                        "Raw_data",
+                        shape=(ny, nx, h, w),
+                        dtype=np.uint16,
+                        chunks=(1, 1, h, w),
+                    )
+                    ds_raw.attrs["Brillouin_type"] = "Raw_data"
+
+                if on_the_fly_treatment and self.rb_calib_result is not None:
+                    t_name = f"Treated {bin_h}x{bin_w} bins"
+                    if t_name in grp:
+                        del grp[t_name]
+                    t_grp = grp.create_group(t_name)
+                    t_grp.attrs["Brillouin_type"] = "Treatment"
+                    t_grp.attrs["bin_val_h"] = int(bin_h)
+                    t_grp.attrs["bin_val_w"] = int(bin_w)
+                    t_grp.attrs["n_orders"] = int(n_orders)
+                    t_grp.attrs["FSR_GHz"] = float(self.rb_calib_result["FSR_cal"])
+                    t_grp.attrs["refractive_index"] = float(refractive_index)
+                    treated_group_path = f"{parent_group}/{t_name}"
+
+                    # 4D chunked DHO datasets: (ny, nx, n_rows, 2*n_orders)
+                    dho_specs = [
+                        ("Shift", "Shift"),
+                        ("Shift error", "Shift_err"),
+                        ("Linewidth", "Linewidth"),
+                        ("Linewidth error", "Linewidth_err"),
+                        ("x_coords", "Other"),
+                        ("y_coords", "Other"),
+                    ]
+                    for ds_name, b_type in dho_specs:
+                        ds = t_grp.create_dataset(
+                            ds_name,
+                            shape=(ny, nx, n_rows, n_cols_dho),
+                            dtype=np.float64,
+                            chunks=(1, 1, n_rows, n_cols_dho),
+                            fillvalue=np.nan,
+                        )
+                        ds.attrs["Brillouin_type"] = b_type
+
+                    # 2D spatial summary maps: (ny, nx)
+                    for map_ds_name in (
+                        "map_mean_shift_GHz",
+                        "map_mean_linewidth_GHz",
+                        "map_Shift_0_GHz",
+                        "map_V_s_m_per_s",
+                        "map_df_coarse_GHz",
+                    ):
+                        ds_m = t_grp.create_dataset(
+                            map_ds_name,
+                            shape=(ny, nx),
+                            dtype=np.float64,
+                            fillvalue=np.nan,
+                        )
+                        ds_m.attrs["Brillouin_type"] = "Other"
+
+                f.flush()
+
+        return parent_group, treated_group_path, n_orders
 
     def write_map_point(
         self,
@@ -1013,20 +1237,40 @@ class AcquisitionSession:
         y_meas_um: Optional[float],
         frame: Optional[np.ndarray],
         save_raw_data: bool,
+        treated_group_path: Optional[str] = None,
+        point_fit: Optional[Dict[str, Any]] = None,
     ):
         """
-        Writes a single acquired spatial point `(iy, ix)` to disk in `Brillouin/<map_name>`
-        and flushes the HDF5 file so data is immediately persisted.
+        Writes a single acquired (and optionally fitted) spatial point `(iy, ix)`
+        to disk in `Brillouin/<map_name>` and flushes the HDF5 file.
         """
         if not self.is_open:
             raise RuntimeError("No HDF5 session file is open.")
 
-        with h5py.File(self.h5_path, "a") as f:
-            grp = f[map_group_path]
-            if x_meas_um is not None and "stage_X_measured_um" in grp:
-                grp["stage_X_measured_um"][iy, ix] = float(x_meas_um)
-            if y_meas_um is not None and "stage_Y_measured_um" in grp:
-                grp["stage_Y_measured_um"][iy, ix] = float(y_meas_um)
-            if save_raw_data and frame is not None and "Raw_data" in grp:
-                grp["Raw_data"][iy, ix, :, :] = np.asarray(frame, dtype=np.uint16)
-            f.flush()
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "a") as f:
+                grp = f[map_group_path]
+                if x_meas_um is not None and "stage_X_measured_um" in grp:
+                    grp["stage_X_measured_um"][iy, ix] = float(x_meas_um)
+                if y_meas_um is not None and "stage_Y_measured_um" in grp:
+                    grp["stage_Y_measured_um"][iy, ix] = float(y_meas_um)
+                if save_raw_data and frame is not None and "Raw_data" in grp:
+                    grp["Raw_data"][iy, ix, :, :] = np.asarray(frame, dtype=np.uint16)
+
+                if treated_group_path and point_fit is not None and treated_group_path in f:
+                    t_grp = f[treated_group_path]
+                    dho = point_fit["dho_results"]
+                    t_grp["Shift"][iy, ix, :, :] = dho["shift_clipped"]
+                    t_grp["Shift error"][iy, ix, :, :] = dho["shift_error"]
+                    t_grp["Linewidth"][iy, ix, :, :] = dho["linewidth_clipped"]
+                    t_grp["Linewidth error"][iy, ix, :, :] = dho["linewidth_error"]
+                    t_grp["x_coords"][iy, ix, :, :] = dho["x_coords"]
+                    t_grp["y_coords"][iy, ix, :, :] = dho["y_coords"]
+
+                    t_grp["map_mean_shift_GHz"][iy, ix] = float(point_fit["mean_shift_ghz"])
+                    t_grp["map_mean_linewidth_GHz"][iy, ix] = float(point_fit["mean_lw_ghz"])
+                    t_grp["map_Shift_0_GHz"][iy, ix] = float(point_fit["Shift_0_ghz"])
+                    t_grp["map_V_s_m_per_s"][iy, ix] = float(point_fit["V_s_ms"])
+                    t_grp["map_df_coarse_GHz"][iy, ix] = float(point_fit["df_coarse"])
+
+                f.flush()

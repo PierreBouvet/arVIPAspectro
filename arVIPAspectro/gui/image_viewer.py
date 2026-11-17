@@ -27,6 +27,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._im_artist = None
         self._cbar = None
         self._in_diagnostic_view: bool = False
+        self._last_live_map_state: Optional[Dict[str, Any]] = None
 
         self._build_ui()
 
@@ -52,6 +53,16 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self.combo_contrast.addItem("Full 16-bit (0 – 65535)", "uint16")
         self.combo_contrast.currentIndexChanged.connect(self._on_display_settings_changed)
         ctrl_bar.addWidget(self.combo_contrast)
+
+        ctrl_bar.addSpacing(12)
+        ctrl_bar.addWidget(QtWidgets.QLabel("Map Metric:"))
+        self.combo_map_metric = QtWidgets.QComboBox()
+        self.combo_map_metric.addItem("Mean Shift ν_B (GHz)", "mean_shift")
+        self.combo_map_metric.addItem("Velocity V_s (m/s)", "v_s")
+        self.combo_map_metric.addItem("Mean Linewidth Γ_B (GHz)", "mean_lw")
+        self.combo_map_metric.addItem("Normal Shift S(0) (GHz)", "shift_0")
+        self.combo_map_metric.currentIndexChanged.connect(self._on_map_metric_changed)
+        ctrl_bar.addWidget(self.combo_map_metric)
 
         ctrl_bar.addStretch()
         self.lbl_stats = QtWidgets.QLabel("No frame loaded")
@@ -586,6 +597,132 @@ class ImageViewerWidget(QtWidgets.QWidget):
             f"Mean Shift = {float(np.nanmean(dho['shift_clipped_averaged'])):.3f} GHz  |  "
             f"Mean LW = {float(np.nanmean(dho['linewidth_clipped_averaged'])):.3f} GHz{vs_str}"
         )
+        self.canvas.draw_idle()
+
+    # ==========================================================================
+    # Step 5.4: Live 2D Spatial Map Heatmap + Interferogram View
+    # ==========================================================================
+
+    def update_live_map_view(
+        self,
+        frame: np.ndarray,
+        x_coords_um: np.ndarray,
+        y_coords_um: np.ndarray,
+        map_mean_shift: np.ndarray,
+        map_mean_lw: np.ndarray,
+        map_shift_0: np.ndarray,
+        map_vs: np.ndarray,
+        iy: int,
+        ix: int,
+        pos_um: Optional[Dict[str, Optional[float]]] = None,
+        point_fit: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Renders a side-by-side live view during spatial mapping:
+          - Left subplot: Latest acquired 2D camera interferogram at `(iy, ix)`.
+          - Right subplot: Live 2D spatial heatmap `(X_um, Y_um)` of the selected Brillouin metric.
+        """
+        self._last_live_map_state = {
+            "frame": np.asarray(frame),
+            "x_coords_um": np.asarray(x_coords_um, dtype=np.float64),
+            "y_coords_um": np.asarray(y_coords_um, dtype=np.float64),
+            "map_mean_shift": np.array(map_mean_shift, dtype=np.float64, copy=True),
+            "map_mean_lw": np.array(map_mean_lw, dtype=np.float64, copy=True),
+            "map_shift_0": np.array(map_shift_0, dtype=np.float64, copy=True),
+            "map_vs": np.array(map_vs, dtype=np.float64, copy=True),
+            "iy": int(iy),
+            "ix": int(ix),
+            "pos_um": pos_um,
+            "point_fit": point_fit,
+        }
+        self._render_live_map_state()
+
+    def _on_map_metric_changed(self):
+        if self._in_diagnostic_view and self._last_live_map_state is not None:
+            self._render_live_map_state()
+
+    def _render_live_map_state(self):
+        st = self._last_live_map_state
+        if st is None:
+            return
+
+        self._in_diagnostic_view = True
+        self._im_artist = None
+        self.figure.clear()
+
+        frame = st["frame"]
+        xs = st["x_coords_um"]
+        ys = st["y_coords_um"]
+        iy, ix = st["iy"], st["ix"]
+        pos_um = st["pos_um"] or {}
+        point_fit = st["point_fit"]
+
+        ax_img = self.figure.add_subplot(1, 2, 1)
+        ax_map = self.figure.add_subplot(1, 2, 2)
+
+        cmap_img = self.combo_cmap.currentText()
+        vmin, vmax = self._compute_clim(frame)
+        im1 = ax_img.imshow(frame, cmap=cmap_img, vmin=vmin, vmax=vmax, origin="upper", aspect="equal")
+        self.figure.colorbar(im1, ax=ax_img, fraction=0.046, pad=0.04, label="Counts (ADU)")
+        x_val = pos_um.get("X", xs[min(ix, len(xs) - 1)])
+        y_val = pos_um.get("Y", ys[min(iy, len(ys) - 1)])
+        ax_img.set_title(
+            f"Point [row={iy}, col={ix}] @ ({x_val:.1f}, {y_val:.1f}) µm",
+            fontsize=10,
+        )
+        ax_img.set_xlabel("Detector X (px)")
+        ax_img.set_ylabel("Detector Y (px)")
+
+        metric_key = self.combo_map_metric.currentData() or "mean_shift"
+        if metric_key == "v_s":
+            data_2d = st["map_vs"]
+            metric_title = "Live 2D Map — Velocity V_s (m/s)"
+            cbar_lbl = "V_s (m/s)"
+            cmap_m = "plasma"
+        elif metric_key == "mean_lw":
+            data_2d = st["map_mean_lw"]
+            metric_title = "Live 2D Map — Mean Linewidth Γ_B (GHz)"
+            cbar_lbl = "Γ_B (GHz)"
+            cmap_m = "magma"
+        elif metric_key == "shift_0":
+            data_2d = st["map_shift_0"]
+            metric_title = "Live 2D Map — Normal Shift S(0) (GHz)"
+            cbar_lbl = "S(0) (GHz)"
+            cmap_m = "viridis"
+        else:
+            data_2d = st["map_mean_shift"]
+            metric_title = "Live 2D Map — Mean Shift ν_B (GHz)"
+            cbar_lbl = "ν_B (GHz)"
+            cmap_m = "viridis"
+
+        # Compute extent in µm for imshow
+        dx_half = 0.5 * abs(xs[1] - xs[0]) if len(xs) > 1 else 5.0
+        dy_half = 0.5 * abs(ys[1] - ys[0]) if len(ys) > 1 else 5.0
+        x_min, x_max = float(np.min(xs)) - dx_half, float(np.max(xs)) + dx_half
+        y_min, y_max = float(np.min(ys)) - dy_half, float(np.max(ys)) + dy_half
+
+        im2 = ax_map.imshow(
+            data_2d,
+            cmap=cmap_m,
+            origin="lower",
+            extent=[x_min, x_max, y_min, y_max],
+            aspect="auto",
+            interpolation="nearest",
+        )
+        self.figure.colorbar(im2, ax=ax_map, fraction=0.046, pad=0.04, label=cbar_lbl)
+        ax_map.plot([x_val], [y_val], "r+", markersize=10, markeredgewidth=2.0)
+        ax_map.set_title(metric_title, fontsize=10)
+        ax_map.set_xlabel("Stage X (µm)")
+        ax_map.set_ylabel("Stage Y (µm)")
+        self.ax = ax_img
+
+        if point_fit is not None:
+            self.lbl_stats.setText(
+                f"Map [{iy},{ix}]: ν_B = {point_fit['mean_shift_ghz']:.3f} GHz  |  "
+                f"Γ_B = {point_fit['mean_lw_ghz']:.3f} GHz  |  "
+                f"S(0) = {point_fit['Shift_0_ghz']:.3f} GHz  |  "
+                f"V_s = {point_fit['V_s_ms']:.1f} m/s"
+            )
         self.canvas.draw_idle()
 
     def _on_mouse_move(self, event):

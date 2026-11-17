@@ -11,7 +11,9 @@ Guided acquisition workflow for:
 
 import os
 import time
-from typing import Optional, Dict, Any, Callable
+import queue
+import threading
+from typing import Optional, Dict, Any, Callable, Tuple
 import numpy as np
 from PySide6 import QtWidgets, QtCore
 
@@ -266,15 +268,21 @@ class SampleTreatmentWorker(QtCore.QThread):
 
 class MapScanWorker(QtCore.QThread):
     """
-    Background worker that executes the 2D spatial map scan across the ASI MS-2000 grid,
-    acquiring an Orca Flash 4.0 v3 frame at each point `(iy, ix)` and persisting
-    measured coordinates and optional raw frames to `Brillouin/<Map_name>` in the HDF5 file.
+    Asynchronous Producer-Consumer worker that executes the 2D spatial map scan:
+      - Producer (Stage + Camera thread): Moves the ASI MS-2000 to `(target_x_um, target_y_um)`,
+        waits `settling_ms`, acquires an Orca Flash 4.0 v3 frame, and enqueues it.
+      - Consumer (Fitting + HDF5 thread): Dequeues each frame `(iy, ix)`, performs on-the-fly
+        DHO fitting (`treat_single_map_point`), persists treated parameters (and optional raw frame)
+        to `Brillouin/<Map_name>` in the HDF5 file, and emits live 2D heatmap updates.
     """
 
     sig_log = QtCore.Signal(str)
     sig_progress = QtCore.Signal(int, int, int, int, float, float)  # (step_idx, total, iy, ix, x_um, y_um)
     sig_stage_updated = QtCore.Signal()
     sig_point_acquired = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
+    sig_live_map_updated = QtCore.Signal(
+        object, object, object, object, object, object, object, int, int, object, object
+    )  # (frame, x_um_1d, y_um_1d, map_shift, map_lw, map_s0, map_vs, iy, ix, pos, point_fit)
     sig_finished_map = QtCore.Signal(str, int)                           # (map_group_path, points_completed)
     sig_error = QtCore.Signal(str, str)
 
@@ -289,6 +297,8 @@ class MapScanWorker(QtCore.QThread):
         n_avg: int,
         settling_ms: float,
         save_raw_data: bool,
+        on_the_fly_treatment: bool = True,
+        fit_params: Optional[Dict[str, Any]] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -301,6 +311,8 @@ class MapScanWorker(QtCore.QThread):
         self.n_avg = n_avg
         self.settling_ms = settling_ms
         self.save_raw_data = save_raw_data
+        self.on_the_fly_treatment = bool(on_the_fly_treatment)
+        self.fit_params = fit_params or {}
 
         self._pause_requested = False
         self._abort_requested = False
@@ -322,8 +334,12 @@ class MapScanWorker(QtCore.QThread):
             out_h = (roi[3] - roi[2]) // max(1, binning)
             frame_shape = (out_h, out_w)
 
-            # Initialize HDF5 Measure group and pre-allocate datasets
-            map_group_path = self.session.initialize_map_group(
+            bin_h = int(self.fit_params.get("bin_val_h", 4))
+            bin_w = int(self.fit_params.get("bin_val_w", 2))
+            n_idx = float(self.fit_params.get("refractive_index", 1.33))
+
+            # Initialize HDF5 Measure group and pre-allocate datasets (including 4D Treated group)
+            map_group_path, treated_group_path, n_orders = self.session.initialize_map_group(
                 map_name=self.map_name,
                 grid=self.grid,
                 frame_shape=frame_shape,
@@ -331,6 +347,10 @@ class MapScanWorker(QtCore.QThread):
                 n_avg=n_avg,
                 roi=roi,
                 save_raw_data=self.save_raw_data,
+                on_the_fly_treatment=self.on_the_fly_treatment,
+                bin_val_h=bin_h,
+                bin_val_w=bin_w,
+                refractive_index=n_idx,
                 overwrite=True,
             )
 
@@ -338,20 +358,106 @@ class MapScanWorker(QtCore.QThread):
             total_pts = len(trajectory)
             settling_s = max(0.0, float(self.settling_ms) / 1000.0)
 
+            ny, nx = max(1, int(self.grid.ny)), max(1, int(self.grid.nx))
+            x_coords_1d = self.grid.x_coords_um
+            y_coords_1d = self.grid.y_coords_um
+            map_mean_shift = np.full((ny, nx), np.nan, dtype=np.float64)
+            map_mean_lw = np.full((ny, nx), np.nan, dtype=np.float64)
+            map_shift_0 = np.full((ny, nx), np.nan, dtype=np.float64)
+            map_vs = np.full((ny, nx), np.nan, dtype=np.float64)
+
             self.sig_log.emit(
-                f"Starting Map '{map_group_path}': {self.grid.nx}x{self.grid.ny} = {total_pts} point(s), "
+                f"Starting Pipelined Map '{map_group_path}': {nx}x{ny} = {total_pts} point(s), "
                 f"pattern={self.grid.scan_pattern}, Exp={exp_s*1e3:.2f} ms x {n_avg}, "
-                f"Save Raw Data={self.save_raw_data}."
+                f"On-the-Fly Fit={treated_group_path is not None} ({bin_h}x{bin_w} bin, {n_orders} orders), "
+                f"Save Raw={self.save_raw_data}."
             )
 
-            completed = 0
+            work_queue: "queue.Queue[Optional[Tuple]]" = queue.Queue(maxsize=8)
+            completed_box = [0]
+            consumer_error: list = []
+
+            def _consumer_loop():
+                while True:
+                    item = work_queue.get()
+                    if item is None:
+                        work_queue.task_done()
+                        break
+                    try:
+                        c_idx, c_iy, c_ix, c_pos, c_frame, c_tx, c_ty = item
+                        point_fit = None
+                        if treated_group_path is not None:
+                            point_fit = self.session.treat_single_map_point(
+                                frame=c_frame,
+                                bin_val_h=bin_h,
+                                bin_val_w=bin_w,
+                                n_orders=n_orders,
+                                expected_shift_ghz=float(self.fit_params.get("expected_shift_ghz", 5.1)),
+                                shift_tol_ghz=float(self.fit_params.get("shift_tol_ghz", 2.0)),
+                                expected_lw_ghz=float(self.fit_params.get("expected_lw_ghz", 0.8)),
+                                lw_bounds_ghz=tuple(self.fit_params.get("lw_bounds_ghz", (0.4, 1.3))),
+                                refractive_index=n_idx,
+                                fast_drift_only=bool(self.fit_params.get("fast_drift_only", True)),
+                            )
+                            map_mean_shift[c_iy, c_ix] = point_fit["mean_shift_ghz"]
+                            map_mean_lw[c_iy, c_ix] = point_fit["mean_lw_ghz"]
+                            map_shift_0[c_iy, c_ix] = point_fit["Shift_0_ghz"]
+                            map_vs[c_iy, c_ix] = point_fit["V_s_ms"]
+
+                        self.session.write_map_point(
+                            map_group_path=map_group_path,
+                            iy=c_iy,
+                            ix=c_ix,
+                            x_meas_um=c_pos.get("X"),
+                            y_meas_um=c_pos.get("Y"),
+                            frame=c_frame,
+                            save_raw_data=self.save_raw_data,
+                            treated_group_path=treated_group_path,
+                            point_fit=point_fit,
+                        )
+                        completed_box[0] += 1
+
+                        if treated_group_path is not None:
+                            self.sig_live_map_updated.emit(
+                                c_frame,
+                                x_coords_1d,
+                                y_coords_1d,
+                                map_mean_shift,
+                                map_mean_lw,
+                                map_shift_0,
+                                map_vs,
+                                c_iy,
+                                c_ix,
+                                c_pos,
+                                point_fit,
+                            )
+                        else:
+                            self.sig_point_acquired.emit(c_frame, c_pos, exp_s, n_avg, binning)
+
+                        self.sig_progress.emit(
+                            c_idx,
+                            total_pts,
+                            c_iy,
+                            c_ix,
+                            float(c_pos.get("X") or c_tx),
+                            float(c_pos.get("Y") or c_ty),
+                        )
+                    except Exception as c_exc:
+                        consumer_error.append(c_exc)
+                    finally:
+                        work_queue.task_done()
+
+            consumer_thread = threading.Thread(target=_consumer_loop, daemon=True)
+            consumer_thread.start()
+
+            # Producer Loop: Move Stage + Expose Camera
             for idx, (iy, ix, target_y_um, target_x_um) in enumerate(trajectory, start=1):
-                # Handle Pause
                 while self._pause_requested and not self._abort_requested:
                     time.sleep(0.05)
 
-                if self._abort_requested:
-                    self.sig_log.emit(f"Map scan aborted by user at point {idx}/{total_pts}.")
+                if self._abort_requested or consumer_error:
+                    if self._abort_requested:
+                        self.sig_log.emit(f"Map scan aborted by user at point {idx}/{total_pts}.")
                     break
 
                 # 1. Move stage to (target_x_um, target_y_um)
@@ -361,8 +467,9 @@ class MapScanWorker(QtCore.QThread):
                 if settling_s > 0:
                     time.sleep(settling_s)
 
-                if self._abort_requested:
-                    self.sig_log.emit(f"Map scan aborted by user at point {idx}/{total_pts}.")
+                if self._abort_requested or consumer_error:
+                    if self._abort_requested:
+                        self.sig_log.emit(f"Map scan aborted by user at point {idx}/{total_pts}.")
                     break
 
                 # 2. Acquire camera frame
@@ -372,29 +479,17 @@ class MapScanWorker(QtCore.QThread):
                     sim_spectrum_type="sample",
                 )
 
-                # 3. Write point data to HDF5
-                self.session.write_map_point(
-                    map_group_path=map_group_path,
-                    iy=iy,
-                    ix=ix,
-                    x_meas_um=pos.get("X"),
-                    y_meas_um=pos.get("Y"),
-                    frame=frame,
-                    save_raw_data=self.save_raw_data,
-                )
+                # 3. Enqueue for asynchronous Consumer fitting & HDF5 disk flush
+                work_queue.put((idx, iy, ix, pos, frame, target_x_um, target_y_um))
 
-                completed += 1
-                self.sig_point_acquired.emit(frame, pos, exp_s, n_avg, binning)
-                self.sig_progress.emit(
-                    idx,
-                    total_pts,
-                    iy,
-                    ix,
-                    float(pos.get("X") or target_x_um),
-                    float(pos.get("Y") or target_y_um),
-                )
+            # Signal Consumer to finish remaining queued frames
+            work_queue.put(None)
+            consumer_thread.join()
 
-            self.sig_finished_map.emit(map_group_path, completed)
+            if consumer_error:
+                raise consumer_error[0]
+
+            self.sig_finished_map.emit(map_group_path, completed_box[0])
 
         except Exception as exc:
             self.sig_error.emit("Map Acquisition Error", str(exc))
@@ -412,6 +507,9 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     sig_show_laser_diagnostics = QtCore.Signal(object, str)             # (calib_res, view_mode)
     sig_show_rb_diagnostics = QtCore.Signal(object, str)                # (rb_res, view_mode)
     sig_show_sample_diagnostics = QtCore.Signal(object, str)            # (sample_res, view_mode)
+    sig_update_live_map = QtCore.Signal(
+        object, object, object, object, object, object, object, int, int, object, object
+    )
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
     sig_lock_geometry = QtCore.Signal(bool)
@@ -1088,6 +1186,22 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         opt_row.addStretch()
         layout.addLayout(opt_row)
 
+        # 4B. Step 5.4 On-the-Fly Treatment Options Row
+        otf_row = QtWidgets.QHBoxLayout()
+        self.chk_treat_on_the_fly = QtWidgets.QCheckBox(
+            "Step 5.4: Treat on the fly & save 4D fitted DHO parameters (Treated H×W bins)"
+        )
+        self.chk_treat_on_the_fly.setChecked(True)
+        self.chk_treat_on_the_fly.toggled.connect(self._update_map_summary)
+        otf_row.addWidget(self.chk_treat_on_the_fly)
+
+        otf_row.addSpacing(12)
+        self.chk_fast_drift = QtWidgets.QCheckBox("Fast elastic drift tracking per point")
+        self.chk_fast_drift.setChecked(True)
+        otf_row.addWidget(self.chk_fast_drift)
+        otf_row.addStretch()
+        layout.addLayout(otf_row)
+
         # 5. Live Map Summary Banner
         self.lbl_map_summary = QtWidgets.QLabel("")
         self.lbl_map_summary.setStyleSheet(
@@ -1638,6 +1752,12 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             frame_shape = (2048, 2048)
 
         raw_bytes = cfg.estimate_raw_size_bytes(frame_shape)
+        bin_h = max(1, int(self.spin_bin_h.value())) if hasattr(self, "spin_bin_h") else 4
+        bin_w = max(1, int(self.spin_bin_w.value())) if hasattr(self, "spin_bin_w") else 2
+        n_rows = frame_shape[0] // bin_h
+        n_orders = 11
+        # 6 float64 4D arrays (Shift, Shift_err, LW, LW_err, x_coords, y_coords)
+        treated_bytes = cfg.total_points * n_rows * (2 * n_orders) * 8 * 6
         est_sec = cfg.estimate_duration_seconds(
             exposure_s=float(self.spin_map_exp.value()) / 1000.0,
             n_avg=int(self.spin_map_avg.value()),
@@ -1648,11 +1768,18 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             if self.chk_save_raw.isChecked()
             else f"NOT SAVED (saves {_format_bytes(raw_bytes)} of disk space)"
         )
+        otf_checked = getattr(self, "chk_treat_on_the_fly", None)
+        otf_status = (
+            f"ENABLED (~{_format_bytes(treated_bytes)} in Treated {bin_h}×{bin_w} bins)"
+            if (otf_checked is None or otf_checked.isChecked())
+            else "DISABLED"
+        )
         self.lbl_map_summary.setText(
             f"Grid: {cfg.nx} × {cfg.ny} = {cfg.total_points} points   |   "
             f"Span: {cfg.span_x_um:.1f} × {cfg.span_y_um:.1f} µm   |   "
             f"Est. Time: {_format_duration(est_sec)}\n"
-            f"Raw 4D Dataset ({cfg.ny}×{cfg.nx}×{frame_shape[0]}×{frame_shape[1]} uint16): {raw_status}"
+            f"On-the-Fly Fitted DHO Dataset: {otf_status}   |   "
+            f"Raw 4D Dataset: {raw_status}"
         )
 
     # ==========================================================================
@@ -1707,6 +1834,17 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self._map_paused = False
         self.btn_pause_map.setText("⏸ Pause")
 
+        fit_params = {
+            "bin_val_h": int(self.spin_bin_h.value()),
+            "bin_val_w": int(self.spin_bin_w.value()),
+            "expected_shift_ghz": float(self.spin_dho_shift.value()),
+            "shift_tol_ghz": float(self.spin_dho_tol.value()),
+            "expected_lw_ghz": float(self.spin_dho_lw.value()),
+            "lw_bounds_ghz": (float(self.spin_dho_lw_min.value()), float(self.spin_dho_lw_max.value())),
+            "refractive_index": float(self.spin_q_n.value()),
+            "fast_drift_only": bool(self.chk_fast_drift.isChecked()),
+        }
+
         self._map_worker = MapScanWorker(
             session=self.session,
             camera=self.camera,
@@ -1717,12 +1855,15 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             n_avg=self.spin_map_avg.value(),
             settling_ms=self.spin_map_settling.value(),
             save_raw_data=self.chk_save_raw.isChecked(),
+            on_the_fly_treatment=self.chk_treat_on_the_fly.isChecked(),
+            fit_params=fit_params,
             parent=self,
         )
         self._map_worker.sig_log.connect(self.sig_log.emit)
         self._map_worker.sig_progress.connect(self._on_map_progress)
         self._map_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
         self._map_worker.sig_point_acquired.connect(self.sig_display_frame.emit)
+        self._map_worker.sig_live_map_updated.connect(self.sig_update_live_map.emit)
         self._map_worker.sig_finished_map.connect(self._on_map_finished)
         self._map_worker.sig_error.connect(self._on_worker_error)
         self._map_worker.finished.connect(self._on_map_worker_thread_done)
