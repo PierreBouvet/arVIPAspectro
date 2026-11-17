@@ -28,6 +28,61 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._cbar = None
         self._in_diagnostic_view: bool = False
         self._last_live_map_state: Optional[Dict[str, Any]] = None
+        self._syncing_map_range: bool = False
+        self._map_range_settings: Dict[str, Dict[str, Any]] = {
+            "mean_shift": {
+                "state_key": "map_mean_shift",
+                "title": "Live 2D Map — Mean Shift ν_B (GHz)",
+                "cbar_label": "ν_B (GHz)",
+                "cmap": "viridis",
+                "auto": True,
+                "vmin": 4.0,
+                "vmax": 7.0,
+                "decimals": 3,
+                "step": 0.05,
+                "bounds": (-100.0, 100.0),
+                "suffix": " GHz",
+            },
+            "mean_lw": {
+                "state_key": "map_mean_lw",
+                "title": "Live 2D Map — Mean Linewidth Γ_B (GHz)",
+                "cbar_label": "Γ_B (GHz)",
+                "cmap": "magma",
+                "auto": True,
+                "vmin": 0.2,
+                "vmax": 1.5,
+                "decimals": 3,
+                "step": 0.05,
+                "bounds": (-100.0, 100.0),
+                "suffix": " GHz",
+            },
+            "shift_0": {
+                "state_key": "map_shift_0",
+                "title": "Live 2D Map — Normal Shift S(0) (GHz)",
+                "cbar_label": "S(0) (GHz)",
+                "cmap": "viridis",
+                "auto": True,
+                "vmin": 4.0,
+                "vmax": 7.0,
+                "decimals": 3,
+                "step": 0.05,
+                "bounds": (-100.0, 100.0),
+                "suffix": " GHz",
+            },
+            "v_s": {
+                "state_key": "map_vs",
+                "title": "Live 2D Map — Velocity V_s (m/s)",
+                "cbar_label": "V_s (m/s)",
+                "cmap": "plasma",
+                "auto": True,
+                "vmin": 1300.0,
+                "vmax": 2000.0,
+                "decimals": 1,
+                "step": 10.0,
+                "bounds": (-1000.0, 50000.0),
+                "suffix": " m/s",
+            },
+        }
 
         self._build_ui()
 
@@ -36,7 +91,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
 
-        # 1. Top Display Controls Bar
+        # 1. Top Detector Display Controls Bar
         ctrl_bar = QtWidgets.QHBoxLayout()
 
         ctrl_bar.addWidget(QtWidgets.QLabel("Colormap:"))
@@ -57,21 +112,48 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self.combo_contrast.currentIndexChanged.connect(self._on_display_settings_changed)
         ctrl_bar.addWidget(self.combo_contrast)
 
-        ctrl_bar.addSpacing(12)
-        ctrl_bar.addWidget(QtWidgets.QLabel("Map Metric:"))
+        ctrl_bar.addStretch()
+        self.lbl_stats = QtWidgets.QLabel("No frame loaded")
+        self.lbl_stats.setStyleSheet("font-family: monospace; font-size: 11px;")
+        ctrl_bar.addWidget(self.lbl_stats)
+        layout.addLayout(ctrl_bar)
+
+        # 1b. Live Spatial Map Display & Colorscale Range Bar
+        map_bar = QtWidgets.QHBoxLayout()
+        map_bar.addWidget(QtWidgets.QLabel("Map Metric:"))
         self.combo_map_metric = QtWidgets.QComboBox()
         self.combo_map_metric.addItem("Mean Shift ν_B (GHz)", "mean_shift")
         self.combo_map_metric.addItem("Velocity V_s (m/s)", "v_s")
         self.combo_map_metric.addItem("Mean Linewidth Γ_B (GHz)", "mean_lw")
         self.combo_map_metric.addItem("Normal Shift S(0) (GHz)", "shift_0")
         self.combo_map_metric.currentIndexChanged.connect(self._on_map_metric_changed)
-        ctrl_bar.addWidget(self.combo_map_metric)
+        map_bar.addWidget(self.combo_map_metric)
 
-        ctrl_bar.addStretch()
-        self.lbl_stats = QtWidgets.QLabel("No frame loaded")
-        self.lbl_stats.setStyleSheet("font-family: monospace; font-size: 11px;")
-        ctrl_bar.addWidget(self.lbl_stats)
-        layout.addLayout(ctrl_bar)
+        map_bar.addSpacing(12)
+        self.chk_map_auto_range = QtWidgets.QCheckBox("Auto Range")
+        self.chk_map_auto_range.setChecked(True)
+        self.chk_map_auto_range.toggled.connect(self._on_map_auto_toggled)
+        map_bar.addWidget(self.chk_map_auto_range)
+
+        map_bar.addSpacing(6)
+        map_bar.addWidget(QtWidgets.QLabel("Min:"))
+        self.spin_map_vmin = QtWidgets.QDoubleSpinBox()
+        self.spin_map_vmin.setKeyboardTracking(False)
+        self.spin_map_vmin.setMinimumWidth(105)
+        self.spin_map_vmin.valueChanged.connect(self._on_map_bounds_changed)
+        map_bar.addWidget(self.spin_map_vmin)
+
+        map_bar.addSpacing(4)
+        map_bar.addWidget(QtWidgets.QLabel("Max:"))
+        self.spin_map_vmax = QtWidgets.QDoubleSpinBox()
+        self.spin_map_vmax.setKeyboardTracking(False)
+        self.spin_map_vmax.setMinimumWidth(105)
+        self.spin_map_vmax.valueChanged.connect(self._on_map_bounds_changed)
+        map_bar.addWidget(self.spin_map_vmax)
+
+        map_bar.addStretch()
+        layout.addLayout(map_bar)
+        self._sync_map_range_widgets()
 
         # 2. Matplotlib Figure & Navigation Toolbar
         self.figure = Figure(figsize=(6, 6), tight_layout=True)
@@ -653,8 +735,78 @@ class ImageViewerWidget(QtWidgets.QWidget):
         }
         self._render_live_map_state()
 
+    @staticmethod
+    def _compute_finite_minmax(data_2d: np.ndarray):
+        finite_mask = np.isfinite(data_2d)
+        if not np.any(finite_mask):
+            return None
+        vals = data_2d[finite_mask]
+        return float(np.min(vals)), float(np.max(vals))
+
+    def _current_metric_key(self) -> str:
+        return self.combo_map_metric.currentData() or "mean_shift"
+
+    def _sync_map_range_widgets(self, live_bounds=None):
+        """Synchronizes Auto checkbox and unit-aware Min/Max spinboxes for the active metric."""
+        metric_key = self._current_metric_key()
+        cfg = self._map_range_settings[metric_key]
+        is_auto = bool(cfg["auto"])
+
+        if live_bounds is None and is_auto and self._last_live_map_state is not None:
+            data_2d = self._last_live_map_state[cfg["state_key"]]
+            live_bounds = self._compute_finite_minmax(data_2d)
+
+        vmin_disp, vmax_disp = (
+            live_bounds if (is_auto and live_bounds is not None) else (cfg["vmin"], cfg["vmax"])
+        )
+
+        self._syncing_map_range = True
+        try:
+            self.chk_map_auto_range.setChecked(is_auto)
+            lo_b, hi_b = cfg["bounds"]
+            for spin, val in ((self.spin_map_vmin, vmin_disp), (self.spin_map_vmax, vmax_disp)):
+                spin.setDecimals(cfg["decimals"])
+                spin.setSingleStep(cfg["step"])
+                spin.setRange(lo_b, hi_b)
+                spin.setSuffix(cfg["suffix"])
+                spin.setValue(float(val))
+                spin.setEnabled(not is_auto)
+        finally:
+            self._syncing_map_range = False
+
     def _on_map_metric_changed(self):
+        self._sync_map_range_widgets()
         if self._in_diagnostic_view and self._last_live_map_state is not None:
+            self._render_live_map_state()
+
+    def _on_map_auto_toggled(self, checked: bool):
+        if self._syncing_map_range:
+            return
+        metric_key = self._current_metric_key()
+        cfg = self._map_range_settings[metric_key]
+        cfg["auto"] = bool(checked)
+
+        # Pre-fill Manual Min/Max with the current finite Auto bounds when switching Auto -> Manual
+        if not checked and self._last_live_map_state is not None:
+            minmax = self._compute_finite_minmax(self._last_live_map_state[cfg["state_key"]])
+            if minmax is not None:
+                d_min, d_max = minmax
+                eps = 1.0 if metric_key == "v_s" else 0.001
+                cfg["vmin"] = d_min
+                cfg["vmax"] = d_max if d_max > d_min else d_min + eps
+
+        self._sync_map_range_widgets()
+        if self._in_diagnostic_view and self._last_live_map_state is not None:
+            self._render_live_map_state()
+
+    def _on_map_bounds_changed(self):
+        if self._syncing_map_range:
+            return
+        metric_key = self._current_metric_key()
+        cfg = self._map_range_settings[metric_key]
+        cfg["vmin"] = float(self.spin_map_vmin.value())
+        cfg["vmax"] = float(self.spin_map_vmax.value())
+        if not cfg["auto"] and self._in_diagnostic_view and self._last_live_map_state is not None:
             self._render_live_map_state()
 
     def _render_live_map_state(self):
@@ -711,27 +863,27 @@ class ImageViewerWidget(QtWidgets.QWidget):
             ax_img.set_title("Detector Frame (waiting for point 1)", fontsize=10)
             self.lbl_stats.setText("Map initialized — acquiring first point...")
 
-        metric_key = self.combo_map_metric.currentData() or "mean_shift"
-        if metric_key == "v_s":
-            data_2d = st["map_vs"]
-            metric_title = "Live 2D Map — Velocity V_s (m/s)"
-            cbar_lbl = "V_s (m/s)"
-            cmap_m = "plasma"
-        elif metric_key == "mean_lw":
-            data_2d = st["map_mean_lw"]
-            metric_title = "Live 2D Map — Mean Linewidth Γ_B (GHz)"
-            cbar_lbl = "Γ_B (GHz)"
-            cmap_m = "magma"
-        elif metric_key == "shift_0":
-            data_2d = st["map_shift_0"]
-            metric_title = "Live 2D Map — Normal Shift S(0) (GHz)"
-            cbar_lbl = "S(0) (GHz)"
-            cmap_m = "viridis"
+        metric_key = self._current_metric_key()
+        cfg = self._map_range_settings[metric_key]
+        data_2d = st[cfg["state_key"]]
+        metric_title = cfg["title"]
+        cbar_lbl = cfg["cbar_label"]
+        cmap_m = cfg["cmap"]
+
+        live_bounds = self._compute_finite_minmax(data_2d)
+        if cfg["auto"]:
+            if live_bounds is not None:
+                self._sync_map_range_widgets(live_bounds=live_bounds)
+                d_min, d_max = live_bounds
+                map_vmin, map_vmax = (d_min, d_max) if d_max > d_min else (None, None)
+            else:
+                map_vmin, map_vmax = None, None
         else:
-            data_2d = st["map_mean_shift"]
-            metric_title = "Live 2D Map — Mean Shift ν_B (GHz)"
-            cbar_lbl = "ν_B (GHz)"
-            cmap_m = "viridis"
+            map_vmin = float(cfg["vmin"])
+            map_vmax = float(cfg["vmax"])
+            if map_vmax <= map_vmin:
+                eps = 1.0 if metric_key == "v_s" else 1e-3
+                map_vmax = map_vmin + eps
 
         # Compute extent in µm using configured step sizes so pixel sizes are proportional
         step_um = st.get("step_um")
@@ -755,6 +907,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
         im2 = ax_map.imshow(
             data_2d,
             cmap=cmap_m,
+            vmin=map_vmin,
+            vmax=map_vmax,
             origin="lower",
             extent=[x_min, x_max, y_min, y_max],
             aspect="equal",
