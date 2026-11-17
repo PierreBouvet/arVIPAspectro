@@ -54,6 +54,8 @@ class OrcaFlashCamera:
         self._sim_exposure_s: float = 0.050  # 50 ms default
         self._sim_roi: Tuple[int, int, int, int, int, int] = (0, 2048, 0, 2048, 1, 1)
         self._sim_readout_speed: str = "fast"
+        self._sim_frame_counter: int = 0
+        self._sim_grid_cache: Optional[Tuple[int, int, np.ndarray, np.ndarray]] = None
 
     def _log(self, message: str):
         if self._log_cb is not None:
@@ -242,6 +244,113 @@ class OrcaFlashCamera:
                 return float(temp) if temp is not None else None
             except Exception:
                 return None
+
+    # ==========================================================================
+    # Image Acquisition
+    # ==========================================================================
+
+    def snap_frame(
+        self,
+        timeout_s: Optional[float] = None,
+        stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
+    ) -> np.ndarray:
+        """
+        Acquires a single 2D image frame (`uint16`) from the camera.
+
+        Parameters
+        ----------
+        timeout_s : float, optional
+            Maximum time to wait for the frame in seconds. Defaults to `max(5.0, exposure_s + 5.0)`.
+        stage_pos_um : dict, optional
+            Optional stage coordinates `{'X': x, 'Y': y, 'Z': z}` (used in Simulation Mode
+            to modulate synthetic Brillouin shift and fringe intensity with stage position).
+
+        Returns
+        -------
+        frame : numpy.ndarray
+            2D image array (`uint16`, shape `(H, W)`).
+        """
+        with self._lock:
+            if not self._connected:
+                raise OrcaCameraError("Camera is not connected.")
+
+            exp_s = self.get_exposure()
+            if timeout_s is None:
+                timeout_s = max(5.0, exp_s * 1.5 + 5.0)
+
+            if self._simulate:
+                time.sleep(min(exp_s, 0.25))  # Cap simulated wait for responsive UI testing
+                frame = self._generate_simulated_frame(stage_pos_um=stage_pos_um)
+                self._log(
+                    f"Acquired simulated frame #{self._sim_frame_counter} "
+                    f"({frame.shape[1]}x{frame.shape[0]} px, uint16, min={frame.min()}, max={frame.max()})."
+                )
+                return frame
+
+            try:
+                t0 = time.time()
+                raw_frame = self._cam.snap(timeout=timeout_s)
+                elapsed_ms = (time.time() - t0) * 1e3
+                frame = np.asarray(raw_frame, dtype=np.uint16)
+                self._log(
+                    f"Acquired frame ({frame.shape[1]}x{frame.shape[0]} px, uint16) "
+                    f"in {elapsed_ms:.1f} ms [min={frame.min()}, max={frame.max()}]."
+                )
+                return frame
+            except Exception as exc:
+                raise OrcaCameraError(f"Failed to acquire frame from camera: {exc}") from exc
+
+    def _generate_simulated_frame(
+        self, stage_pos_um: Optional[Dict[str, Optional[float]]] = None
+    ) -> np.ndarray:
+        """
+        Generates a realistic synthetic 2D ar-VIPA Brillouin interferogram (`uint16`)
+        whose Brillouin satellite splitting and envelope vary smoothly with `(X, Y)` stage coordinates.
+        """
+        self._sim_frame_counter += 1
+        hstart, hend, vstart, vend, hbin, vbin = self._sim_roi
+        w = max(1, (hend - hstart) // max(1, hbin))
+        h = max(1, (vend - vstart) // max(1, vbin))
+
+        if self._sim_grid_cache is None or self._sim_grid_cache[0] != h or self._sim_grid_cache[1] != w:
+            yy, xx = np.indices((h, w), dtype=np.float32)
+            self._sim_grid_cache = (h, w, xx, yy)
+        else:
+            _, _, xx, yy = self._sim_grid_cache
+
+        x_um = float((stage_pos_um or {}).get("X") or 0.0)
+        y_um = float((stage_pos_um or {}).get("Y") or 0.0)
+
+        # Normalize detector coordinates to [-1, 1]
+        xn = (xx - 0.5 * w) / (0.5 * w)
+        yn = (yy - 0.5 * h) / (0.5 * h)
+
+        # Curved VIPA orders (parabolic curvature along y + non-linear dispersion along x)
+        order_phase = 6.0 * (xn + 1.05) - 0.45 * (xn + 1.05) ** 2 + 0.18 * (yn ** 2)
+        frac = order_phase - np.floor(order_phase)  # [0, 1) within each FSR
+
+        # Modulate Brillouin shift ratio slightly with stage (X, Y) so movement is visible
+        shift_frac = 0.18 + 0.03 * np.sin(x_um / 50.0) * np.cos(y_um / 50.0)
+        # Angular dependence along vertical axis yn
+        shift_y = shift_frac * np.sqrt(np.clip(1.0 - 0.25 * yn ** 2, 0.2, 1.0))
+
+        # Elastic Rayleigh peak at frac ~ 0 / 1 + Stokes & Anti-Stokes doublets at +/- shift_y
+        elastic = np.exp(-0.5 * (np.minimum(frac, 1.0 - frac) / 0.018) ** 2)
+        stokes = 0.42 * np.exp(-0.5 * ((frac - shift_y) / 0.026) ** 2)
+        antistokes = 0.42 * np.exp(-0.5 * ((frac - (1.0 - shift_y)) / 0.026) ** 2)
+
+        # 2D Gaussian illumination envelope (shifted slightly by stage position)
+        env_x0 = 0.08 * np.sin(x_um / 100.0)
+        env_y0 = 0.08 * np.cos(y_um / 100.0)
+        envelope = np.exp(-0.6 * ((xn - env_x0) ** 2 + (yn - env_y0) ** 2))
+
+        exp_scale = np.clip(self._sim_exposure_s / 0.050, 0.1, 10.0)
+        signal = (120.0 + 18000.0 * exp_scale * envelope * (elastic + stokes + antistokes)).astype(np.float32)
+
+        rng = np.random.default_rng(seed=1000 + self._sim_frame_counter)
+        noise = rng.normal(loc=0.0, scale=25.0, size=(h, w)).astype(np.float32)
+        frame = np.clip(signal + noise, 0, 65535).astype(np.uint16)
+        return frame
 
     def get_status(self) -> Dict[str, object]:
         """Returns a complete snapshot of the camera connection state and parameters."""
