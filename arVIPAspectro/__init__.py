@@ -11,6 +11,7 @@ from . import q_vector
 from . import q_vector_extraction
 from . import plotting
 from . import hardware
+from . import acquisition_pipeline
 
 __version__ = "0.1.0"
 
@@ -24,4 +25,5 @@ __all__ = [
     'q_vector_extraction',
     'plotting',
     'hardware',
+    'acquisition_pipeline',
 ]

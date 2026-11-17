@@ -20,6 +20,7 @@ from ..hardware import (
     count_dcam_cameras,
 )
 from .image_viewer import ImageViewerWidget
+from .pipeline_panel import PipelineAcquisitionWidget
 
 
 class HardwareActionWorker(QtCore.QThread):
@@ -133,9 +134,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(
-            "arVIPAspectro — Step 3: Drivable Acquisition Parameters (Orca Flash 4.0 v3 & ASI MS-2000)"
+            "arVIPAspectro — Step 4: Acquisition Pipeline & Spatial Mapping (Orca Flash 4.0 v3 & ASI MS-2000)"
         )
-        self.resize(1420, 880)
+        self.resize(1460, 900)
 
         self._worker: Optional[HardwareActionWorker] = None
         self._live_running: bool = False
@@ -165,7 +166,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Top Header Bar
         top_bar = QtWidgets.QHBoxLayout()
         title_lbl = QtWidgets.QLabel(
-            "Step 3 — Hardware Connection, Stage Motion & Drivable Camera Parameters"
+            "Step 4 — Hardware Control, Calibration Spectra & Spatial Map Acquisition"
         )
         title_font = title_lbl.font()
         title_font.setPointSize(13)
@@ -198,36 +199,51 @@ class MainWindow(QtWidgets.QMainWindow):
         viewer_layout.addWidget(self.image_viewer)
         splitter.addWidget(viewer_box)
 
-        # --- RIGHT PANEL: Steps 1, 2, 3 Controls + Log ---
+        # --- RIGHT PANEL: Tabbed Controls (Tab 1: Steps 1-3 Hardware/Camera/Stage, Tab 2: Step 4 Pipeline) + Log ---
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setContentsMargins(4, 0, 0, 0)
         right_layout.setSpacing(8)
 
+        self.tabs_right = QtWidgets.QTabWidget()
+
+        # Tab 1: Steps 1, 2, 3 (Hardware Connections, Camera Parameters, Stage Motion & Live Preview)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll_content = QtWidgets.QWidget()
         scroll_vbox = QtWidgets.QVBoxLayout(scroll_content)
-        scroll_vbox.setContentsMargins(0, 0, 4, 0)
+        scroll_vbox.setContentsMargins(4, 4, 4, 4)
         scroll_vbox.setSpacing(8)
 
-        # Step 1: Side-by-side compact Camera & Stage Connection cards
         conn_row = QtWidgets.QHBoxLayout()
         conn_row.setSpacing(8)
         conn_row.addWidget(self._build_camera_card(), stretch=1)
         conn_row.addWidget(self._build_stage_card(), stretch=1)
         scroll_vbox.addLayout(conn_row)
 
-        # Step 3: Drivable Camera Acquisition Parameters Card
         scroll_vbox.addWidget(self._build_step3_camera_parameters_card())
-
-        # Step 2: Stage Motion & Image Capture Card
         scroll_vbox.addWidget(self._build_step2_motion_and_capture_card())
         scroll_vbox.addStretch()
 
         scroll.setWidget(scroll_content)
-        right_layout.addWidget(scroll, stretch=3)
+        self.tabs_right.addTab(scroll, "🔧 Steps 1–3: Hardware, Camera & Stage")
+
+        # Tab 2: Step 4 (Guided Calibration Prompt & Spatial Map Acquisition)
+        self.pipeline_panel = PipelineAcquisitionWidget(
+            camera=self.camera,
+            stage=self.stage,
+            stop_live_callback=self._stop_live_if_running,
+            parent=self,
+        )
+        self.pipeline_panel.sig_log.connect(self._append_log_slot)
+        self.pipeline_panel.sig_display_frame.connect(self._on_frame_acquired)
+        self.pipeline_panel.sig_stage_updated.connect(self._update_stage_ui)
+        self.pipeline_panel.sig_camera_updated.connect(self._update_camera_ui)
+        self.pipeline_panel.sig_lock_geometry.connect(self.chk_lock_geometry.setChecked)
+        self.tabs_right.addTab(self.pipeline_panel, "🧭 Step 4: Acquisition Pipeline & Mapping")
+
+        right_layout.addWidget(self.tabs_right, stretch=3)
 
         # Bottom Hardware Log
         log_group = QtWidgets.QGroupBox("Hardware Communication Log")
@@ -1044,6 +1060,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         busy = bool(self._worker and self._worker.isRunning() and not self._live_running)
         self._set_motion_controls_enabled(not busy)
+        if hasattr(self, "pipeline_panel"):
+            self.pipeline_panel._update_map_summary()
 
     def _update_stage_ui(self):
         try:
@@ -1074,6 +1092,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         busy = bool(self._worker and self._worker.isRunning() and not self._live_running)
         self._set_motion_controls_enabled(not busy)
+        if hasattr(self, "pipeline_panel"):
+            self.pipeline_panel._update_map_summary()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         """Ensure hardware connections are cleanly closed when exiting the GUI."""

@@ -436,6 +436,7 @@ class OrcaFlashCamera:
         n_frames: Optional[int] = None,
         timeout_s: Optional[float] = None,
         stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
+        sim_spectrum_type: str = "sample",
     ) -> np.ndarray:
         """
         Acquires a 2D image frame (`uint16`) from the camera.
@@ -450,6 +451,10 @@ class OrcaFlashCamera:
             Per-frame timeout in seconds. Defaults to `max(5.0, exposure_s * 1.5 + 5.0)`.
         stage_pos_um : dict, optional
             Optional stage coordinates `{'X': x, 'Y': y, 'Z': z}` (used in Simulation Mode).
+        sim_spectrum_type : str, optional
+            In Simulation Mode, controls the synthetic spectrum profile:
+            `'laser'` (monochromatic VIPA fringes), `'rb'` (Rubidium hyperfine absorption),
+            or `'sample'` (Rayleigh + Stokes/Anti-Stokes Brillouin doublets).
 
         Returns
         -------
@@ -472,19 +477,26 @@ class OrcaFlashCamera:
                 t0 = time.time()
                 time.sleep(min(exp_s * n_frames, 0.25))
                 if n_frames == 1:
-                    frame = self._generate_simulated_frame(stage_pos_um=stage_pos_um)
-                else:
-                    acc = np.zeros_like(
-                        self._generate_simulated_frame(stage_pos_um=stage_pos_um),
-                        dtype=np.float64,
+                    frame = self._generate_simulated_frame(
+                        stage_pos_um=stage_pos_um,
+                        spectrum_type=sim_spectrum_type,
                     )
-                    for _ in range(n_frames):
-                        acc += self._generate_simulated_frame(stage_pos_um=stage_pos_um)
+                else:
+                    first = self._generate_simulated_frame(
+                        stage_pos_um=stage_pos_um,
+                        spectrum_type=sim_spectrum_type,
+                    )
+                    acc = first.astype(np.float64)
+                    for _ in range(n_frames - 1):
+                        acc += self._generate_simulated_frame(
+                            stage_pos_um=stage_pos_um,
+                            spectrum_type=sim_spectrum_type,
+                        )
                     frame = np.clip(np.rint(acc / n_frames), 0, 65535).astype(np.uint16)
 
                 elapsed_ms = (time.time() - t0) * 1e3
                 self._log(
-                    f"Acquired simulated frame ({frame.shape[1]}x{frame.shape[0]} px, "
+                    f"Acquired simulated [{sim_spectrum_type}] frame ({frame.shape[1]}x{frame.shape[0]} px, "
                     f"avg={n_frames}, {elapsed_ms:.1f} ms) [min={frame.min()}, max={frame.max()}]."
                 )
                 return frame
@@ -511,7 +523,9 @@ class OrcaFlashCamera:
                 raise OrcaCameraError(f"Failed to acquire frame from camera: {exc}") from exc
 
     def _generate_simulated_frame(
-        self, stage_pos_um: Optional[Dict[str, Optional[float]]] = None
+        self,
+        stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
+        spectrum_type: str = "sample",
     ) -> np.ndarray:
         """
         Generates a realistic synthetic 2D ar-VIPA Brillouin interferogram (`uint16`)
@@ -544,21 +558,35 @@ class OrcaFlashCamera:
         order_phase = 6.0 * (xn + 1.05) - 0.45 * (xn + 1.05) ** 2 + 0.18 * (yn ** 2)
         frac = order_phase - np.floor(order_phase)
 
-        # Modulate Brillouin shift ratio slightly with stage (X, Y)
-        shift_frac = 0.18 + 0.03 * np.sin(x_um / 50.0) * np.cos(y_um / 50.0)
-        shift_y = shift_frac * np.sqrt(np.clip(1.0 - 0.25 * yn ** 2, 0.2, 1.0))
+        mode = str(spectrum_type).lower().strip()
+        if mode == "laser":
+            # Pure monochromatic laser reference fringes (sharp elastic peaks only)
+            spectral_profile = 1.4 * np.exp(-0.5 * (np.minimum(frac, 1.0 - frac) / 0.015) ** 2)
+            env_x0, env_y0 = 0.0, 0.0
+        elif mode == "rb":
+            # Broadband continuum modulated by Rubidium hyperfine absorption dips
+            continuum = 0.75 + 0.25 * np.cos(2.0 * np.pi * frac)
+            dip1 = 0.55 * np.exp(-0.5 * ((frac - 0.36) / 0.022) ** 2)
+            dip2 = 0.65 * np.exp(-0.5 * ((frac - 0.46) / 0.024) ** 2)
+            dip3 = 0.35 * np.exp(-0.5 * ((frac - 0.58) / 0.018) ** 2)
+            dip4 = 0.28 * np.exp(-0.5 * ((frac - 0.26) / 0.018) ** 2)
+            spectral_profile = np.clip(continuum - (dip1 + dip2 + dip3 + dip4), 0.05, 1.5)
+            env_x0, env_y0 = 0.0, 0.0
+        else:
+            # Sample spectrum: Elastic Rayleigh peak + Stokes & Anti-Stokes Brillouin doublets
+            shift_frac = 0.18 + 0.03 * np.sin(x_um / 50.0) * np.cos(y_um / 50.0)
+            shift_y = shift_frac * np.sqrt(np.clip(1.0 - 0.25 * yn ** 2, 0.2, 1.0))
+            elastic = np.exp(-0.5 * (np.minimum(frac, 1.0 - frac) / 0.018) ** 2)
+            stokes = 0.42 * np.exp(-0.5 * ((frac - shift_y) / 0.026) ** 2)
+            antistokes = 0.42 * np.exp(-0.5 * ((frac - (1.0 - shift_y)) / 0.026) ** 2)
+            spectral_profile = elastic + stokes + antistokes
+            env_x0 = 0.08 * np.sin(x_um / 100.0)
+            env_y0 = 0.08 * np.cos(y_um / 100.0)
 
-        # Elastic Rayleigh peak + Stokes & Anti-Stokes doublets
-        elastic = np.exp(-0.5 * (np.minimum(frac, 1.0 - frac) / 0.018) ** 2)
-        stokes = 0.42 * np.exp(-0.5 * ((frac - shift_y) / 0.026) ** 2)
-        antistokes = 0.42 * np.exp(-0.5 * ((frac - (1.0 - shift_y)) / 0.026) ** 2)
-
-        env_x0 = 0.08 * np.sin(x_um / 100.0)
-        env_y0 = 0.08 * np.cos(y_um / 100.0)
         envelope = np.exp(-0.6 * ((xn - env_x0) ** 2 + (yn - env_y0) ** 2))
 
         exp_scale = np.clip(self._sim_exposure_s / 0.050, 0.02, 20.0) * (hbin * vbin)
-        signal = (120.0 + 18000.0 * exp_scale * envelope * (elastic + stokes + antistokes)).astype(np.float32)
+        signal = (120.0 + 18000.0 * exp_scale * envelope * spectral_profile).astype(np.float32)
 
         noise_std = 12.0 if self._sim_readout_speed == "slow" else 25.0
         rng = np.random.default_rng(seed=1000 + self._sim_frame_counter)

@@ -1,0 +1,992 @@
+"""
+Step 4 GUI Panel & Worker (`arVIPAspectro/gui/pipeline_panel.py`):
+Guided acquisition workflow for:
+  1. Opening / creating the HDF5_BLS container (`Measures.h5`)
+  2. Prompting & acquiring (or loading) `laser_reference`, `Rb_absorption`,
+     and optional `reference_sample` into `Brillouin/Calibration/<role>/image`
+  3. Configuring the 2D spatial map (`Nx, Ny, ΔX, ΔY` or Corner A / Corner B,
+     point exposure, frame averaging, Snake vs. Raster, optional 4D `Raw_data` saving)
+  4. Executing the automated 2D stage + camera map scan with Pause / Resume / Abort.
+"""
+
+import os
+import time
+from typing import Optional, Dict, Any, Callable
+import numpy as np
+from PySide6 import QtWidgets, QtCore
+
+from ..hardware import MS2000Stage, OrcaFlashCamera
+from ..acquisition_pipeline import AcquisitionSession, MapGridConfig
+
+
+def _format_bytes(num_bytes: int) -> str:
+    val = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024.0 or unit == "TB":
+            return f"{val:.2f} {unit}" if unit in ("MB", "GB", "TB") else f"{val:.0f} {unit}"
+        val /= 1024.0
+    return f"{val:.2f} TB"
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60.0:
+        return f"{seconds:.1f} s"
+    m, s = divmod(int(round(seconds)), 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s"
+
+
+class CalibrationCaptureWorker(QtCore.QThread):
+    """
+    Background worker that applies the requested exposure & frame averaging,
+    snaps a calibration image (`laser_reference`, `Rb_absorption`, or `reference_sample`),
+    and saves it into `Brillouin/Calibration/<role>/image` in the HDF5_BLS session.
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_captured = QtCore.Signal(str, object, object, float, int, int)  # (role, frame, pos, exp_s, n_avg, binning)
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(
+        self,
+        session: AcquisitionSession,
+        camera: OrcaFlashCamera,
+        stage: MS2000Stage,
+        role: str,
+        exposure_ms: float,
+        n_avg: int,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.session = session
+        self.camera = camera
+        self.stage = stage
+        self.role = role
+        self.exposure_ms = exposure_ms
+        self.n_avg = n_avg
+
+    def run(self):
+        try:
+            exp_s = self.camera.set_exposure(float(self.exposure_ms) / 1000.0)
+            n_avg = self.camera.set_frame_averaging(int(self.n_avg))
+            roi = self.camera.get_roi()
+            binning = int(roi[4])
+
+            pos = None
+            if self.stage.is_connected:
+                try:
+                    pos = self.stage.get_position()
+                except Exception:
+                    pos = None
+
+            sim_type_map = {
+                AcquisitionSession.ROLE_LASER: "laser",
+                AcquisitionSession.ROLE_RB: "rb",
+                AcquisitionSession.ROLE_REF_SAMPLE: "sample",
+            }
+            sim_type = sim_type_map.get(self.role, "sample")
+
+            self.sig_log.emit(
+                f"Acquiring '{self.role}' (Exp={exp_s*1e3:.2f} ms, Avg={n_avg})..."
+            )
+            frame = self.camera.snap_frame(
+                n_frames=n_avg,
+                stage_pos_um=pos,
+                sim_spectrum_type=sim_type,
+            )
+
+            self.session.save_calibration_image(
+                role=self.role,
+                image=frame,
+                exposure_s=exp_s,
+                n_avg=n_avg,
+                roi=roi,
+                stage_pos_um=pos,
+            )
+            self.sig_log.emit(
+                f"Saved '{self.role}' to HDF5: Brillouin/Calibration/{self.role}/image "
+                f"({frame.shape[1]}x{frame.shape[0]} px)."
+            )
+            self.sig_captured.emit(self.role, frame, pos, exp_s, n_avg, binning)
+        except Exception as exc:
+            self.sig_error.emit(f"Calibration Capture Error ({self.role})", str(exc))
+
+
+class MapScanWorker(QtCore.QThread):
+    """
+    Background worker that executes the 2D spatial map scan across the ASI MS-2000 grid,
+    acquiring an Orca Flash 4.0 v3 frame at each point `(iy, ix)` and persisting
+    measured coordinates and optional raw frames to `Brillouin/<Map_name>` in the HDF5 file.
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_progress = QtCore.Signal(int, int, int, int, float, float)  # (step_idx, total, iy, ix, x_um, y_um)
+    sig_stage_updated = QtCore.Signal()
+    sig_point_acquired = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
+    sig_finished_map = QtCore.Signal(str, int)                           # (map_group_path, points_completed)
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(
+        self,
+        session: AcquisitionSession,
+        camera: OrcaFlashCamera,
+        stage: MS2000Stage,
+        map_name: str,
+        grid: MapGridConfig,
+        exposure_ms: float,
+        n_avg: int,
+        settling_ms: float,
+        save_raw_data: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.session = session
+        self.camera = camera
+        self.stage = stage
+        self.map_name = map_name
+        self.grid = grid
+        self.exposure_ms = exposure_ms
+        self.n_avg = n_avg
+        self.settling_ms = settling_ms
+        self.save_raw_data = save_raw_data
+
+        self._pause_requested = False
+        self._abort_requested = False
+
+    def request_pause(self, paused: bool):
+        self._pause_requested = bool(paused)
+
+    def request_abort(self):
+        self._abort_requested = True
+        self._pause_requested = False
+
+    def run(self):
+        try:
+            exp_s = self.camera.set_exposure(float(self.exposure_ms) / 1000.0)
+            n_avg = self.camera.set_frame_averaging(int(self.n_avg))
+            roi = self.camera.get_roi()
+            binning = int(roi[4])
+            out_w = (roi[1] - roi[0]) // max(1, binning)
+            out_h = (roi[3] - roi[2]) // max(1, binning)
+            frame_shape = (out_h, out_w)
+
+            # Initialize HDF5 Measure group and pre-allocate datasets
+            map_group_path = self.session.initialize_map_group(
+                map_name=self.map_name,
+                grid=self.grid,
+                frame_shape=frame_shape,
+                exposure_s=exp_s,
+                n_avg=n_avg,
+                roi=roi,
+                save_raw_data=self.save_raw_data,
+                overwrite=True,
+            )
+
+            trajectory = self.grid.build_trajectory()
+            total_pts = len(trajectory)
+            settling_s = max(0.0, float(self.settling_ms) / 1000.0)
+
+            self.sig_log.emit(
+                f"Starting Map '{map_group_path}': {self.grid.nx}x{self.grid.ny} = {total_pts} point(s), "
+                f"pattern={self.grid.scan_pattern}, Exp={exp_s*1e3:.2f} ms x {n_avg}, "
+                f"Save Raw Data={self.save_raw_data}."
+            )
+
+            completed = 0
+            for idx, (iy, ix, target_y_um, target_x_um) in enumerate(trajectory, start=1):
+                # Handle Pause
+                while self._pause_requested and not self._abort_requested:
+                    time.sleep(0.05)
+
+                if self._abort_requested:
+                    self.sig_log.emit(f"Map scan aborted by user at point {idx}/{total_pts}.")
+                    break
+
+                # 1. Move stage to (target_x_um, target_y_um)
+                pos = self.stage.move_to(x_um=target_x_um, y_um=target_y_um, wait=True)
+                self.sig_stage_updated.emit()
+
+                if settling_s > 0:
+                    time.sleep(settling_s)
+
+                if self._abort_requested:
+                    self.sig_log.emit(f"Map scan aborted by user at point {idx}/{total_pts}.")
+                    break
+
+                # 2. Acquire camera frame
+                frame = self.camera.snap_frame(
+                    n_frames=n_avg,
+                    stage_pos_um=pos,
+                    sim_spectrum_type="sample",
+                )
+
+                # 3. Write point data to HDF5
+                self.session.write_map_point(
+                    map_group_path=map_group_path,
+                    iy=iy,
+                    ix=ix,
+                    x_meas_um=pos.get("X"),
+                    y_meas_um=pos.get("Y"),
+                    frame=frame,
+                    save_raw_data=self.save_raw_data,
+                )
+
+                completed += 1
+                self.sig_point_acquired.emit(frame, pos, exp_s, n_avg, binning)
+                self.sig_progress.emit(
+                    idx,
+                    total_pts,
+                    iy,
+                    ix,
+                    float(pos.get("X") or target_x_um),
+                    float(pos.get("Y") or target_y_um),
+                )
+
+            self.sig_finished_map.emit(map_group_path, completed)
+
+        except Exception as exc:
+            self.sig_error.emit("Map Acquisition Error", str(exc))
+
+
+class PipelineAcquisitionWidget(QtWidgets.QWidget):
+    """
+    Step 4 UI Widget:
+      - 4A: HDF5_BLS File & Calibration Spectra Acquisition (Laser Reference, Rb Absorption, Ref Sample)
+      - 4B: 2D Spatial Map Definition (Grid / Corners, Exposure, Optional Raw Data) & Scan Execution
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_display_frame = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
+    sig_stage_updated = QtCore.Signal()
+    sig_camera_updated = QtCore.Signal()
+    sig_lock_geometry = QtCore.Signal(bool)
+
+    def __init__(
+        self,
+        camera: OrcaFlashCamera,
+        stage: MS2000Stage,
+        stop_live_callback: Callable[[], None],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.camera = camera
+        self.stage = stage
+        self._stop_live_cb = stop_live_callback
+        self.session = AcquisitionSession()
+
+        self._cal_worker: Optional[CalibrationCaptureWorker] = None
+        self._map_worker: Optional[MapScanWorker] = None
+        self._map_paused: bool = False
+
+        # Taught corners (X, Y) in µm
+        self._corner_a: Optional[Tuple[float, float]] = None
+        self._corner_b: Optional[Tuple[float, float]] = None
+
+        self._build_ui()
+        self._update_calibration_badges()
+        self._update_map_summary()
+
+    # ==========================================================================
+    # UI Construction
+    # ==========================================================================
+
+    def _build_ui(self):
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(2, 2, 6, 2)
+        layout.setSpacing(8)
+
+        layout.addWidget(self._build_h5_session_card())
+        layout.addWidget(self._build_calibration_prompt_card())
+        layout.addWidget(self._build_map_configuration_card())
+        layout.addStretch()
+
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
+
+    def _build_h5_session_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("4A. HDF5_BLS Session Container")
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(6)
+
+        row = QtWidgets.QHBoxLayout()
+        self.txt_h5_path = QtWidgets.QLineEdit()
+        default_path = os.path.abspath("Measures.h5")
+        self.txt_h5_path.setText(default_path)
+        self.txt_h5_path.setPlaceholderText("Path to output/existing .h5 file...")
+
+        self.btn_browse_h5 = QtWidgets.QPushButton("Browse / New...")
+        self.btn_browse_h5.clicked.connect(self._on_browse_h5)
+
+        self.btn_open_h5 = QtWidgets.QPushButton("Open / Create HDF5")
+        self.btn_open_h5.setStyleSheet("font-weight: bold;")
+        self.btn_open_h5.clicked.connect(self._on_open_or_create_h5)
+
+        row.addWidget(self.txt_h5_path, stretch=1)
+        row.addWidget(self.btn_browse_h5)
+        row.addWidget(self.btn_open_h5)
+        layout.addLayout(row)
+
+        self.lbl_h5_status = QtWidgets.QLabel("No HDF5 file opened yet. Click 'Open / Create HDF5' to begin.")
+        self.lbl_h5_status.setStyleSheet("font-size: 11px; color: #b0bec5;")
+        layout.addWidget(self.lbl_h5_status)
+        return box
+
+    def _build_calibration_prompt_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox(
+            "4B. Step-by-Step Calibration Spectra (Brillouin/Calibration/<role>/image)"
+        )
+        grid = QtWidgets.QGridLayout(box)
+        grid.setSpacing(6)
+
+        grid.addWidget(QtWidgets.QLabel("<b>Spectrum Role</b>"), 0, 0)
+        grid.addWidget(QtWidgets.QLabel("<b>Exposure</b>"), 0, 1)
+        grid.addWidget(QtWidgets.QLabel("<b>Avg</b>"), 0, 2)
+        grid.addWidget(QtWidgets.QLabel("<b>Acquire</b>"), 0, 3)
+        grid.addWidget(QtWidgets.QLabel("<b>Preview</b>"), 0, 4)
+        grid.addWidget(QtWidgets.QLabel("<b>Status</b>"), 0, 5)
+
+        # Row 1: Laser Reference
+        grid.addWidget(QtWidgets.QLabel("1. Laser Reference:"), 1, 0)
+        self.spin_laser_exp = QtWidgets.QDoubleSpinBox()
+        self.spin_laser_exp.setDecimals(2)
+        self.spin_laser_exp.setRange(0.02, 30000.0)
+        self.spin_laser_exp.setValue(20.0)
+        self.spin_laser_exp.setSuffix(" ms")
+        grid.addWidget(self.spin_laser_exp, 1, 1)
+
+        self.spin_laser_avg = QtWidgets.QSpinBox()
+        self.spin_laser_avg.setRange(1, 500)
+        self.spin_laser_avg.setValue(1)
+        grid.addWidget(self.spin_laser_avg, 1, 2)
+
+        self.btn_acq_laser = QtWidgets.QPushButton("📷 Acquire Laser")
+        self.btn_acq_laser.clicked.connect(
+            lambda: self._on_acquire_calibration(
+                AcquisitionSession.ROLE_LASER,
+                self.spin_laser_exp.value(),
+                self.spin_laser_avg.value(),
+            )
+        )
+        grid.addWidget(self.btn_acq_laser, 1, 3)
+
+        self.btn_view_laser = QtWidgets.QPushButton("👁 View")
+        self.btn_view_laser.clicked.connect(lambda: self._on_view_calibration(AcquisitionSession.ROLE_LASER))
+        grid.addWidget(self.btn_view_laser, 1, 4)
+
+        self.lbl_status_laser = QtWidgets.QLabel("MISSING")
+        self.lbl_status_laser.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_status_laser.setMinimumWidth(95)
+        grid.addWidget(self.lbl_status_laser, 1, 5)
+
+        # Row 2: Rubidium Absorption
+        grid.addWidget(QtWidgets.QLabel("2. Rb Absorption:"), 2, 0)
+        self.spin_rb_exp = QtWidgets.QDoubleSpinBox()
+        self.spin_rb_exp.setDecimals(2)
+        self.spin_rb_exp.setRange(0.02, 30000.0)
+        self.spin_rb_exp.setValue(50.0)
+        self.spin_rb_exp.setSuffix(" ms")
+        grid.addWidget(self.spin_rb_exp, 2, 1)
+
+        self.spin_rb_avg = QtWidgets.QSpinBox()
+        self.spin_rb_avg.setRange(1, 500)
+        self.spin_rb_avg.setValue(1)
+        grid.addWidget(self.spin_rb_avg, 2, 2)
+
+        self.btn_acq_rb = QtWidgets.QPushButton("📷 Acquire Rb")
+        self.btn_acq_rb.clicked.connect(
+            lambda: self._on_acquire_calibration(
+                AcquisitionSession.ROLE_RB,
+                self.spin_rb_exp.value(),
+                self.spin_rb_avg.value(),
+            )
+        )
+        grid.addWidget(self.btn_acq_rb, 2, 3)
+
+        self.btn_view_rb = QtWidgets.QPushButton("👁 View")
+        self.btn_view_rb.clicked.connect(lambda: self._on_view_calibration(AcquisitionSession.ROLE_RB))
+        grid.addWidget(self.btn_view_rb, 2, 4)
+
+        self.lbl_status_rb = QtWidgets.QLabel("MISSING")
+        self.lbl_status_rb.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_status_rb.setMinimumWidth(95)
+        grid.addWidget(self.lbl_status_rb, 2, 5)
+
+        # Row 3: Reference Sample (Optional, e.g. Water / Polystyrene)
+        grid.addWidget(QtWidgets.QLabel("3. Ref Sample (opt):"), 3, 0)
+        self.spin_ref_exp = QtWidgets.QDoubleSpinBox()
+        self.spin_ref_exp.setDecimals(2)
+        self.spin_ref_exp.setRange(0.02, 30000.0)
+        self.spin_ref_exp.setValue(500.0)
+        self.spin_ref_exp.setSuffix(" ms")
+        grid.addWidget(self.spin_ref_exp, 3, 1)
+
+        self.spin_ref_avg = QtWidgets.QSpinBox()
+        self.spin_ref_avg.setRange(1, 500)
+        self.spin_ref_avg.setValue(1)
+        grid.addWidget(self.spin_ref_avg, 3, 2)
+
+        self.btn_acq_ref = QtWidgets.QPushButton("📷 Acquire Ref")
+        self.btn_acq_ref.clicked.connect(
+            lambda: self._on_acquire_calibration(
+                AcquisitionSession.ROLE_REF_SAMPLE,
+                self.spin_ref_exp.value(),
+                self.spin_ref_avg.value(),
+            )
+        )
+        grid.addWidget(self.btn_acq_ref, 3, 3)
+
+        self.btn_view_ref = QtWidgets.QPushButton("👁 View")
+        self.btn_view_ref.clicked.connect(lambda: self._on_view_calibration(AcquisitionSession.ROLE_REF_SAMPLE))
+        grid.addWidget(self.btn_view_ref, 3, 4)
+
+        self.lbl_status_ref = QtWidgets.QLabel("OPTIONAL")
+        self.lbl_status_ref.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_status_ref.setMinimumWidth(95)
+        grid.addWidget(self.lbl_status_ref, 3, 5)
+
+        return box
+
+    def _build_map_configuration_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("4C. Spatial Map Configuration & Scan Execution (Brillouin/<Map_name>)")
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(8)
+
+        # 1. Map Name + Point Exposure + Averaging
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.addWidget(QtWidgets.QLabel("Map Name:"))
+        self.txt_map_name = QtWidgets.QLineEdit("Map_01")
+        self.txt_map_name.setMaximumWidth(130)
+        top_row.addWidget(self.txt_map_name)
+
+        top_row.addSpacing(8)
+        top_row.addWidget(QtWidgets.QLabel("Point Exposure:"))
+        self.spin_map_exp = QtWidgets.QDoubleSpinBox()
+        self.spin_map_exp.setDecimals(2)
+        self.spin_map_exp.setRange(0.02, 30000.0)
+        self.spin_map_exp.setValue(100.0)
+        self.spin_map_exp.setSuffix(" ms")
+        self.spin_map_exp.valueChanged.connect(self._update_map_summary)
+        top_row.addWidget(self.spin_map_exp)
+
+        top_row.addSpacing(8)
+        top_row.addWidget(QtWidgets.QLabel("Avg:"))
+        self.spin_map_avg = QtWidgets.QSpinBox()
+        self.spin_map_avg.setRange(1, 500)
+        self.spin_map_avg.setValue(1)
+        self.spin_map_avg.setSuffix(" frame(s)")
+        self.spin_map_avg.valueChanged.connect(self._update_map_summary)
+        top_row.addWidget(self.spin_map_avg)
+        top_row.addStretch()
+        layout.addLayout(top_row)
+
+        # 2. Grid Coordinates & Step Sizes
+        grid_form = QtWidgets.QGridLayout()
+        grid_form.setSpacing(6)
+
+        grid_form.addWidget(QtWidgets.QLabel("Start X₀:"), 0, 0)
+        self.spin_x_start = QtWidgets.QDoubleSpinBox()
+        self.spin_x_start.setDecimals(2)
+        self.spin_x_start.setRange(-100000.0, 100000.0)
+        self.spin_x_start.setValue(0.0)
+        self.spin_x_start.setSuffix(" µm")
+        self.spin_x_start.valueChanged.connect(self._update_map_summary)
+        grid_form.addWidget(self.spin_x_start, 0, 1)
+
+        grid_form.addWidget(QtWidgets.QLabel("Step ΔX:"), 0, 2)
+        self.spin_dx = QtWidgets.QDoubleSpinBox()
+        self.spin_dx.setDecimals(2)
+        self.spin_dx.setRange(-50000.0, 50000.0)
+        self.spin_dx.setValue(25.0)
+        self.spin_dx.setSuffix(" µm")
+        self.spin_dx.valueChanged.connect(self._update_map_summary)
+        grid_form.addWidget(self.spin_dx, 0, 3)
+
+        grid_form.addWidget(QtWidgets.QLabel("Points Nx:"), 0, 4)
+        self.spin_nx = QtWidgets.QSpinBox()
+        self.spin_nx.setRange(1, 5000)
+        self.spin_nx.setValue(4)
+        self.spin_nx.valueChanged.connect(self._update_map_summary)
+        grid_form.addWidget(self.spin_nx, 0, 5)
+
+        grid_form.addWidget(QtWidgets.QLabel("Start Y₀:"), 1, 0)
+        self.spin_y_start = QtWidgets.QDoubleSpinBox()
+        self.spin_y_start.setDecimals(2)
+        self.spin_y_start.setRange(-100000.0, 100000.0)
+        self.spin_y_start.setValue(0.0)
+        self.spin_y_start.setSuffix(" µm")
+        self.spin_y_start.valueChanged.connect(self._update_map_summary)
+        grid_form.addWidget(self.spin_y_start, 1, 1)
+
+        grid_form.addWidget(QtWidgets.QLabel("Step ΔY:"), 1, 2)
+        self.spin_dy = QtWidgets.QDoubleSpinBox()
+        self.spin_dy.setDecimals(2)
+        self.spin_dy.setRange(-50000.0, 50000.0)
+        self.spin_dy.setValue(25.0)
+        self.spin_dy.setSuffix(" µm")
+        self.spin_dy.valueChanged.connect(self._update_map_summary)
+        grid_form.addWidget(self.spin_dy, 1, 3)
+
+        grid_form.addWidget(QtWidgets.QLabel("Points Ny:"), 1, 4)
+        self.spin_ny = QtWidgets.QSpinBox()
+        self.spin_ny.setRange(1, 5000)
+        self.spin_ny.setValue(4)
+        self.spin_ny.valueChanged.connect(self._update_map_summary)
+        grid_form.addWidget(self.spin_ny, 1, 5)
+
+        layout.addLayout(grid_form)
+
+        # 3. Stage Teaching Helpers (Set Start / Teach Corner A & Corner B)
+        teach_row = QtWidgets.QHBoxLayout()
+        self.btn_set_start_current = QtWidgets.QPushButton("Set (X₀, Y₀) from Current Stage")
+        self.btn_set_start_current.clicked.connect(self._on_set_start_from_stage)
+        teach_row.addWidget(self.btn_set_start_current)
+
+        self.btn_teach_a = QtWidgets.QPushButton("Teach Corner A")
+        self.btn_teach_a.clicked.connect(self._on_teach_corner_a)
+        teach_row.addWidget(self.btn_teach_a)
+
+        self.btn_teach_b = QtWidgets.QPushButton("Teach Corner B -> Compute Grid")
+        self.btn_teach_b.clicked.connect(self._on_teach_corner_b)
+        teach_row.addWidget(self.btn_teach_b)
+        teach_row.addStretch()
+        layout.addLayout(teach_row)
+
+        # 4. Scan Pattern, Settling Delay & Optional Raw Data Saving
+        opt_row = QtWidgets.QHBoxLayout()
+        opt_row.addWidget(QtWidgets.QLabel("Pattern:"))
+        self.combo_pattern = QtWidgets.QComboBox()
+        self.combo_pattern.addItem("Snake / Serpentine (Alternating X)", "snake")
+        self.combo_pattern.addItem("Raster (Unidirectional X)", "raster")
+        self.combo_pattern.currentIndexChanged.connect(self._update_map_summary)
+        opt_row.addWidget(self.combo_pattern)
+
+        opt_row.addSpacing(8)
+        opt_row.addWidget(QtWidgets.QLabel("Settling:"))
+        self.spin_map_settling = QtWidgets.QSpinBox()
+        self.spin_map_settling.setRange(0, 5000)
+        self.spin_map_settling.setValue(50)
+        self.spin_map_settling.setSuffix(" ms")
+        self.spin_map_settling.valueChanged.connect(self._update_map_summary)
+        opt_row.addWidget(self.spin_map_settling)
+
+        opt_row.addSpacing(12)
+        self.chk_save_raw = QtWidgets.QCheckBox("Save 4D Raw Data Dataset (Ny×Nx×H×W) in HDF5")
+        self.chk_save_raw.setChecked(False)
+        self.chk_save_raw.toggled.connect(self._update_map_summary)
+        opt_row.addWidget(self.chk_save_raw)
+        opt_row.addStretch()
+        layout.addLayout(opt_row)
+
+        # 5. Live Map Summary Banner
+        self.lbl_map_summary = QtWidgets.QLabel("")
+        self.lbl_map_summary.setStyleSheet(
+            "background-color: #1e293b; color: #e2e8f0; font-family: monospace; "
+            "font-size: 11px; padding: 6px; border-radius: 4px;"
+        )
+        self.lbl_map_summary.setWordWrap(True)
+        layout.addWidget(self.lbl_map_summary)
+
+        # 6. Execution Controls & Progress Bar
+        exec_row = QtWidgets.QHBoxLayout()
+        self.btn_start_map = QtWidgets.QPushButton("▶ Start Map Acquisition")
+        self.btn_start_map.setMinimumHeight(32)
+        self.btn_start_map.setStyleSheet(
+            "background-color: #2e7d32; color: white; font-weight: bold; padding: 4px 12px;"
+        )
+        self.btn_start_map.clicked.connect(self._on_start_map)
+        exec_row.addWidget(self.btn_start_map)
+
+        self.btn_pause_map = QtWidgets.QPushButton("⏸ Pause")
+        self.btn_pause_map.setMinimumHeight(32)
+        self.btn_pause_map.setEnabled(False)
+        self.btn_pause_map.clicked.connect(self._on_toggle_pause_map)
+        exec_row.addWidget(self.btn_pause_map)
+
+        self.btn_abort_map = QtWidgets.QPushButton("⏹ Abort Map")
+        self.btn_abort_map.setMinimumHeight(32)
+        self.btn_abort_map.setEnabled(False)
+        self.btn_abort_map.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
+        self.btn_abort_map.clicked.connect(self._on_abort_map)
+        exec_row.addWidget(self.btn_abort_map)
+        layout.addLayout(exec_row)
+
+        self.progress_map = QtWidgets.QProgressBar()
+        self.progress_map.setRange(0, 100)
+        self.progress_map.setValue(0)
+        self.progress_map.setFormat("Idle — %p%")
+        layout.addWidget(self.progress_map)
+
+        return box
+
+    # ==========================================================================
+    # Event Handlers: HDF5 Session & Calibration Spectra
+    # ==========================================================================
+
+    def _on_browse_h5(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Select or Create HDF5_BLS Measures File",
+            self.txt_h5_path.text().strip() or "Measures.h5",
+            "HDF5 Files (*.h5 *.hdf5);;All Files (*)",
+            options=QtWidgets.QFileDialog.DontConfirmOverwrite,
+        )
+        if path:
+            self.txt_h5_path.setText(path)
+            self._on_open_or_create_h5()
+
+    def _on_open_or_create_h5(self):
+        path = self.txt_h5_path.text().strip()
+        if not path:
+            QtWidgets.QMessageBox.warning(self, "Invalid Path", "Please enter a valid HDF5 file path.")
+            return
+        try:
+            info = self.session.open_or_create_h5(path)
+            self.txt_h5_path.setText(info["h5_path"])
+            maps_str = ", ".join(info["existing_maps"]) if info["existing_maps"] else "none"
+            self.lbl_h5_status.setText(
+                f"Opened: {os.path.basename(info['h5_path'])}  |  "
+                f"Laser: {'✓' if info['has_laser'] else '—'}, "
+                f"Rb: {'✓' if info['has_rb'] else '—'}, "
+                f"Ref: {'✓' if info['has_ref_sample'] else '—'}  |  "
+                f"Maps: {maps_str}"
+            )
+            self.sig_log.emit(f"Opened HDF5_BLS container: {info['h5_path']}")
+            self._update_calibration_badges()
+        except Exception as exc:
+            self.sig_log.emit(f"ERROR opening HDF5: {exc}")
+            QtWidgets.QMessageBox.critical(self, "HDF5 Error", str(exc))
+
+    def _ensure_h5_open(self) -> bool:
+        if not self.session.is_open:
+            self._on_open_or_create_h5()
+        return self.session.is_open
+
+    def _on_acquire_calibration(self, role: str, exp_ms: float, n_avg: int):
+        if not self.camera.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Camera Not Connected", "Please connect the camera first.")
+            return
+        if not self._ensure_h5_open():
+            return
+        if self._is_busy():
+            return
+
+        self._stop_live_cb()
+        self._set_controls_busy(True)
+
+        self._cal_worker = CalibrationCaptureWorker(
+            session=self.session,
+            camera=self.camera,
+            stage=self.stage,
+            role=role,
+            exposure_ms=exp_ms,
+            n_avg=n_avg,
+            parent=self,
+        )
+        self._cal_worker.sig_log.connect(self.sig_log.emit)
+        self._cal_worker.sig_captured.connect(self._on_calibration_captured)
+        self._cal_worker.sig_error.connect(self._on_worker_error)
+        self._cal_worker.finished.connect(lambda: self._set_controls_busy(False))
+        self._cal_worker.start()
+
+    @QtCore.Slot(str, object, object, float, int, int)
+    def _on_calibration_captured(self, role: str, frame, pos, exp_s: float, n_avg: int, binning: int):
+        # Lock camera ROI & hardware binning once calibration spectrum is captured
+        self.sig_lock_geometry.emit(True)
+        self.sig_camera_updated.emit()
+        self.sig_display_frame.emit(frame, pos, exp_s, n_avg, binning)
+        self._update_calibration_badges()
+
+    def _on_view_calibration(self, role: str):
+        img = None
+        meta = {}
+        if role == AcquisitionSession.ROLE_LASER:
+            img, meta = self.session.laser_image, self.session.laser_meta
+        elif role == AcquisitionSession.ROLE_RB:
+            img, meta = self.session.rb_image, self.session.rb_meta
+        elif role == AcquisitionSession.ROLE_REF_SAMPLE:
+            img, meta = self.session.ref_sample_image, self.session.ref_sample_meta
+
+        if img is None:
+            QtWidgets.QMessageBox.information(self, "Not Available", f"No '{role}' image has been acquired or loaded yet.")
+            return
+
+        exp_s = float(meta.get("exposure_s", 0.05))
+        n_avg = int(meta.get("frame_averaging", 1))
+        binning = int(meta.get("hardware_binning", 1))
+        pos = None
+        if "stage_x_um" in meta and "stage_y_um" in meta:
+            pos = {"X": float(meta["stage_x_um"]), "Y": float(meta["stage_y_um"]), "Z": meta.get("stage_z_um")}
+        self.sig_display_frame.emit(img, pos, exp_s, n_avg, binning)
+        self.sig_log.emit(f"Displaying stored '{role}' calibration image ({img.shape[1]}x{img.shape[0]} px).")
+
+    def _update_calibration_badges(self):
+        def _style_badge(lbl: QtWidgets.QLabel, has_data: bool, optional: bool = False):
+            if has_data:
+                lbl.setText("✓ READY (H5)")
+                lbl.setStyleSheet(
+                    "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+                )
+            elif optional:
+                lbl.setText("OPTIONAL")
+                lbl.setStyleSheet(
+                    "background-color: #455a64; color: #cfd8dc; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+                )
+            else:
+                lbl.setText("MISSING")
+                lbl.setStyleSheet(
+                    "background-color: #c62828; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+                )
+
+        has_laser = self.session.laser_image is not None
+        has_rb = self.session.rb_image is not None
+        has_ref = self.session.ref_sample_image is not None
+
+        _style_badge(self.lbl_status_laser, has_laser, optional=False)
+        _style_badge(self.lbl_status_rb, has_rb, optional=False)
+        _style_badge(self.lbl_status_ref, has_ref, optional=True)
+
+        self.btn_view_laser.setEnabled(has_laser)
+        self.btn_view_rb.setEnabled(has_rb)
+        self.btn_view_ref.setEnabled(has_ref)
+
+    # ==========================================================================
+    # Event Handlers: Spatial Map Grid & Teaching
+    # ==========================================================================
+
+    def get_current_grid_config(self) -> MapGridConfig:
+        return MapGridConfig(
+            x_start_um=float(self.spin_x_start.value()),
+            y_start_um=float(self.spin_y_start.value()),
+            dx_um=float(self.spin_dx.value()),
+            dy_um=float(self.spin_dy.value()),
+            nx=int(self.spin_nx.value()),
+            ny=int(self.spin_ny.value()),
+            scan_pattern=str(self.combo_pattern.currentData() or "snake"),
+        )
+
+    def _on_set_start_from_stage(self):
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Connect the ASI MS-2000 stage first.")
+            return
+        pos = self.stage.get_position()
+        if pos.get("X") is not None:
+            self.spin_x_start.setValue(float(pos["X"]))
+        if pos.get("Y") is not None:
+            self.spin_y_start.setValue(float(pos["Y"]))
+        self.sig_log.emit(f"Set Map Start (X₀, Y₀) to ({pos['X']:.2f}, {pos['Y']:.2f}) µm.")
+
+    def _on_teach_corner_a(self):
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Connect the ASI MS-2000 stage first.")
+            return
+        pos = self.stage.get_position()
+        self._corner_a = (float(pos["X"]), float(pos["Y"]))
+        self.spin_x_start.setValue(self._corner_a[0])
+        self.spin_y_start.setValue(self._corner_a[1])
+        self.sig_log.emit(f"Taught Corner A = ({self._corner_a[0]:.2f}, {self._corner_a[1]:.2f}) µm.")
+
+    def _on_teach_corner_b(self):
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Connect the ASI MS-2000 stage first.")
+            return
+        if self._corner_a is None:
+            QtWidgets.QMessageBox.information(
+                self, "Teach Corner A First", "Please move to the first corner and click 'Teach Corner A' first."
+            )
+            return
+        pos = self.stage.get_position()
+        self._corner_b = (float(pos["X"]), float(pos["Y"]))
+        cfg = MapGridConfig.from_corners(
+            x_a_um=self._corner_a[0],
+            y_a_um=self._corner_a[1],
+            x_b_um=self._corner_b[0],
+            y_b_um=self._corner_b[1],
+            dx_um=self.spin_dx.value(),
+            dy_um=self.spin_dy.value(),
+            scan_pattern=str(self.combo_pattern.currentData() or "snake"),
+        )
+        self.spin_x_start.setValue(cfg.x_start_um)
+        self.spin_y_start.setValue(cfg.y_start_um)
+        self.spin_dx.setValue(cfg.dx_um)
+        self.spin_dy.setValue(cfg.dy_um)
+        self.spin_nx.setValue(cfg.nx)
+        self.spin_ny.setValue(cfg.ny)
+        self.sig_log.emit(
+            f"Taught Corner B = ({self._corner_b[0]:.2f}, {self._corner_b[1]:.2f}) µm -> "
+            f"Computed Grid: {cfg.nx}x{cfg.ny} points, step=({cfg.dx_um:.2f}, {cfg.dy_um:.2f}) µm."
+        )
+
+    def _update_map_summary(self):
+        cfg = self.get_current_grid_config()
+        if self.camera.is_connected:
+            roi = self.camera.get_roi()
+            out_w = (roi[1] - roi[0]) // max(1, roi[4])
+            out_h = (roi[3] - roi[2]) // max(1, roi[5])
+            frame_shape = (out_h, out_w)
+        else:
+            frame_shape = (2048, 2048)
+
+        raw_bytes = cfg.estimate_raw_size_bytes(frame_shape)
+        est_sec = cfg.estimate_duration_seconds(
+            exposure_s=float(self.spin_map_exp.value()) / 1000.0,
+            n_avg=int(self.spin_map_avg.value()),
+            settling_s=float(self.spin_map_settling.value()) / 1000.0,
+        )
+        raw_status = (
+            f"SAVED ({_format_bytes(raw_bytes)})"
+            if self.chk_save_raw.isChecked()
+            else f"NOT SAVED (saves {_format_bytes(raw_bytes)} of disk space)"
+        )
+        self.lbl_map_summary.setText(
+            f"Grid: {cfg.nx} × {cfg.ny} = {cfg.total_points} points   |   "
+            f"Span: {cfg.span_x_um:.1f} × {cfg.span_y_um:.1f} µm   |   "
+            f"Est. Time: {_format_duration(est_sec)}\n"
+            f"Raw 4D Dataset ({cfg.ny}×{cfg.nx}×{frame_shape[0]}×{frame_shape[1]} uint16): {raw_status}"
+        )
+
+    # ==========================================================================
+    # Event Handlers: Map Scan Execution
+    # ==========================================================================
+
+    def _on_start_map(self):
+        if not self.camera.is_connected or not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Hardware Not Connected",
+                "Please connect both the Camera (Orca Flash 4.0 v3) and the Stage (ASI MS-2000) before starting a map.",
+            )
+            return
+
+        if not self._ensure_h5_open():
+            return
+
+        # Prompt user if Laser Reference or Rb Absorption is missing
+        missing = []
+        if self.session.laser_image is None:
+            missing.append("1. Laser Reference (Brillouin/Calibration/laser_reference/image)")
+        if self.session.rb_image is None:
+            missing.append("2. Rubidium Absorption (Brillouin/Calibration/Rb_absorption/image)")
+
+        if missing:
+            missing_list = "\n  • ".join(missing)
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Calibration Spectra Missing",
+                f"The following calibration spectra have not been acquired yet:\n  • {missing_list}\n\n"
+                "Usually you should acquire Laser Reference and Rb Absorption in Section 4B before starting the map.\n"
+                "Do you want to stop and acquire them first (Recommended), or proceed with an uncalibrated raw scan?",
+                QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Yes,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+        if self._is_busy():
+            return
+
+        self._stop_live_cb()
+        self.sig_lock_geometry.emit(True)
+        self._set_controls_busy(True, map_running=True)
+
+        cfg = self.get_current_grid_config()
+        self.progress_map.setRange(0, cfg.total_points)
+        self.progress_map.setValue(0)
+        self.progress_map.setFormat(f"Starting map (0 / {cfg.total_points})...")
+
+        self._map_paused = False
+        self.btn_pause_map.setText("⏸ Pause")
+
+        self._map_worker = MapScanWorker(
+            session=self.session,
+            camera=self.camera,
+            stage=self.stage,
+            map_name=self.txt_map_name.text().strip() or "Map_01",
+            grid=cfg,
+            exposure_ms=self.spin_map_exp.value(),
+            n_avg=self.spin_map_avg.value(),
+            settling_ms=self.spin_map_settling.value(),
+            save_raw_data=self.chk_save_raw.isChecked(),
+            parent=self,
+        )
+        self._map_worker.sig_log.connect(self.sig_log.emit)
+        self._map_worker.sig_progress.connect(self._on_map_progress)
+        self._map_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
+        self._map_worker.sig_point_acquired.connect(self.sig_display_frame.emit)
+        self._map_worker.sig_finished_map.connect(self._on_map_finished)
+        self._map_worker.sig_error.connect(self._on_worker_error)
+        self._map_worker.finished.connect(self._on_map_worker_thread_done)
+        self._map_worker.start()
+
+    def _on_toggle_pause_map(self):
+        if self._map_worker is None or not self._map_worker.isRunning():
+            return
+        self._map_paused = not self._map_paused
+        self._map_worker.request_pause(self._map_paused)
+        if self._map_paused:
+            self.btn_pause_map.setText("▶ Resume")
+            self.sig_log.emit("Map scan PAUSED.")
+        else:
+            self.btn_pause_map.setText("⏸ Pause")
+            self.sig_log.emit("Map scan RESUMED.")
+
+    def _on_abort_map(self):
+        if self._map_worker is not None and self._map_worker.isRunning():
+            self._map_worker.request_abort()
+
+    @QtCore.Slot(int, int, int, int, float, float)
+    def _on_map_progress(self, step_idx: int, total: int, iy: int, ix: int, x_um: float, y_um: float):
+        self.progress_map.setValue(step_idx)
+        self.progress_map.setFormat(
+            f"Point {step_idx}/{total} [row={iy}, col={ix}] @ ({x_um:.1f}, {y_um:.1f}) µm — %p%"
+        )
+
+    @QtCore.Slot(str, int)
+    def _on_map_finished(self, map_group_path: str, completed: int):
+        self.sig_log.emit(f"Finished Map '{map_group_path}' ({completed} point(s) saved to HDF5).")
+        self.sig_camera_updated.emit()
+        self.sig_stage_updated.emit()
+        # Refresh HDF5 status banner
+        if self.session.h5_path:
+            self._on_open_or_create_h5()
+
+    def _on_map_worker_thread_done(self):
+        self._set_controls_busy(False, map_running=False)
+
+    @QtCore.Slot(str, str)
+    def _on_worker_error(self, title: str, message: str):
+        self.sig_log.emit(f"ERROR ({title}): {message}")
+        QtWidgets.QMessageBox.warning(self, title, message)
+
+    def _is_busy(self) -> bool:
+        if self._cal_worker is not None and self._cal_worker.isRunning():
+            return True
+        if self._map_worker is not None and self._map_worker.isRunning():
+            return True
+        return False
+
+    def _set_controls_busy(self, busy: bool, map_running: bool = False):
+        for w in (
+            self.btn_browse_h5,
+            self.btn_open_h5,
+            self.btn_acq_laser,
+            self.btn_acq_rb,
+            self.btn_acq_ref,
+            self.btn_start_map,
+            self.btn_set_start_current,
+            self.btn_teach_a,
+            self.btn_teach_b,
+        ):
+            w.setEnabled(not busy)
+
+        self.btn_pause_map.setEnabled(map_running)
+        self.btn_abort_map.setEnabled(map_running)
