@@ -290,6 +290,142 @@ class ImageViewerWidget(QtWidgets.QWidget):
         )
         self.canvas.draw_idle()
 
+    # ==========================================================================
+    # Step 5.2: Rubidium Absorption & 2D Frequency Map Diagnostic Views
+    # ==========================================================================
+
+    def show_rb_calibration_diagnostics(
+        self,
+        rb_res: Dict[str, Any],
+        view_mode: str = "fsr_fit",
+    ):
+        """
+        Renders diagnostic plots for Step 5.2 (Rubidium Calibration & 2D Frequency Map):
+          - `'rb_denoise_radial'`: Step 8–9 Denoised Rb image + radial order profile.
+          - `'fsr_fit'`: Step 10 Folded multi-order Rb spectrum & hyperfine FSR fit.
+          - `'freq_map'`: Step 10B Full 2D calibrated frequency map & intra-order detuning map.
+        """
+        self._in_diagnostic_view = True
+        self._im_artist = None
+        self.figure.clear()
+
+        cmap = self.combo_cmap.currentText()
+        fsr_cal = rb_res["FSR_cal"]
+        dnu = rb_res["delta_nu_opt"]
+
+        if view_mode == "rb_denoise_radial":
+            gs = self.figure.add_gridspec(2, 1, height_ratios=[2.0, 1.0])
+            ax_img = self.figure.add_subplot(gs[0])
+            ax_rad = self.figure.add_subplot(gs[1])
+
+            data_abs = rb_res["data_absorption"]
+            vmin, vmax = self._compute_clim(data_abs)
+            im = ax_img.imshow(data_abs, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper", aspect="auto")
+            self.figure.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04, label="Net ADU")
+            ax_img.set_title("Step 5.2A — Denoised Rubidium Absorption Interferogram", fontsize=10)
+            ax_img.set_ylabel("Detector Y (px)")
+
+            phi_r = rb_res["phi_order_r"]
+            spec_r = rb_res["avg_spectrum_radius"]
+            ax_rad.plot(phi_r, spec_r, color="#ab47bc", linewidth=1.2)
+            ax_rad.set_title("Radially Averaged Rb Transmission vs. Continuous Interference Order φ(r)", fontsize=10)
+            ax_rad.set_xlabel("Interference Order φ")
+            ax_rad.set_ylabel("Radial Mean Intensity (ADU)")
+            ax_rad.grid(True, alpha=0.3)
+            self.ax = ax_img
+
+        elif view_mode == "freq_map":
+            ax1 = self.figure.add_subplot(1, 2, 1)
+            ax2 = self.figure.add_subplot(1, 2, 2)
+
+            freq_map = rb_res["freq_map"]
+            im1 = ax1.imshow(freq_map, cmap="viridis", origin="upper", aspect="equal")
+            self.figure.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label="Frequency (GHz)")
+            ax1.set_title(
+                f"Step 5.2C — 2D Frequency Map (FSR = {fsr_cal:.4f} GHz)",
+                fontsize=10,
+            )
+            ax1.set_xlabel("Detector X (px)")
+            ax1.set_ylabel("Detector Y (px)")
+
+            # Intra-order detuning in [-FSR/2, +FSR/2] around each elastic Rayleigh order
+            intra_ghz = ((freq_map + 0.5 * fsr_cal) % fsr_cal) - 0.5 * fsr_cal
+            im2 = ax2.imshow(
+                intra_ghz,
+                cmap="coolwarm",
+                vmin=-0.5 * fsr_cal,
+                vmax=+0.5 * fsr_cal,
+                origin="upper",
+                aspect="equal",
+            )
+            self.figure.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04, label="Δν from Elastic Order (GHz)")
+            ax2.set_title(
+                f"Intra-Order Detuning (Elastic Zero ξ = {rb_res['xi_elastic']:.4f})",
+                fontsize=10,
+            )
+            ax2.set_xlabel("Detector X (px)")
+            ax2.set_ylabel("Detector Y (px)")
+            self.ax = ax1
+
+        else:
+            # Default: 'fsr_fit' — Coherently folded multi-order Rb spectrum & hyperfine match
+            gs = self.figure.add_gridspec(2, 1, height_ratios=[1.1, 1.1])
+            ax_fold = self.figure.add_subplot(gs[0])
+            ax_fit = self.figure.add_subplot(gs[1])
+
+            f_grid = rb_res["f_grid"]
+            order_spectra = rb_res["order_spectra"]
+            orders_used = rb_res["orders_used"]
+            for idx_o, k_ord in enumerate(orders_used):
+                lbl = f"Orders k={orders_used[0]}..{orders_used[-1]}" if idx_o == 0 else None
+                ax_fold.plot(f_grid, order_spectra[idx_o], alpha=0.35, linewidth=0.9, label=lbl)
+
+            f_valid = rb_res["f_valid"]
+            sig_valid = rb_res["sig_valid"]
+            base_env = rb_res["baseline_env"]
+            ax_fold.plot(f_valid, sig_valid, color="#1e88e5", linewidth=1.6, label="Order-averaged spectrum")
+            ax_fold.plot(f_valid, base_env, color="#e53935", linestyle="--", linewidth=1.3, label="Envelope baseline")
+            ax_fold.set_title(
+                f"Step 5.2B — Coherently Folded Rb Orders (Calibrated FSR = {fsr_cal:.4f} GHz)",
+                fontsize=10,
+            )
+            ax_fold.set_ylabel("Intensity (ADU)")
+            ax_fold.grid(True, alpha=0.3)
+            ax_fold.legend(loc="upper right", fontsize=8)
+
+            f_fit = rb_res["f_fit_rb"]
+            meas_abs = rb_res["meas_abs_fit"]
+            theo_abs = rb_res["theo_fit_rb"]
+            meas_norm = meas_abs / max(float(np.max(meas_abs)), 1e-9)
+            theo_norm = theo_abs / max(float(np.max(theo_abs)), 1e-9)
+
+            ax_fit.plot(f_fit, meas_norm, color="#00897b", linewidth=1.5, label="Measured Rb absorption (norm.)")
+            ax_fit.plot(
+                f_fit,
+                theo_norm,
+                color="#d81b60",
+                linestyle="--",
+                linewidth=1.5,
+                label=f"Theoretical Rb D2 (T={rb_res['T_cell']:.0f}°C, Δν={dnu:+.3f} GHz)",
+            )
+            ax_fit.set_title(
+                f"Hyperfine Cross-Correlation Fit: Δν = {dnu:+.3f} GHz  |  FSR = {fsr_cal:.4f} GHz",
+                fontsize=10,
+            )
+            ax_fit.set_xlabel("Relative Frequency within Order (GHz)")
+            ax_fit.set_ylabel("Normalized Absorption")
+            ax_fit.grid(True, alpha=0.3)
+            ax_fit.legend(loc="upper right", fontsize=8)
+            self.ax = ax_fold
+
+        self.lbl_stats.setText(
+            f"Rb Calib: FSR = {fsr_cal:.4f} GHz  |  "
+            f"Δν = {dnu:+.3f} GHz  |  "
+            f"ξ_elastic = {rb_res['xi_elastic']:.4f}  |  "
+            f"Freq Map: {rb_res['freq_map'].shape[1]}×{rb_res['freq_map'].shape[0]} px"
+        )
+        self.canvas.draw_idle()
+
     def _on_mouse_move(self, event):
         if event.inaxes is None or event.xdata is None or event.ydata is None:
             self.lbl_cursor.setText("Cursor: —")

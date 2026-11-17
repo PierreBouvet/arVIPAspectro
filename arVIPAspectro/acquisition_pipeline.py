@@ -23,6 +23,7 @@ from HDF5_BLS import Wrapper
 
 from . import config
 from . import laser_calib
+from . import Rb_calib
 
 
 @dataclass
@@ -162,6 +163,9 @@ class AcquisitionSession:
         # Step 5.1: Laser Calibration results dictionary
         self.laser_calib_result: Optional[Dict[str, Any]] = None
 
+        # Step 5.2: Rubidium Absorption & 2D Frequency Map Calibration results dictionary
+        self.rb_calib_result: Optional[Dict[str, Any]] = None
+
     @property
     def is_open(self) -> bool:
         return self.wrapper is not None and self.h5_path is not None
@@ -199,12 +203,14 @@ class AcquisitionSession:
         self.rb_image, self.rb_meta = self._try_load_calibration(self.ROLE_RB)
         self.ref_sample_image, self.ref_sample_meta = self._try_load_calibration(self.ROLE_REF_SAMPLE)
         self.laser_calib_result = self._try_load_laser_calibration_result()
+        self.rb_calib_result = self._try_load_rb_calibration_result()
 
         return {
             "h5_path": self.h5_path,
             "has_laser": self.laser_image is not None,
             "has_laser_calib": self.laser_calib_result is not None,
             "has_rb": self.rb_image is not None,
+            "has_rb_calib": self.rb_calib_result is not None,
             "has_ref_sample": self.ref_sample_image is not None,
             "existing_maps": self.list_map_groups(),
         }
@@ -275,9 +281,11 @@ class AcquisitionSession:
             self.laser_image = np.asarray(image)
             self.laser_meta = attrs
             self.laser_calib_result = None  # Reset calibration state when a new raw laser image is saved
+            self.rb_calib_result = None
         elif role == self.ROLE_RB:
             self.rb_image = np.asarray(image)
             self.rb_meta = attrs
+            self.rb_calib_result = None
         elif role == self.ROLE_REF_SAMPLE:
             self.ref_sample_image = np.asarray(image)
             self.ref_sample_meta = attrs
@@ -487,6 +495,222 @@ class AcquisitionSession:
         }
         result.update(calib_res)
         self.laser_calib_result = result
+        return result
+
+    # ==========================================================================
+    # Step 5.2: Rubidium Absorption & 2D Frequency Map Calibration (Steps 7–10B)
+    # ==========================================================================
+
+    def _try_load_rb_calibration_result(self) -> Optional[Dict[str, Any]]:
+        """
+        Attempts to reconstruct previously saved Rubidium Calibration & 2D Frequency Map
+        results from `Brillouin/Calibration/Rb_absorption` in the HDF5 file if present.
+        """
+        if not self.is_open or self.rb_image is None or self.laser_calib_result is None:
+            return None
+
+        path_rb = f"{self.CALIBRATION_GROUP}/{self.ROLE_RB}"
+        try:
+            children = self.wrapper.get_children_elements(path_rb)
+            rb_attrs = self.wrapper.get_attributes(path_rb)
+            if "image_corrected" not in children or "Frequency" not in children or "FSR" not in rb_attrs:
+                return None
+
+            lc = self.laser_calib_result
+            t_cell = float(rb_attrs.get("T_cell_C", 70.0))
+            l_cell = float(rb_attrs.get("L_cell_m", 0.07))
+            fit_win = float(rb_attrs.get("fit_window_ghz", 10.0))
+            laser_off = float(rb_attrs.get("delta_nu_laser_offset_ghz", 0.0))
+            rb_lock = float(rb_attrs.get("rb_lock_offset_ghz", 1.323))
+
+            det_table_MHz, trans_table, trans_fast = Rb_calib.create_rubidium_reference_table(
+                T_cell=t_cell, L_cell=l_cell
+            )
+            data_abs, base_abs = Rb_calib.retrieve_denoised_rb(self.wrapper, path_rb)
+            profiles_2d, radius_axis, avg_spec_r, phi_order_r = Rb_calib.extract_radial_absorption_profile(
+                data_abs,
+                xc_gnom=lc["xc_gnom"],
+                yc_gnom=lc["yc_gnom"],
+                y0_fit=lc["y0_fit"],
+                c_2d_order=lc["c_2d_order"],
+                g_mean_ref=lc["g_mean_ref"],
+                g_std_ref=lc["g_std_ref"],
+                L_y=lc["L_y"],
+                f_px=config.F_PX_DEFAULT,
+                phi_rad=config.VIPA_TILT_ANGLE,
+                n_r=config.N_FUSED_SILICA_780,
+            )
+            fsr_res = Rb_calib.retrieve_fsr_calibration(
+                self.wrapper,
+                path_rb,
+                lc["g_bar"],
+                lc["q_orders"],
+                phi_order_r,
+                avg_spec_r,
+                trans_fast,
+                nu_0=config.nu_0,
+                fit_window_ghz=fit_win,
+                delta_nu_laser_offset=laser_off,
+            )
+            freq_map, _ = Rb_calib.retrieve_frequency_map(self.wrapper, path_rb)
+            if freq_map is None:
+                return None
+
+            res = {
+                "data_raw": self.rb_image.astype(np.float64),
+                "data_absorption": data_abs,
+                "baseline_absorption": base_abs,
+                "det_table_MHz": det_table_MHz,
+                "trans_table": trans_table,
+                "trans_fast": trans_fast,
+                "profiles_2d": profiles_2d,
+                "radius_axis": radius_axis,
+                "avg_spectrum_radius": avg_spec_r,
+                "phi_order_r": phi_order_r,
+                "freq_map": freq_map,
+                "xi_elastic": float(rb_attrs.get("xi_elastic", (fsr_res["delta_nu_opt"] + rb_lock) / fsr_res["FSR_cal"])),
+                "T_cell": t_cell,
+                "L_cell": l_cell,
+                "rb_lock_offset_ghz": rb_lock,
+            }
+            res.update(fsr_res)
+            return res
+        except Exception:
+            return None
+
+    def run_rb_calibration(
+        self,
+        t_cell_c: float = 70.0,
+        l_cell_m: float = 0.07,
+        scale_rb: int = 9,
+        ksize_se_rb: int = 3,
+        ksize_blur_rb: int = 11,
+        delta_nu_laser_offset_ghz: float = 0.0,
+        fit_window_ghz: float = 10.0,
+        rb_lock_offset_ghz: float = 1.323,
+    ) -> Dict[str, Any]:
+        """
+        Executes Steps 7–10B of `arVIPAspectro.Rb_calib` on `Brillouin/Calibration/Rb_absorption`:
+          - Step 7: Theoretical natural Rubidium D2 transmission lookup table (`create_rubidium_reference_table`)
+          - Step 8: Morphological baseline denoising of Rb absorption image (`denoise_rb`)
+          - Step 9: Radial profile extraction around gnomonic center (`extract_radial_absorption_profile`)
+          - Step 10: VIPA FSR & hyperfine offset calibration across folded orders (`calibrate_fsr_and_offset`)
+          - Step 10B: Full 2D calibrated Frequency Map construction & HDF5 persistence (`compute_and_save_frequency_map`)
+        """
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+        if self.laser_calib_result is None:
+            raise RuntimeError(
+                "Step 5.1 (Laser Reference Calibration) must be completed before running Step 5.2 (Rb Calibration)."
+            )
+        if self.rb_image is None:
+            raise RuntimeError("No Rubidium Absorption image has been acquired or loaded yet.")
+
+        lc = self.laser_calib_result
+        data_raw = self.rb_image.astype(np.float64)
+        if data_raw.shape != lc["data_raw"].shape:
+            raise ValueError(
+                f"Rb image shape {data_raw.shape} does not match calibrated Laser image shape {lc['data_raw'].shape}."
+            )
+
+        path_rb = f"{self.CALIBRATION_GROUP}/{self.ROLE_RB}"
+
+        # Step 7: Theoretical Rubidium D2 Absorption Spectrum Model
+        det_table_MHz, trans_table, trans_fast = Rb_calib.create_rubidium_reference_table(
+            T_cell=float(t_cell_c),
+            L_cell=float(l_cell_m),
+        )
+
+        # Step 8: Rubidium Absorption Image Denoising
+        data_abs, base_abs = Rb_calib.denoise_rb(
+            self.wrapper,
+            path_rb,
+            data_raw,
+            scale=int(scale_rb),
+            ksize_structuring_elements=int(ksize_se_rb),
+            ksize_blur=int(ksize_blur_rb),
+        )
+
+        # Step 9: Radial Profile Extraction Around Gnomonic Center
+        profiles_2d, radius_axis, avg_spec_r, phi_order_r = Rb_calib.extract_radial_absorption_profile(
+            data_abs,
+            xc_gnom=lc["xc_gnom"],
+            yc_gnom=lc["yc_gnom"],
+            y0_fit=lc["y0_fit"],
+            c_2d_order=lc["c_2d_order"],
+            g_mean_ref=lc["g_mean_ref"],
+            g_std_ref=lc["g_std_ref"],
+            L_y=lc["L_y"],
+            f_px=config.F_PX_DEFAULT,
+            phi_rad=config.VIPA_TILT_ANGLE,
+            n_r=config.N_FUSED_SILICA_780,
+            num_angles=1000,
+        )
+
+        # Step 10: VIPA Free Spectral Range (FSR) & Hyperfine Offset Calibration
+        fsr_res = Rb_calib.calibrate_fsr_and_offset(
+            self.wrapper,
+            path_rb,
+            lc["g_bar"],
+            lc["q_orders"],
+            phi_order_r,
+            avg_spec_r,
+            trans_fast,
+            nu_0=config.nu_0,
+            fit_window_ghz=float(fit_window_ghz),
+            delta_nu_laser_offset=float(delta_nu_laser_offset_ghz),
+        )
+
+        # Step 10B: Full 2D Frequency Map Construction & Save
+        freq_map, phi_order_map, xi_elastic = Rb_calib.compute_and_save_frequency_map(
+            wrapper=self.wrapper,
+            path_group=path_rb,
+            img_shape=data_abs.shape,
+            x0_fit=lc["x0_fit"],
+            y0_fit=lc["y0_fit"],
+            xc_gnom=lc["xc_gnom"],
+            yc_gnom=lc["yc_gnom"],
+            c_2d_order=lc["c_2d_order"],
+            g_mean_ref=lc["g_mean_ref"],
+            g_std_ref=lc["g_std_ref"],
+            L_y=lc["L_y"],
+            FSR_cal=fsr_res["FSR_cal"],
+            delta_nu_opt=fsr_res["delta_nu_opt"],
+            rb_lock_offset_ghz=float(rb_lock_offset_ghz),
+            f_px=config.F_PX_DEFAULT,
+            phi_rad=config.VIPA_TILT_ANGLE,
+            n_r=config.N_FUSED_SILICA_780,
+        )
+
+        extra_rb_attrs = {
+            "T_cell_C": float(t_cell_c),
+            "L_cell_m": float(l_cell_m),
+            "fit_window_ghz": float(fit_window_ghz),
+            "delta_nu_laser_offset_ghz": float(delta_nu_laser_offset_ghz),
+            "rb_lock_offset_ghz": float(rb_lock_offset_ghz),
+        }
+        self.wrapper.add_attributes(extra_rb_attrs, parent_group=path_rb, overwrite=True)
+
+        result = {
+            "data_raw": data_raw,
+            "data_absorption": data_abs,
+            "baseline_absorption": base_abs,
+            "det_table_MHz": det_table_MHz,
+            "trans_table": trans_table,
+            "trans_fast": trans_fast,
+            "profiles_2d": profiles_2d,
+            "radius_axis": radius_axis,
+            "avg_spectrum_radius": avg_spec_r,
+            "phi_order_r": phi_order_r,
+            "freq_map": freq_map,
+            "phi_order_map": phi_order_map,
+            "xi_elastic": float(xi_elastic),
+            "T_cell": float(t_cell_c),
+            "L_cell": float(l_cell_m),
+            "rb_lock_offset_ghz": float(rb_lock_offset_ghz),
+        }
+        result.update(fsr_res)
+        self.rb_calib_result = result
         return result
 
     def list_map_groups(self) -> List[str]:

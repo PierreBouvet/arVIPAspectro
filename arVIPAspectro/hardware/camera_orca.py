@@ -554,7 +554,7 @@ class OrcaFlashCamera:
         xn = (xx - 0.5 * det_w) / (0.5 * det_w)
         yn = (yy - 0.5 * det_h) / (0.5 * det_h)
 
-        # Exact 2D gnomonic VIPA order dispersion using arVIPAspectro backend physics
+        # Exact 2D gnomonic VIPA order dispersion using arVIPAspectro backend physics (FSR = 30.0 GHz)
         try:
             from .. import config, backend as bck
             g_2d = bck.g_from_xy(
@@ -566,39 +566,45 @@ class OrcaFlashCamera:
                 phi=config.VIPA_TILT_ANGLE,
                 n_r=config.N_FUSED_SILICA_780,
             )
-            g_min_ref, g_max_ref = 1.449836, 1.451927
-            order_phase = 12.0 * (g_max_ref - g_2d) / (g_max_ref - g_min_ref) - 0.35
+            dg_order = 1.45085 * (30.0 / (config.nu_0 * 1e-9))
+            order_phase = (1.45158 - g_2d) / dg_order
         except Exception:
             order_phase = 6.0 * (xn + 1.05) - 0.45 * (xn + 1.05) ** 2 + 0.18 * (yn ** 2)
 
         frac = order_phase - np.floor(order_phase)
+        # Signed fractional order in [-0.5, +0.5) centered on each integer elastic order
+        frac_signed = (order_phase + 0.5) - np.floor(order_phase + 0.5) - 0.5
+        f_rel_ghz = frac_signed * 30.0
 
         mode = str(spectrum_type).lower().strip()
         if mode == "laser":
-            # Pure monochromatic laser reference fringes (sharp elastic peaks only)
-            spectral_profile = 1.4 * np.exp(-0.5 * (np.minimum(frac, 1.0 - frac) / 0.015) ** 2)
+            # Pure monochromatic laser reference fringes (sharp elastic peaks at frac_signed = 0)
+            spectral_profile = 1.4 * np.exp(-0.5 * (frac_signed / 0.016) ** 2)
             env_x0, env_y0 = 0.0, 0.0
         elif mode == "rb":
-            # Broadband continuum modulated by Rubidium hyperfine absorption dips
-            continuum = 0.75 + 0.25 * np.cos(2.0 * np.pi * frac)
-            dip1 = 0.55 * np.exp(-0.5 * ((frac - 0.36) / 0.022) ** 2)
-            dip2 = 0.65 * np.exp(-0.5 * ((frac - 0.46) / 0.024) ** 2)
-            dip3 = 0.35 * np.exp(-0.5 * ((frac - 0.58) / 0.018) ** 2)
-            dip4 = 0.28 * np.exp(-0.5 * ((frac - 0.26) / 0.018) ** 2)
-            spectral_profile = np.clip(continuum - (dip1 + dip2 + dip3 + dip4), 0.05, 1.5)
+            # Broadband continuum modulated by Rubidium D2 hyperfine absorption dips around each order
+            # Laser locked to 85Rb F=2 line (delta_nu = -1.323 GHz)
+            f_rb = f_rel_ghz + 1.323
+            continuum = 0.85 * np.exp(-0.5 * (frac_signed / 0.28) ** 2) + 0.15
+            dip_87_a = 0.32 * np.exp(-0.5 * ((f_rb - (-2.56)) / 0.32) ** 2)
+            dip_85_a = 0.62 * np.exp(-0.5 * ((f_rb - (-1.22)) / 0.35) ** 2)
+            dip_85_b = 0.48 * np.exp(-0.5 * ((f_rb - (+1.70)) / 0.35) ** 2)
+            dip_87_b = 0.22 * np.exp(-0.5 * ((f_rb - (+4.15)) / 0.32) ** 2)
+            trans_rb = np.clip(1.0 - (dip_87_a + dip_85_a + dip_85_b + dip_87_b), 0.08, 1.0)
+            spectral_profile = continuum * trans_rb
             env_x0, env_y0 = 0.0, 0.0
         else:
-            # Sample spectrum: Elastic Rayleigh peak + Stokes & Anti-Stokes Brillouin doublets
-            shift_frac = 0.18 + 0.03 * np.sin(x_um / 50.0) * np.cos(y_um / 50.0)
-            shift_y = shift_frac * np.sqrt(np.clip(1.0 - 0.25 * yn ** 2, 0.2, 1.0))
-            elastic = np.exp(-0.5 * (np.minimum(frac, 1.0 - frac) / 0.018) ** 2)
-            stokes = 0.42 * np.exp(-0.5 * ((frac - shift_y) / 0.026) ** 2)
-            antistokes = 0.42 * np.exp(-0.5 * ((frac - (1.0 - shift_y)) / 0.026) ** 2)
+            # Sample spectrum: Elastic Rayleigh peak + Stokes & Anti-Stokes Brillouin doublets (~5.1 GHz)
+            shift_ghz = 5.10 + 0.45 * np.sin(x_um / 50.0) * np.cos(y_um / 50.0)
+            shift_y_ghz = shift_ghz * np.sqrt(np.clip(1.0 - 0.22 * yn ** 2, 0.25, 1.0))
+            elastic = np.exp(-0.5 * (f_rel_ghz / 0.48) ** 2)
+            stokes = 0.42 * np.exp(-0.5 * ((f_rel_ghz - shift_y_ghz) / 0.55) ** 2)
+            antistokes = 0.42 * np.exp(-0.5 * ((f_rel_ghz + shift_y_ghz) / 0.55) ** 2)
             spectral_profile = elastic + stokes + antistokes
             env_x0 = 0.08 * np.sin(x_um / 100.0)
             env_y0 = 0.08 * np.cos(y_um / 100.0)
 
-        envelope = np.exp(-0.6 * ((xn - env_x0) ** 2 + (yn - env_y0) ** 2))
+        envelope = np.exp(-0.95 * ((xn - env_x0) ** 2) - 0.55 * ((yn - env_y0) ** 2))
 
         exp_scale = np.clip(self._sim_exposure_s / 0.050, 0.02, 20.0) * (hbin * vbin)
         signal = (120.0 + 18000.0 * exp_scale * envelope * spectral_profile).astype(np.float32)

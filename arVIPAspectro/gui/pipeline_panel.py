@@ -163,6 +163,51 @@ class LaserCalibrationWorker(QtCore.QThread):
             self.sig_error.emit("Step 5.1 Laser Calibration Error", str(exc))
 
 
+class RbCalibrationWorker(QtCore.QThread):
+    """
+    Background worker for Step 5.2: Executes `session.run_rb_calibration(...)`
+    (Steps 7–10B of `arVIPAspectro.Rb_calib`: theoretical Rb D2 table, denoising,
+    radial profile extraction, VIPA FSR & hyperfine offset calibration, and 2D Frequency Map).
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_calibrated = QtCore.Signal(object)  # rb_res dict
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(
+        self,
+        session: AcquisitionSession,
+        params: Dict[str, Any],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.session = session
+        self.params = params
+
+    def run(self):
+        try:
+            t0 = time.time()
+            self.sig_log.emit("Step 5.2 — Running Rubidium & 2D Frequency Map Calibration (Steps 7–10B)...")
+            res = self.session.run_rb_calibration(
+                t_cell_c=float(self.params.get("t_cell_c", 70.0)),
+                l_cell_m=float(self.params.get("l_cell_m", 0.07)),
+                scale_rb=int(self.params.get("scale_rb", 9)),
+                delta_nu_laser_offset_ghz=float(self.params.get("delta_nu_laser_offset_ghz", 0.0)),
+                fit_window_ghz=float(self.params.get("fit_window_ghz", 10.0)),
+                rb_lock_offset_ghz=float(self.params.get("rb_lock_offset_ghz", 1.323)),
+            )
+            dt = time.time() - t0
+            self.sig_log.emit(
+                f"Step 5.2 Completed in {dt:.2f} s: Calibrated VIPA FSR = {res['FSR_cal']:.4f} GHz | "
+                f"Hyperfine offset Δν = {res['delta_nu_opt']:+.3f} GHz | "
+                f"Elastic zero ξ = {res['xi_elastic']:.4f} | "
+                f"Saved 2D Frequency Map ({res['freq_map'].shape[1]}x{res['freq_map'].shape[0]} px)."
+            )
+            self.sig_calibrated.emit(res)
+        except Exception as exc:
+            self.sig_error.emit("Step 5.2 Rubidium Calibration Error", str(exc))
+
+
 class MapScanWorker(QtCore.QThread):
     """
     Background worker that executes the 2D spatial map scan across the ASI MS-2000 grid,
@@ -309,6 +354,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     sig_log = QtCore.Signal(str)
     sig_display_frame = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
     sig_show_laser_diagnostics = QtCore.Signal(object, str)             # (calib_res, view_mode)
+    sig_show_rb_diagnostics = QtCore.Signal(object, str)                # (rb_res, view_mode)
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
     sig_lock_geometry = QtCore.Signal(bool)
@@ -328,6 +374,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
         self._laser_calib_worker: Optional[LaserCalibrationWorker] = None
+        self._rb_calib_worker: Optional[RbCalibrationWorker] = None
         self._map_worker: Optional[MapScanWorker] = None
         self._map_paused: bool = False
 
@@ -358,6 +405,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         layout.addWidget(self._build_h5_session_card())
         layout.addWidget(self._build_calibration_prompt_card())
         layout.addWidget(self._build_step5_1_laser_calib_card())
+        layout.addWidget(self._build_step5_2_rb_calib_card())
         layout.addWidget(self._build_map_configuration_card())
         layout.addStretch()
 
@@ -599,6 +647,107 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         )
         self.lbl_laser_calib_summary.setWordWrap(True)
         layout.addWidget(self.lbl_laser_calib_summary)
+
+        return box
+
+    def _build_step5_2_rb_calib_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox(
+            "Step 5.2 — Rubidium Absorption & 2D Frequency Map Calibration (Steps 7–10B)"
+        )
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(6)
+
+        # Row 1: Auto-calibrate toggle + Status badge
+        top_row = QtWidgets.QHBoxLayout()
+        self.chk_auto_calib_rb = QtWidgets.QCheckBox(
+            "Auto-run Rb Calibration after acquiring Rb Absorption"
+        )
+        self.chk_auto_calib_rb.setChecked(True)
+        top_row.addWidget(self.chk_auto_calib_rb)
+        top_row.addStretch()
+
+        self.lbl_rb_calib_status = QtWidgets.QLabel("NOT CALIBRATED")
+        self.lbl_rb_calib_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_rb_calib_status.setMinimumWidth(140)
+        top_row.addWidget(self.lbl_rb_calib_status)
+        layout.addLayout(top_row)
+
+        # Row 2: Algorithm parameters
+        param_row = QtWidgets.QHBoxLayout()
+        param_row.addWidget(QtWidgets.QLabel("T_cell:"))
+        self.spin_rb_tcell = QtWidgets.QDoubleSpinBox()
+        self.spin_rb_tcell.setDecimals(1)
+        self.spin_rb_tcell.setRange(20.0, 150.0)
+        self.spin_rb_tcell.setValue(70.0)
+        self.spin_rb_tcell.setSuffix(" °C")
+        param_row.addWidget(self.spin_rb_tcell)
+
+        param_row.addSpacing(6)
+        param_row.addWidget(QtWidgets.QLabel("L_cell:"))
+        self.spin_rb_lcell = QtWidgets.QDoubleSpinBox()
+        self.spin_rb_lcell.setDecimals(3)
+        self.spin_rb_lcell.setRange(0.005, 0.500)
+        self.spin_rb_lcell.setValue(0.070)
+        self.spin_rb_lcell.setSuffix(" m")
+        param_row.addWidget(self.spin_rb_lcell)
+
+        param_row.addSpacing(6)
+        param_row.addWidget(QtWidgets.QLabel("85Rb Lock:"))
+        self.spin_rb_lock = QtWidgets.QDoubleSpinBox()
+        self.spin_rb_lock.setDecimals(3)
+        self.spin_rb_lock.setRange(-15.0, 15.0)
+        self.spin_rb_lock.setValue(1.323)
+        self.spin_rb_lock.setSuffix(" GHz")
+        param_row.addWidget(self.spin_rb_lock)
+
+        param_row.addSpacing(6)
+        param_row.addWidget(QtWidgets.QLabel("Fit Win:"))
+        self.spin_rb_fitwin = QtWidgets.QDoubleSpinBox()
+        self.spin_rb_fitwin.setDecimals(1)
+        self.spin_rb_fitwin.setRange(2.0, 30.0)
+        self.spin_rb_fitwin.setValue(10.0)
+        self.spin_rb_fitwin.setSuffix(" GHz")
+        param_row.addWidget(self.spin_rb_fitwin)
+
+        param_row.addSpacing(6)
+        param_row.addWidget(QtWidgets.QLabel("Morph Scale:"))
+        self.spin_rb_scale = QtWidgets.QSpinBox()
+        self.spin_rb_scale.setRange(2, 32)
+        self.spin_rb_scale.setValue(9)
+        param_row.addWidget(self.spin_rb_scale)
+        param_row.addStretch()
+        layout.addLayout(param_row)
+
+        # Row 3: Execute Calibration button + Diagnostic Plot Viewers
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_run_rb_calib = QtWidgets.QPushButton("⚙ Calibrate Rb & Frequency Map (Steps 7–10B)")
+        self.btn_run_rb_calib.setStyleSheet("font-weight: bold; padding: 4px 10px;")
+        self.btn_run_rb_calib.clicked.connect(self._on_run_rb_calibration)
+        btn_row.addWidget(self.btn_run_rb_calib)
+
+        self.btn_diag_rb_rad = QtWidgets.QPushButton("📊 5.2A: Denoise & Radial")
+        self.btn_diag_rb_rad.clicked.connect(lambda: self._on_show_rb_diag("rb_denoise_radial"))
+        btn_row.addWidget(self.btn_diag_rb_rad)
+
+        self.btn_diag_rb_fsr = QtWidgets.QPushButton("📊 5.2B: Folded FSR Fit")
+        self.btn_diag_rb_fsr.clicked.connect(lambda: self._on_show_rb_diag("fsr_fit"))
+        btn_row.addWidget(self.btn_diag_rb_fsr)
+
+        self.btn_diag_rb_fmap = QtWidgets.QPushButton("📊 5.2C: 2D Frequency Map")
+        self.btn_diag_rb_fmap.clicked.connect(lambda: self._on_show_rb_diag("freq_map"))
+        btn_row.addWidget(self.btn_diag_rb_fmap)
+        layout.addLayout(btn_row)
+
+        # Row 4: Calibrated FSR & 2D Frequency Map Summary Banner
+        self.lbl_rb_calib_summary = QtWidgets.QLabel(
+            "Complete Step 5.1 (Laser Calibration) and acquire/load an Rb Absorption image, then click 'Calibrate Rb & Frequency Map'."
+        )
+        self.lbl_rb_calib_summary.setStyleSheet(
+            "background-color: #1e293b; color: #e2e8f0; font-family: monospace; "
+            "font-size: 11px; padding: 5px; border-radius: 4px;"
+        )
+        self.lbl_rb_calib_summary.setWordWrap(True)
+        layout.addWidget(self.lbl_rb_calib_summary)
 
         return box
 
@@ -855,6 +1004,13 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         # If Laser Reference was just acquired and auto-calibrate is enabled, trigger Step 5.1
         if role == AcquisitionSession.ROLE_LASER and self.chk_auto_calib_laser.isChecked():
             QtCore.QTimer.singleShot(50, self._on_run_laser_calibration)
+        # If Rb Absorption was just acquired and auto-calibrate is enabled, trigger Step 5.2
+        elif (
+            role == AcquisitionSession.ROLE_RB
+            and self.chk_auto_calib_rb.isChecked()
+            and self.session.laser_calib_result is not None
+        ):
+            QtCore.QTimer.singleShot(50, self._on_run_rb_calibration)
 
     def _on_run_laser_calibration(self):
         if not self._ensure_h5_open():
@@ -903,6 +1059,61 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             )
             return
         self.sig_show_laser_diagnostics.emit(res, view_mode)
+
+    def _on_run_rb_calibration(self):
+        if not self._ensure_h5_open():
+            return
+        if self.session.laser_calib_result is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Laser Calibration Required",
+                "Please complete Step 5.1 (Laser Reference Calibration) before running Step 5.2 (Rb Calibration).",
+            )
+            return
+        if self.session.rb_image is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Rb Absorption Image Missing",
+                "Please acquire or load a Rubidium Absorption image first (Section 4B).",
+            )
+            return
+        if self._is_busy():
+            return
+
+        params = {
+            "t_cell_c": float(self.spin_rb_tcell.value()),
+            "l_cell_m": float(self.spin_rb_lcell.value()),
+            "rb_lock_offset_ghz": float(self.spin_rb_lock.value()),
+            "fit_window_ghz": float(self.spin_rb_fitwin.value()),
+            "scale_rb": int(self.spin_rb_scale.value()),
+        }
+        self._set_controls_busy(True)
+        self._rb_calib_worker = RbCalibrationWorker(
+            session=self.session,
+            params=params,
+            parent=self,
+        )
+        self._rb_calib_worker.sig_log.connect(self.sig_log.emit)
+        self._rb_calib_worker.sig_calibrated.connect(self._on_rb_calibrated)
+        self._rb_calib_worker.sig_error.connect(self._on_worker_error)
+        self._rb_calib_worker.finished.connect(lambda: self._set_controls_busy(False))
+        self._rb_calib_worker.start()
+
+    @QtCore.Slot(object)
+    def _on_rb_calibrated(self, res: dict):
+        self._update_calibration_badges()
+        self.sig_show_rb_diagnostics.emit(res, "fsr_fit")
+
+    def _on_show_rb_diag(self, view_mode: str):
+        res = self.session.rb_calib_result
+        if res is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Not Calibrated Yet",
+                "Run 'Calibrate Rb & Frequency Map (Steps 7–10B)' first to view diagnostic plots.",
+            )
+            return
+        self.sig_show_rb_diagnostics.emit(res, view_mode)
 
     def _on_view_calibration(self, role: str):
         img = None
@@ -985,6 +1196,35 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_diag_seeds.setEnabled(has_lc)
         self.btn_diag_geom.setEnabled(has_lc)
         self.btn_diag_res.setEnabled(has_lc)
+
+        # Update Step 5.2 Rubidium Calibration badge & summary
+        rb_res = self.session.rb_calib_result
+        has_rb_cal = rb_res is not None
+        if has_rb_cal:
+            self.lbl_rb_calib_status.setText("✓ CALIBRATED")
+            self.lbl_rb_calib_status.setStyleSheet(
+                "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+            )
+            fmap_h, fmap_w = rb_res["freq_map"].shape
+            self.lbl_rb_calib_summary.setText(
+                f"Calibrated VIPA FSR = {rb_res['FSR_cal']:.4f} GHz  |  "
+                f"Hyperfine Offset Δν = {rb_res['delta_nu_opt']:+.3f} GHz  |  "
+                f"Elastic Zero ξ = {rb_res['xi_elastic']:.4f}\n"
+                f"2D Frequency Map: {fmap_w}×{fmap_h} px saved at Brillouin/Calibration/Rb_absorption/Frequency"
+            )
+        else:
+            self.lbl_rb_calib_status.setText("NOT CALIBRATED")
+            self.lbl_rb_calib_status.setStyleSheet(
+                "background-color: #455a64; color: #cfd8dc; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+            )
+            self.lbl_rb_calib_summary.setText(
+                "Complete Step 5.1 (Laser Calibration) and acquire/load an Rb Absorption image, then click 'Calibrate Rb & Frequency Map'."
+            )
+
+        self.btn_run_rb_calib.setEnabled(has_lc and has_rb)
+        self.btn_diag_rb_rad.setEnabled(has_rb_cal)
+        self.btn_diag_rb_fsr.setEnabled(has_rb_cal)
+        self.btn_diag_rb_fmap.setEnabled(has_rb_cal)
 
     # ==========================================================================
     # Event Handlers: Spatial Map Grid & Teaching
@@ -1199,6 +1439,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             return True
         if self._laser_calib_worker is not None and self._laser_calib_worker.isRunning():
             return True
+        if self._rb_calib_worker is not None and self._rb_calib_worker.isRunning():
+            return True
         if self._map_worker is not None and self._map_worker.isRunning():
             return True
         return False
@@ -1211,12 +1453,15 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             self.btn_acq_rb,
             self.btn_acq_ref,
             self.btn_run_laser_calib,
+            self.btn_run_rb_calib,
             self.btn_start_map,
             self.btn_set_start_current,
             self.btn_teach_a,
             self.btn_teach_b,
         ):
             w.setEnabled(not busy)
+        if not busy:
+            self._update_calibration_badges()
 
         self.btn_pause_map.setEnabled(map_running)
         self.btn_abort_map.setEnabled(map_running)
