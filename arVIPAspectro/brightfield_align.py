@@ -7,7 +7,7 @@ Brightfield Spatial Calibration & Sub-Pixel Image Registration (`arVIPAspectro/b
 
 from typing import Dict, Any, Tuple
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, zoom
 
 
 def _prepare_registration_image(img: np.ndarray) -> np.ndarray:
@@ -21,7 +21,17 @@ def _prepare_registration_image(img: np.ndarray) -> np.ndarray:
         raise ValueError(f"Expected a 2D image for registration, got shape {arr.shape}.")
     h, w = arr.shape
     sigma_bg = max(12.0, min(h, w) / 8.0)
-    illum = gaussian_filter(arr, sigma=sigma_bg, mode="nearest")
+    if min(h, w) >= 256:
+        small = arr[::4, ::4]
+        illum_small = gaussian_filter(small, sigma=sigma_bg / 4.0, mode="nearest")
+        illum = zoom(
+            illum_small,
+            (h / illum_small.shape[0], w / illum_small.shape[1]),
+            order=1,
+            mode="nearest",
+        )[:h, :w]
+    else:
+        illum = gaussian_filter(arr, sigma=sigma_bg, mode="nearest")
     illum_floor = max(float(np.mean(illum)) * 0.1, 1.0)
     flat = (arr / np.maximum(illum, illum_floor)) - 1.0
     bp = gaussian_filter(flat, sigma=2.0, mode="nearest")
@@ -31,39 +41,13 @@ def _prepare_registration_image(img: np.ndarray) -> np.ndarray:
     return bp * (win_y * win_x)
 
 
-def measure_image_shift_px(ref_img: np.ndarray, mov_img: np.ndarray) -> Tuple[float, float, float]:
-    """
-    Measures the sub-pixel shift `(dcol_px, drow_px)` of features in `mov_img` relative to
-    `ref_img` via flat-fielded normalized 2D FFT cross-correlation.
-
-    Convention: if a feature at `(col, row)` in `ref_img` moves to `(col + dcol_px, row + drow_px)`
-    in `mov_img`, this returns `(dcol_px, drow_px, peak_response)`.
-    """
-    ref_arr = np.asarray(ref_img)
-    mov_arr = np.asarray(mov_img)
-    if ref_arr.shape != mov_arr.shape:
-        raise ValueError(
-            f"Brightfield image shapes must match for registration ({ref_arr.shape} vs {mov_arr.shape})."
-        )
-
-    p1 = _prepare_registration_image(ref_arr)
-    p2 = _prepare_registration_image(mov_arr)
-    norm = float(np.sqrt(np.sum(p1 ** 2) * np.sum(p2 ** 2)))
-    if norm <= 1e-12:
-        return 0.0, 0.0, 0.0
-
-    f1 = np.fft.fft2(p1)
-    f2 = np.fft.fft2(p2)
-
-    # Cross-correlation: F2 * conj(F1) -> peak at (+drow, +dcol) when mov_img shifts by (+drow, +dcol)
-    cc = np.real(np.fft.ifft2(f2 * np.conj(f1))) / norm
-
+def _extract_subpixel_peak(cc: np.ndarray) -> Tuple[float, float, float]:
+    """Extracts wrapped sub-pixel shift `(dcol_px, drow_px, peak_val)` from a 2D correlation map."""
     h, w = cc.shape
     peak_idx = int(np.argmax(cc))
     py, px = divmod(peak_idx, w)
     peak_val = float(cc[py, px])
 
-    # Parabolic sub-pixel interpolation around wrapped correlation peak
     ym = (py - 1) % h
     yp = (py + 1) % h
     xm = (px - 1) % w
@@ -85,6 +69,92 @@ def measure_image_shift_px(ref_img: np.ndarray, mov_img: np.ndarray) -> Tuple[fl
         dcol -= w
 
     return float(dcol), float(drow), peak_val
+
+
+def measure_image_shift_with_map(
+    ref_img: np.ndarray,
+    mov_img: np.ndarray,
+) -> Tuple[float, float, float, np.ndarray]:
+    """
+    Like `measure_image_shift_px`, also returns the full normalized 2D correlation map `cc`.
+    """
+    ref_arr = np.asarray(ref_img)
+    mov_arr = np.asarray(mov_img)
+    if ref_arr.shape != mov_arr.shape:
+        raise ValueError(
+            f"Brightfield image shapes must match for registration ({ref_arr.shape} vs {mov_arr.shape})."
+        )
+
+    p1 = _prepare_registration_image(ref_arr)
+    p2 = _prepare_registration_image(mov_arr)
+    norm = float(np.sqrt(np.sum(p1 ** 2) * np.sum(p2 ** 2)))
+    if norm <= 1e-12:
+        return 0.0, 0.0, 0.0, np.zeros(ref_arr.shape, dtype=np.float64)
+
+    f1 = np.fft.fft2(p1)
+    f2 = np.fft.fft2(p2)
+    cc = np.real(np.fft.ifft2(f2 * np.conj(f1))) / norm
+    dcol, drow, peak_val = _extract_subpixel_peak(cc)
+    return dcol, drow, peak_val, cc
+
+
+def compute_jog_correlations(
+    img0: np.ndarray,
+    img_x: np.ndarray,
+    img_y: np.ndarray,
+) -> Dict[str, Any]:
+    """
+    Computes normalized autocorrelation (`img0 vs img0`) and 3-point stage jog
+    cross-correlations (`img_x vs img0`, `img_y vs img0`) in one pass.
+    """
+    if img0.shape != img_x.shape or img0.shape != img_y.shape:
+        raise ValueError(
+            f"Jog images must share identical shape ({img0.shape}, {img_x.shape}, {img_y.shape})."
+        )
+
+    p0 = _prepare_registration_image(img0)
+    px = _prepare_registration_image(img_x)
+    py = _prepare_registration_image(img_y)
+
+    e0 = float(np.sum(p0 ** 2))
+    ex = float(np.sum(px ** 2))
+    ey = float(np.sum(py ** 2))
+
+    f0_conj = np.conj(np.fft.fft2(p0))
+    f0 = np.conj(f0_conj)
+    fx = np.fft.fft2(px)
+    fy = np.fft.fft2(py)
+
+    cc_auto = np.real(np.fft.ifft2(f0 * f0_conj)) / e0 if e0 > 1e-12 else np.zeros(img0.shape)
+    norm_x = float(np.sqrt(e0 * ex))
+    cc_x = np.real(np.fft.ifft2(fx * f0_conj)) / norm_x if norm_x > 1e-12 else np.zeros(img0.shape)
+    norm_y = float(np.sqrt(e0 * ey))
+    cc_y = np.real(np.fft.ifft2(fy * f0_conj)) / norm_y if norm_y > 1e-12 else np.zeros(img0.shape)
+
+    dc_x, dr_x, pk_x = _extract_subpixel_peak(cc_x)
+    dc_y, dr_y, pk_y = _extract_subpixel_peak(cc_y)
+
+    return {
+        "cc_auto": cc_auto,
+        "cc_x": cc_x,
+        "cc_y": cc_y,
+        "dp_x": (dc_x, dr_x),
+        "dp_y": (dc_y, dr_y),
+        "peak_x": pk_x,
+        "peak_y": pk_y,
+    }
+
+
+def measure_image_shift_px(ref_img: np.ndarray, mov_img: np.ndarray) -> Tuple[float, float, float]:
+    """
+    Measures the sub-pixel shift `(dcol_px, drow_px)` of features in `mov_img` relative to
+    `ref_img` via flat-fielded normalized 2D FFT cross-correlation.
+
+    Convention: if a feature at `(col, row)` in `ref_img` moves to `(col + dcol_px, row + drow_px)`
+    in `mov_img`, this returns `(dcol_px, drow_px, peak_response)`.
+    """
+    dcol, drow, peak_val, _ = measure_image_shift_with_map(ref_img, mov_img)
+    return dcol, drow, peak_val
 
 
 def build_plate_calibration_from_jogs(

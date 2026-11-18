@@ -1037,6 +1037,134 @@ class ImageViewerWidget(QtWidgets.QWidget):
         )
         self.canvas.draw_idle()
 
+    def _render_plate_jog_panels(
+        self,
+        img0: np.ndarray,
+        img_x: np.ndarray,
+        img_y: np.ndarray,
+        x0: float,
+        y0: float,
+        dx_um: float,
+        dy_um: float,
+    ):
+        """Renders the 3 brightfield jog images in subplots (1..3) of a 2x2 grid and returns ax4."""
+        self._last_live_map_state = None
+        self._enter_diagnostic_mode()
+
+        cmap = self.combo_cmap.currentText()
+        specs = [
+            (1, img0, f"1. Base ({x0:.1f}, {y0:.1f}) µm"),
+            (2, img_x, f"2. +X ({x0 + dx_um:.1f}, {y0:.1f}) µm [ΔX={dx_um:+.1f}]"),
+            (3, img_y, f"3. +Y ({x0:.1f}, {y0 + dy_um:.1f}) µm [ΔY={dy_um:+.1f}]"),
+        ]
+        first_ax = None
+        for idx, arr, title in specs:
+            ax = self.figure.add_subplot(2, 2, idx)
+            if first_ax is None:
+                first_ax = ax
+            vmin, vmax = np.percentile(arr, [1.0, 99.5])
+            if vmax <= vmin:
+                vmin, vmax = float(np.min(arr)), float(np.max(arr)) + 1.0
+            ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper", aspect="equal")
+            ax.set_title(title, fontsize=9)
+            ax.set_xlabel("X (px)")
+            ax.set_ylabel("Y (px)")
+
+        self.ax = first_ax
+        return self.figure.add_subplot(2, 2, 4)
+
+    def show_plate_calib_images(
+        self,
+        img0: np.ndarray,
+        img_x: np.ndarray,
+        img_y: np.ndarray,
+        x0: float,
+        y0: float,
+        dx_um: float,
+        dy_um: float,
+    ):
+        """Step 1 diagnostic view: displays the 3 brightfield jog images before correlation."""
+        ax4 = self._render_plate_jog_panels(img0, img_x, img_y, x0, y0, dx_um, dy_um)
+        ax4.set_facecolor("#1e1e1e")
+        ax4.text(
+            0.5,
+            0.5,
+            "3 jog frames captured.\nClick 'Continue' to compute\nautocorrelation & cross-correlation.",
+            color="#cfd8dc",
+            ha="center",
+            va="center",
+            transform=ax4.transAxes,
+            fontsize=10,
+        )
+        ax4.set_xticks([])
+        ax4.set_yticks([])
+        ax4.set_title("4. Correlation Result (Pending)", fontsize=9)
+        self.lbl_stats.setText(
+            f"Plate Calib Step 1: 3 frames captured at Base ({x0:.1f}, {y0:.1f}), +{dx_um:.1f} X, +{dy_um:.1f} Y µm"
+        )
+        self.canvas.draw_idle()
+
+    def show_plate_calib_correlation(
+        self,
+        img0: np.ndarray,
+        img_x: np.ndarray,
+        img_y: np.ndarray,
+        x0: float,
+        y0: float,
+        dx_um: float,
+        dy_um: float,
+        corr_res: Dict[str, Any],
+    ):
+        """
+        Step 2 diagnostic view: shows the 3 jog images plus subplot 4 as an RGB composite of
+        the correlation maps centered at (0, 0): Red=CC(+X), Green=CC(+Y), Blue=AutoCorr(Base).
+        """
+        ax4 = self._render_plate_jog_panels(img0, img_x, img_y, x0, y0, dx_um, dy_um)
+
+        cc_auto = np.fft.fftshift(corr_res["cc_auto"])
+        cc_x = np.fft.fftshift(corr_res["cc_x"])
+        cc_y = np.fft.fftshift(corr_res["cc_y"])
+        dc_x, dr_x = corr_res["dp_x"]
+        dc_y, dr_y = corr_res["dp_y"]
+        pk_x = float(corr_res["peak_x"])
+        pk_y = float(corr_res["peak_y"])
+
+        h, w = cc_auto.shape
+        cy, cx = h // 2, w // 2
+        half_span = int(min(max(120.0, 2.0 * max(abs(dc_x), abs(dr_x), abs(dc_y), abs(dr_y)) + 40.0), cy, cx))
+        y1, y2 = cy - half_span, cy + half_span + 1
+        x1, x2 = cx - half_span, cx + half_span + 1
+
+        def _pos_norm(a: np.ndarray) -> np.ndarray:
+            crop = np.maximum(a[y1:y2, x1:x2], 0.0)
+            m = float(np.max(crop))
+            return np.clip(crop / m, 0.0, 1.0) if m > 1e-12 else np.zeros_like(crop)
+
+        rgb_corr = np.stack([_pos_norm(cc_x), _pos_norm(cc_y), _pos_norm(cc_auto)], axis=-1)
+        ax4.imshow(
+            rgb_corr,
+            origin="upper",
+            extent=[-half_span - 0.5, half_span + 0.5, half_span + 0.5, -half_span - 0.5],
+            aspect="equal",
+        )
+        ax4.axhline(0.0, color="white", ls=":", lw=0.7, alpha=0.5)
+        ax4.axvline(0.0, color="white", ls=":", lw=0.7, alpha=0.5)
+        ax4.plot([0.0], [0.0], "wo", markersize=4, fillstyle="none")
+        ax4.annotate("", xy=(dc_x, dr_x), xytext=(0.0, 0.0), arrowprops=dict(arrowstyle="->", color="#ff5252", lw=1.8))
+        ax4.annotate("", xy=(dc_y, dr_y), xytext=(0.0, 0.0), arrowprops=dict(arrowstyle="->", color="#69f0ae", lw=1.8))
+        ax4.set_title(
+            f"4. RGB Correlation (R=+X, G=+Y, B=Auto)\n"
+            f"+X=({dc_x:+.1f},{dr_x:+.1f}) px [{pk_x:.2f}] | +Y=({dc_y:+.1f},{dr_y:+.1f}) px [{pk_y:.2f}]",
+            fontsize=8.5,
+        )
+        ax4.set_xlabel("Shift ΔX (px)")
+        ax4.set_ylabel("Shift ΔY (px)")
+        self.lbl_stats.setText(
+            f"Plate Calib Step 2: +X=({dc_x:+.2f}, {dr_x:+.2f}) px [pk={pk_x:.3f}] | "
+            f"+Y=({dc_y:+.2f}, {dr_y:+.2f}) px [pk={pk_y:.3f}]"
+        )
+        self.canvas.draw_idle()
+
     def _on_pg_mouse_move(self, scene_pos):
         if self._in_diagnostic_view or self._current_image is None:
             return

@@ -340,6 +340,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_angle_panel.sig_show_brightfield_alignment.connect(
             self.image_viewer.show_brightfield_alignment
         )
+        self.multi_angle_panel.sig_show_plate_calib_images.connect(
+            self.image_viewer.show_plate_calib_images
+        )
+        self.multi_angle_panel.sig_show_plate_calib_correlation.connect(
+            self.image_viewer.show_plate_calib_correlation
+        )
         self.multi_angle_panel.sig_update_live_map.connect(
             self.image_viewer.update_live_map_view
         )

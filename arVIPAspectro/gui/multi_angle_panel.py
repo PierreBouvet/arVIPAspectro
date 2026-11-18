@@ -18,6 +18,7 @@ from ..hardware import MS2000Stage, OrcaFlashCamera, TeledyneBrightfieldCamera
 from ..acquisition_pipeline import AcquisitionSession, MapGridConfig
 from ..brightfield_align import (
     measure_image_shift_px,
+    compute_jog_correlations,
     build_plate_calibration_from_jogs,
     build_manual_plate_calibration,
     pixel_shift_to_stage_delta_um,
@@ -32,15 +33,15 @@ from .pipeline_panel import (
 )
 
 
-class _PlateJogCalibWorker(QtCore.QThread):
+class _PlateJogCaptureWorker(QtCore.QThread):
     """
-    Executes a 3-point ASI MS-2000 stage jog calibration (`Base`, `+dx`, `+dy`, return to `Base`)
-    using the Teledyne Brightfield camera and 2D FFT phase cross-correlation to measure the exact
-    2x2 pixel-to-stage Jacobian (um/px & camera rotation).
+    Step 1 of interactive Brightfield plate calibration:
+    Moves to Base `(x0, y0)`, `+X`, and `+Y`, captures the 3 brightfield frames,
+    and returns to `(x0, y0)`.
     """
 
     sig_log = QtCore.Signal(str)
-    sig_calibrated = QtCore.Signal(object)  # calib dict
+    sig_captured = QtCore.Signal(object)  # dict with img0, img_x, img_y, x0, y0, dx_um, dy_um
     sig_stage_updated = QtCore.Signal()
     sig_error = QtCore.Signal(str, str)
 
@@ -49,7 +50,7 @@ class _PlateJogCalibWorker(QtCore.QThread):
         stage: MS2000Stage,
         brightfield_cam: TeledyneBrightfieldCamera,
         jog_step_um: float = 20.0,
-        settling_ms: float = 150.0,
+        settling_ms: float = 300.0,
         parent=None,
     ):
         super().__init__(parent)
@@ -67,43 +68,42 @@ class _PlateJogCalibWorker(QtCore.QThread):
             settling_s = self.settling_ms / 1000.0
             d = self.jog_step_um
 
-            self.sig_log.emit(f"Brightfield 3-pt plate calibration starting at ({x0:.2f}, {y0:.2f}) µm (step={d:.1f} µm)...")
+            self.sig_log.emit(
+                f"Plate Calib Step 1/3 — Capturing 3 jog frames around ({x0:.2f}, {y0:.2f}) µm (step={d:.1f} µm)..."
+            )
             img0 = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=base_pos)
 
-            # 1. Jog +X
+            # Move +X
             px = self.stage.move_to(x_um=x0 + d, y_um=y0, wait=True)
             self.sig_stage_updated.emit()
             if settling_s > 0:
                 time.sleep(settling_s)
             img_x = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=px)
-            dc_x, dr_x, resp_x = measure_image_shift_px(img0, img_x)
 
-            # 2. Jog +Y relative to base
+            # Move +Y relative to Base
             py = self.stage.move_to(x_um=x0, y_um=y0 + d, wait=True)
             self.sig_stage_updated.emit()
             if settling_s > 0:
                 time.sleep(settling_s)
             img_y = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=py)
-            dc_y, dr_y, resp_y = measure_image_shift_px(img0, img_y)
 
-            # 3. Return cleanly to base position
+            # Return to Base
             self.stage.move_to(x_um=x0, y_um=y0, wait=True)
             self.sig_stage_updated.emit()
 
             dx_actual = float(px["X"]) - x0
             dy_actual = float(py["Y"]) - y0
-            calib = build_plate_calibration_from_jogs(
-                dx_um=dx_actual if abs(dx_actual) > 0.1 else d,
-                dy_um=dy_actual if abs(dy_actual) > 0.1 else d,
-                dp_from_x_px=(dc_x, dr_x),
-                dp_from_y_px=(dc_y, dr_y),
+            self.sig_captured.emit(
+                {
+                    "img0": img0,
+                    "img_x": img_x,
+                    "img_y": img_y,
+                    "x0": x0,
+                    "y0": y0,
+                    "dx_um": dx_actual if abs(dx_actual) > 0.1 else d,
+                    "dy_um": dy_actual if abs(dy_actual) > 0.1 else d,
+                }
             )
-            self.sig_log.emit(
-                f"Brightfield plate calibration complete: scale={calib['um_per_px']:.4f} µm/px "
-                f"(X={calib['um_per_px_x']:.4f}, Y={calib['um_per_px_y']:.4f}), "
-                f"rot={calib['rotation_deg']:+.2f}°, CC peaks=({resp_x:.3f}, {resp_y:.3f})."
-            )
-            self.sig_calibrated.emit(calib)
         except Exception as exc:
             if base_pos is not None:
                 try:
@@ -111,7 +111,38 @@ class _PlateJogCalibWorker(QtCore.QThread):
                     self.sig_stage_updated.emit()
                 except Exception:
                     pass
-            self.sig_error.emit("Plate Calibration Error", str(exc))
+            self.sig_error.emit("Plate Calibration Capture Error", str(exc))
+
+
+class _PlateCorrWorker(QtCore.QThread):
+    """
+    Step 2 of interactive Brightfield plate calibration:
+    Computes autocorrelation & cross-correlation maps for the 3 jog frames.
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_correlated = QtCore.Signal(object)  # corr_res dict
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(self, img0: np.ndarray, img_x: np.ndarray, img_y: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.img0 = img0
+        self.img_x = img_x
+        self.img_y = img_y
+
+    def run(self):
+        try:
+            self.sig_log.emit("Plate Calib Step 2/3 — Computing autocorrelation & 2D cross-correlations...")
+            res = compute_jog_correlations(self.img0, self.img_x, self.img_y)
+            dc_x, dr_x = res["dp_x"]
+            dc_y, dr_y = res["dp_y"]
+            self.sig_log.emit(
+                f"Plate Calib Correlation Peaks: +X=({dc_x:+.2f}, {dr_x:+.2f}) px [pk={res['peak_x']:.3f}] | "
+                f"+Y=({dc_y:+.2f}, {dr_y:+.2f}) px [pk={res['peak_y']:.3f}]."
+            )
+            self.sig_correlated.emit(res)
+        except Exception as exc:
+            self.sig_error.emit("Plate Calibration Correlation Error", str(exc))
 
 
 class _StageMoveWorker(QtCore.QThread):
@@ -175,6 +206,8 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
     sig_display_frame = QtCore.Signal(object, object, float, int, int)
     sig_show_sample_diagnostics = QtCore.Signal(object, str)
     sig_show_brightfield_alignment = QtCore.Signal(object, object, str, str, float, float, float, float)
+    sig_show_plate_calib_images = QtCore.Signal(object, object, object, float, float, float, float)
+    sig_show_plate_calib_correlation = QtCore.Signal(object, object, object, float, float, float, float, object)
     sig_update_live_map = QtCore.Signal(
         object, object, object, object, object, object, object, int, int, object, object, object
     )
@@ -204,7 +237,9 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self._map_paused: bool = False
 
         self._move_worker: Optional[_StageMoveWorker] = None
-        self._plate_calib_worker: Optional[_PlateJogCalibWorker] = None
+        self._plate_calib_worker: Optional[_PlateJogCaptureWorker] = None
+        self._plate_corr_worker: Optional[_PlateCorrWorker] = None
+        self._plate_calib_pending: Optional[Dict[str, Any]] = None
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
         self._bf_worker: Optional[BrightfieldCaptureWorker] = None
         self._ref_fit_worker: Optional[SampleTreatmentWorker] = None
@@ -1001,6 +1036,7 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         for w in (
             self._move_worker,
             self._plate_calib_worker,
+            self._plate_corr_worker,
             self._cal_worker,
             self._bf_worker,
             self._ref_fit_worker,
@@ -1293,20 +1329,127 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
             return
 
         self._stop_live_cb()
+        self._plate_calib_pending = None
         self._set_controls_busy(True)
-        self._plate_calib_worker = _PlateJogCalibWorker(
+        self._plate_calib_worker = _PlateJogCaptureWorker(
             stage=self.stage,
             brightfield_cam=self.brightfield_cam,
             jog_step_um=float(self.spin_bf_jog_step.value()),
-            settling_ms=150.0,
+            settling_ms=300.0,
             parent=self,
         )
         self._plate_calib_worker.sig_log.connect(self.sig_log.emit)
         self._plate_calib_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
-        self._plate_calib_worker.sig_calibrated.connect(self._on_plate_calibrated)
+        self._plate_calib_worker.sig_captured.connect(self._on_plate_jog_captured)
         self._plate_calib_worker.sig_error.connect(self._on_worker_error)
         self._plate_calib_worker.finished.connect(self._on_worker_done)
         self._plate_calib_worker.start()
+
+    @QtCore.Slot(object)
+    def _on_plate_jog_captured(self, step1_data: dict):
+        self._plate_calib_pending = dict(step1_data)
+        self.sig_show_plate_calib_images.emit(
+            step1_data["img0"],
+            step1_data["img_x"],
+            step1_data["img_y"],
+            float(step1_data["x0"]),
+            float(step1_data["y0"]),
+            float(step1_data["dx_um"]),
+            float(step1_data["dy_um"]),
+        )
+
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle("Plate Calibration — Step 1/3")
+        msg.setIcon(QtWidgets.QMessageBox.Information)
+        msg.setText(
+            f"Captured 3 Brightfield frames at Base ({step1_data['x0']:.1f}, {step1_data['y0']:.1f}) µm, "
+            f"+X ({step1_data['dx_um']:+.1f} µm), and +Y ({step1_data['dy_um']:+.1f} µm).\n\n"
+            "Verify on the left panel that the sample visibly shifted between frames 1, 2, and 3.\n"
+            "Click 'Continue' to compute autocorrelation & cross-correlation."
+        )
+        btn_cont = msg.addButton("Continue", QtWidgets.QMessageBox.AcceptRole)
+        msg.addButton(QtWidgets.QMessageBox.Cancel)
+        msg.exec()
+        if msg.clickedButton() != btn_cont:
+            self._plate_calib_pending = None
+            self.sig_log.emit("Plate calibration canceled after Step 1 image inspection.")
+            self._on_worker_done()
+            return
+
+        self._set_controls_busy(True)
+        self._plate_corr_worker = _PlateCorrWorker(
+            img0=step1_data["img0"],
+            img_x=step1_data["img_x"],
+            img_y=step1_data["img_y"],
+            parent=self,
+        )
+        self._plate_corr_worker.sig_log.connect(self.sig_log.emit)
+        self._plate_corr_worker.sig_correlated.connect(self._on_plate_corr_ready)
+        self._plate_corr_worker.sig_error.connect(self._on_worker_error)
+        self._plate_corr_worker.finished.connect(self._on_worker_done)
+        self._plate_corr_worker.start()
+
+    @QtCore.Slot(object)
+    def _on_plate_corr_ready(self, corr_res: dict):
+        data = self._plate_calib_pending
+        if data is None:
+            return
+        self.sig_show_plate_calib_correlation.emit(
+            data["img0"],
+            data["img_x"],
+            data["img_y"],
+            float(data["x0"]),
+            float(data["y0"]),
+            float(data["dx_um"]),
+            float(data["dy_um"]),
+            corr_res,
+        )
+
+        dc_x, dr_x = corr_res["dp_x"]
+        dc_y, dr_y = corr_res["dp_y"]
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle("Plate Calibration — Step 2/3")
+        msg.setIcon(QtWidgets.QMessageBox.Information)
+        msg.setText(
+            f"Autocorrelation & 2D Cross-Correlation RGB map displayed on panel 4 (R=+X, G=+Y, B=Auto).\n\n"
+            f"• +X jog ({data['dx_um']:+.1f} µm): ΔX = {dc_x:+.2f} px, ΔY = {dr_x:+.2f} px (peak = {corr_res['peak_x']:.3f})\n"
+            f"• +Y jog ({data['dy_um']:+.1f} µm): ΔX = {dc_y:+.2f} px, ΔY = {dr_y:+.2f} px (peak = {corr_res['peak_y']:.3f})\n\n"
+            "Click 'Continue' to deduce the pixel/µm relation and update fields."
+        )
+        btn_cont = msg.addButton("Continue", QtWidgets.QMessageBox.AcceptRole)
+        msg.addButton(QtWidgets.QMessageBox.Cancel)
+        msg.exec()
+        if msg.clickedButton() != btn_cont:
+            self._plate_calib_pending = None
+            self.sig_log.emit("Plate calibration canceled after Step 2 correlation inspection.")
+            self._on_worker_done()
+            return
+
+        self._finalize_plate_calibration(data, corr_res)
+
+    def _finalize_plate_calibration(self, step1_data: dict, corr_res: dict):
+        try:
+            calib = build_plate_calibration_from_jogs(
+                dx_um=float(step1_data["dx_um"]),
+                dy_um=float(step1_data["dy_um"]),
+                dp_from_x_px=corr_res["dp_x"],
+                dp_from_y_px=corr_res["dp_y"],
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Plate Calibration Deduction Error", str(exc))
+            return
+        finally:
+            self._plate_calib_pending = None
+            self._on_worker_done()
+
+        P = calib["P_px_per_um"]
+        self.chk_bf_flip_x.setChecked(bool(P[0, 0] < 0))
+        self.chk_bf_flip_y.setChecked(bool(P[1, 1] < 0))
+        self._on_plate_calibrated(calib)
+        self.sig_log.emit(
+            f"Plate Calib Step 3/3 — Deduced scale = {calib['um_per_px']:.4f} µm/px "
+            f"(X={calib['um_per_px_x']:.4f}, Y={calib['um_per_px_y']:.4f} µm/px, rot={calib['rotation_deg']:+.2f}°)."
+        )
 
     @QtCore.Slot(object)
     def _on_plate_calibrated(self, calib: dict):
@@ -1689,9 +1832,13 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
 
     @QtCore.Slot(str, str)
     def _on_worker_error(self, title: str, message: str):
+        self._plate_calib_pending = None
         self.sig_log.emit(f"ERROR [{title}]: {message}")
         QtWidgets.QMessageBox.critical(self, title, message)
+        self._on_worker_done()
 
     def _on_worker_done(self):
+        if self._plate_calib_pending is not None:
+            return
         self._set_controls_busy(False, map_running=False)
         self._refresh_active_angle_ui()
