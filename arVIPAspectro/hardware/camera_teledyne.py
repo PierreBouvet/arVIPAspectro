@@ -7,8 +7,11 @@ hardware control and includes a built-in Simulation / Mock mode (`simulate=True`
 for offline development and UI testing.
 """
 
+import glob
+import os
 import time
 import threading
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
@@ -17,28 +20,194 @@ class TeledyneCameraError(Exception):
     """Exception raised for Teledyne Spinnaker camera communication or SDK errors."""
 
 
+def _find_spinnaker_c_dll_dir() -> Optional[str]:
+    """
+    Searches common Teledyne / FLIR Spinnaker SDK installation paths on Windows
+    for ``SpinnakerC_v*.dll`` and returns the containing directory if found.
+    """
+    if os.name != "nt":
+        return None
+
+    candidate_dirs: List[Path] = []
+
+    # 1. Explicit pylablib parameter if already configured
+    try:
+        import pylablib as pll
+        configured = pll.par.get("devices/dlls/teledyne_spinnaker", None)
+        if configured:
+            candidate_dirs.append(Path(configured))
+    except Exception:
+        pass
+
+    # 2. Environment variables set by Spinnaker installer
+    for env_var in ("SPINNAKER_GENTL64_CTI", "SPINNAKER_GENTL32_CTI"):
+        val = os.environ.get(env_var)
+        if val:
+            p = Path(val).parent
+            candidate_dirs.extend([
+                p,
+                p / "vs2015",
+                p / "vs2017",
+                p / "vs2019",
+                p / "vs2022",
+                p.parent / "bin64" / "vs2015",
+                p.parent / "bin64",
+            ])
+
+    # 3. Standard Program Files locations
+    prog_roots = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ]
+    for root in prog_roots:
+        if not root:
+            continue
+        for vendor_dir in ("Teledyne", "FLIR Systems", "Point Grey Research"):
+            base = Path(root) / vendor_dir / "Spinnaker"
+            for sub in (
+                "bin64/vs2015",
+                "bin64/vs2017",
+                "bin64/vs2019",
+                "bin64/vs2022",
+                "bin64",
+                "bin/vs2015",
+                "bin",
+            ):
+                candidate_dirs.append(base / sub)
+
+    # 4. PATH entries
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry.strip():
+            candidate_dirs.append(Path(entry.strip()))
+
+    seen = set()
+    for d in candidate_dirs:
+        try:
+            resolved = str(d.resolve())
+        except Exception:
+            resolved = str(d)
+        if resolved in seen or not d.is_dir():
+            continue
+        seen.add(resolved)
+        if glob.glob(str(d / "SpinnakerC_v*.dll")):
+            return resolved
+    return None
+
+
+def _configure_spinnaker_dll_path() -> Optional[str]:
+    """
+    Configures `pylablib` and Windows DLL search paths for `SpinnakerC_v*.dll`.
+    Returns the directory used, or None if not found.
+    """
+    dll_dir = _find_spinnaker_c_dll_dir()
+    if dll_dir:
+        try:
+            import pylablib as pll
+            pll.par["devices/dlls/teledyne_spinnaker"] = dll_dir
+        except Exception:
+            pass
+        if hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(dll_dir)
+            except Exception:
+                pass
+        # Also ensure parent bin64 dir (where GenTL / Spinnaker_v140.dll often live) is on DLL path
+        parent_dir = str(Path(dll_dir).parent)
+        if hasattr(os, "add_dll_directory") and Path(parent_dir).is_dir():
+            try:
+                os.add_dll_directory(parent_dir)
+            except Exception:
+                pass
+    return dll_dir
+
+
+def diagnose_teledyne_backend() -> Dict[str, object]:
+    """
+    Collects diagnostic information about the Teledyne Spinnaker Python backend,
+    including DLL discovery, `pylablib.devices.Teledyne` status, and `PySpin` availability.
+    """
+    dll_dir = _configure_spinnaker_dll_path()
+    diag: Dict[str, object] = {
+        "os": os.name,
+        "spinnaker_c_dll_dir": dll_dir,
+        "pylablib_cameras": [],
+        "pylablib_error": None,
+        "pyspin_available": False,
+        "pyspin_cameras": [],
+        "pyspin_error": None,
+    }
+
+    try:
+        from pylablib.devices import Teledyne
+        infos = Teledyne.list_cameras(desc=True)
+        diag["pylablib_cameras"] = [
+            {
+                "index": idx,
+                "name": str(getattr(info, "name", "")),
+                "model": str(getattr(info, "model", "")),
+                "serial": str(getattr(info, "serial", "")),
+                "vendor": str(getattr(info, "vendor", "")),
+            }
+            for idx, info in enumerate(infos)
+        ]
+    except Exception as exc:
+        diag["pylablib_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        import PySpin
+        diag["pyspin_available"] = True
+        system = PySpin.System.GetInstance()
+        cam_list = system.GetCameras()
+        try:
+            cams = []
+            for idx in range(cam_list.GetSize()):
+                cam = cam_list.GetByIndex(idx)
+                nodemap = cam.GetTLDeviceNodeMap()
+                def _node_str(name: str) -> str:
+                    node = PySpin.CStringPtr(nodemap.GetNode(name))
+                    return node.GetValue() if PySpin.IsReadable(node) else ""
+                cams.append({
+                    "index": idx,
+                    "name": _node_str("DeviceDisplayName"),
+                    "model": _node_str("DeviceModelName"),
+                    "serial": _node_str("DeviceSerialNumber"),
+                    "vendor": _node_str("DeviceVendorName"),
+                })
+                del cam
+            diag["pyspin_cameras"] = cams
+        finally:
+            cam_list.Clear()
+            system.ReleaseInstance()
+    except ImportError:
+        pass
+    except Exception as exc:
+        diag["pyspin_error"] = f"{type(exc).__name__}: {exc}"
+
+    return diag
+
+
 def list_teledyne_cameras() -> List[Dict[str, str]]:
     """
     Returns a list of detected Teledyne Spinnaker cameras as dictionaries with
     keys ``index``, ``name``, ``model``, ``serial``, and ``vendor``.
-    Returns ``[]`` if the Spinnaker SDK is not installed or no cameras are found.
+    Automatically configures the Spinnaker C DLL search path before querying.
     """
+    _configure_spinnaker_dll_path()
     try:
         from pylablib.devices import Teledyne
         infos = Teledyne.list_cameras(desc=True)
+        return [
+            {
+                "index": idx,
+                "name": str(getattr(info, "name", "")),
+                "model": str(getattr(info, "model", "")),
+                "serial": str(getattr(info, "serial", "")),
+                "vendor": str(getattr(info, "vendor", "")),
+            }
+            for idx, info in enumerate(infos)
+        ]
     except Exception:
         return []
-
-    cameras: List[Dict[str, str]] = []
-    for idx, info in enumerate(infos):
-        cameras.append({
-            "index": idx,
-            "name": str(getattr(info, "name", "")),
-            "model": str(getattr(info, "model", "")),
-            "serial": str(getattr(info, "serial", "")),
-            "vendor": str(getattr(info, "vendor", "")),
-        })
-    return cameras
 
 
 def count_teledyne_cameras() -> int:
@@ -46,6 +215,7 @@ def count_teledyne_cameras() -> int:
     Returns the number of Teledyne Spinnaker cameras detected on the system.
     Returns 0 if the Spinnaker SDK is not installed or no cameras are connected.
     """
+    _configure_spinnaker_dll_path()
     try:
         from pylablib.devices import Teledyne
         return int(Teledyne.get_cameras_number())
@@ -191,6 +361,10 @@ class TeledyneBrightfieldCamera:
                     f"[{self._detector_size[0]}x{self._detector_size[1]} px]."
                 )
                 return self.get_status()
+
+            dll_dir = _configure_spinnaker_dll_path()
+            if dll_dir:
+                self._log(f"Using Spinnaker C DLL directory: {dll_dir}")
 
             try:
                 from pylablib.devices import Teledyne

@@ -13,6 +13,7 @@ from .camera_teledyne import (
     count_teledyne_cameras,
     list_teledyne_cameras,
     find_chameleon3_camera,
+    diagnose_teledyne_backend,
 )
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "count_teledyne_cameras",
     "list_teledyne_cameras",
     "find_chameleon3_camera",
+    "diagnose_teledyne_backend",
 ]

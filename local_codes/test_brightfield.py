@@ -40,6 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
 from arVIPAspectro.hardware import (
     TeledyneBrightfieldCamera,
     TeledyneCameraError,
+    diagnose_teledyne_backend,
     find_chameleon3_camera,
     list_teledyne_cameras,
 )
@@ -243,12 +244,21 @@ def main():
         if args.simulate:
             cam.connect(simulate=True)
         else:
+            diag = diagnose_teledyne_backend()
+            print("Teledyne backend diagnostics:", diag)
             detected = list_teledyne_cameras()
             print(f"Detected Teledyne Spinnaker cameras: {detected}")
             idx = find_chameleon3_camera("CM3-U3-31S4M")
             if idx is None:
+                err_detail = diag.get("pylablib_error") or "0 cameras returned by Spinnaker."
                 raise TeledyneCameraError(
-                    "No Teledyne Spinnaker camera found. Connect the CM3-U3-31S4M-CS via USB 3.0 "
+                    "No Teledyne Spinnaker camera found.\n"
+                    f"SpinnakerC DLL dir: {diag.get('spinnaker_c_dll_dir')}\n"
+                    f"pylablib error: {err_detail}\n"
+                    f"PySpin available: {diag.get('pyspin_available')} "
+                    f"(cameras: {diag.get('pyspin_cameras')})\n\n"
+                    "Make sure the full Teledyne Spinnaker SDK (including Spinnaker C libraries) "
+                    "is installed, SpinView is closed, and the camera is connected via USB 3.0 "
                     "(or pass --simulate to test offline)."
                 )
             cam.connect(camera_idx=idx)
