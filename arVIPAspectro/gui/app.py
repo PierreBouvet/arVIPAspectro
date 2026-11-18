@@ -47,7 +47,8 @@ class CollapsibleSection(QtWidgets.QWidget):
         self.toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.toggle_btn.setStyleSheet(
             "QToolButton { font-weight: bold; padding: 5px 8px; text-align: left; "
-            "background-color: #2b2b2b; border: 1px solid #455a64; border-radius: 4px; }"
+            "background-color: #d6eaf8; color: #1b4f72; border: 1px solid #85c1e9; border-radius: 4px; }"
+            "QToolButton:hover { background-color: #ebf5fb; }"
         )
         self.toggle_btn.toggled.connect(self._on_toggled)
         outer.addWidget(self.toggle_btn)
