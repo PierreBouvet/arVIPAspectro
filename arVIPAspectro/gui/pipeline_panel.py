@@ -248,6 +248,7 @@ class SampleTreatmentWorker(QtCore.QThread):
                 refractive_index=float(self.params.get("refractive_index", 1.33)),
                 shift_filter_bounds=tuple(self.params.get("shift_filter_bounds", (4.8, 5.3))),
                 lw_filter_bounds=tuple(self.params.get("lw_bounds_ghz", (0.4, 1.3))),
+                ref_role=self.params.get("ref_role"),
             )
             dt = time.time() - t0
             dho = res["dho_results"]
@@ -299,6 +300,8 @@ class MapScanWorker(QtCore.QThread):
         save_raw_data: bool,
         on_the_fly_treatment: bool = True,
         fit_params: Optional[Dict[str, Any]] = None,
+        q_calib_result: Optional[Dict[str, Any]] = None,
+        extra_attrs: Optional[Dict[str, Any]] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -313,6 +316,8 @@ class MapScanWorker(QtCore.QThread):
         self.save_raw_data = save_raw_data
         self.on_the_fly_treatment = bool(on_the_fly_treatment)
         self.fit_params = fit_params or {}
+        self.q_calib_result = q_calib_result
+        self.extra_attrs = extra_attrs
 
         self._pause_requested = False
         self._abort_requested = False
@@ -352,6 +357,7 @@ class MapScanWorker(QtCore.QThread):
                 bin_val_w=bin_w,
                 refractive_index=n_idx,
                 overwrite=True,
+                extra_attrs=self.extra_attrs,
             )
 
             trajectory = self.grid.build_trajectory()
@@ -416,6 +422,7 @@ class MapScanWorker(QtCore.QThread):
                                 lw_bounds_ghz=tuple(self.fit_params.get("lw_bounds_ghz", (0.4, 1.3))),
                                 refractive_index=n_idx,
                                 fast_drift_only=bool(self.fit_params.get("fast_drift_only", True)),
+                                q_calib_result=self.q_calib_result,
                             )
                             map_mean_shift[c_iy, c_ix] = point_fit["mean_shift_ghz"]
                             map_mean_lw[c_iy, c_ix] = point_fit["mean_lw_ghz"]
@@ -532,19 +539,21 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
     sig_lock_geometry = QtCore.Signal(bool)
+    sig_session_updated = QtCore.Signal()
 
     def __init__(
         self,
         camera: OrcaFlashCamera,
         stage: MS2000Stage,
         stop_live_callback: Callable[[], None],
+        session: Optional[AcquisitionSession] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.camera = camera
         self.stage = stage
         self._stop_live_cb = stop_live_callback
-        self.session = AcquisitionSession()
+        self.session = session if session is not None else AcquisitionSession()
 
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
         self._laser_calib_worker: Optional[LaserCalibrationWorker] = None
@@ -1707,6 +1716,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_diag_s_freq.setEnabled(has_sf)
         self.btn_diag_s_dho.setEnabled(has_sf)
         self.btn_diag_s_q.setEnabled(has_sf and (sf_res.get("q_results") is not None))
+        self.sig_session_updated.emit()
 
     # ==========================================================================
     # Event Handlers: Spatial Map Grid & Teaching

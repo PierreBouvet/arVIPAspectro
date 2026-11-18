@@ -213,6 +213,24 @@ class AcquisitionSession:
         # Step 5.3: Reference / Test Sample DHO Fitting & Elliptical q-Vector Calibration results
         self.ref_sample_calib_result: Optional[Dict[str, Any]] = None
 
+        # Multi-angle Reference Samples keyed by sanitized angle label
+        self.multi_angle_ref_images: Dict[str, np.ndarray] = {}
+        self.multi_angle_ref_meta: Dict[str, Dict[str, Any]] = {}
+        self.multi_angle_ref_calibs: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def sanitize_angle_label(label: str) -> str:
+        clean = str(label).strip().replace("/", "_").replace("\\", "_")
+        if not clean:
+            raise ValueError("Angle label cannot be empty.")
+        return clean
+
+    @classmethod
+    def ref_role_for_angle(cls, angle_label: Optional[str] = None) -> str:
+        if angle_label is None or not str(angle_label).strip():
+            return cls.ROLE_REF_SAMPLE
+        return f"{cls.ROLE_REF_SAMPLE}_{cls.sanitize_angle_label(angle_label)}"
+
     @property
     def is_open(self) -> bool:
         return self.wrapper is not None and self.h5_path is not None
@@ -251,6 +269,20 @@ class AcquisitionSession:
         self.ref_sample_image, self.ref_sample_meta = self._try_load_calibration(self.ROLE_REF_SAMPLE)
         self.laser_calib_result = self._try_load_laser_calibration_result()
         self.rb_calib_result = self._try_load_rb_calibration_result()
+
+        self.multi_angle_ref_images.clear()
+        self.multi_angle_ref_meta.clear()
+        self.multi_angle_ref_calibs.clear()
+        prefix = f"{self.ROLE_REF_SAMPLE}_"
+        with h5py.File(self.h5_path, "r") as f:
+            if self.CALIBRATION_GROUP in f:
+                for k in f[self.CALIBRATION_GROUP].keys():
+                    if k.startswith(prefix):
+                        ang = k[len(prefix):]
+                        img, meta = self._try_load_calibration(k)
+                        if img is not None:
+                            self.multi_angle_ref_images[ang] = img
+                            self.multi_angle_ref_meta[ang] = meta
 
         return {
             "h5_path": self.h5_path,
@@ -337,6 +369,11 @@ class AcquisitionSession:
             self.ref_sample_image = np.asarray(image)
             self.ref_sample_meta = attrs
             self.ref_sample_calib_result = None
+        elif role.startswith(f"{self.ROLE_REF_SAMPLE}_"):
+            ang = role[len(self.ROLE_REF_SAMPLE) + 1:]
+            self.multi_angle_ref_images[ang] = np.asarray(image)
+            self.multi_angle_ref_meta[ang] = attrs
+            self.multi_angle_ref_calibs.pop(ang, None)
 
     # ==========================================================================
     # Step 5.1: Laser Reference Calibration (Steps 2 to 6 of arVIPAspectro)
@@ -810,10 +847,12 @@ class AcquisitionSession:
         fixed_ellipse_angle_deg: Optional[float] = 90.0,
         initial_m_theta: float = 3000.0,
         persist_to_ref_group: bool = True,
+        ref_role: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes Steps 11–14 of `arVIPAspectro` (`spectrum_fitting` and `q_vector`) on the
-        Reference Sample (`Brillouin/Calibration/reference_sample`) or a provided test sample frame:
+        Reference Sample (`Brillouin/Calibration/<ref_role>`, defaulting to `reference_sample`)
+        or a provided test sample frame:
           - Step 11 (`calibrate_sample_frequency_map`): Two-stage in-situ 2D frequency map
             self-calibration (`df_coarse`, `dz_map_2d`, `dinst_map_2d`, `freq_corrected`).
           - Step 12 (`fit_sample_dho`): Spatial binning (`bin_val_h x bin_val_w`) & vectorized
@@ -828,10 +867,17 @@ class AcquisitionSession:
                 "Steps 5.1 (Laser Calibration) and 5.2 (Rb Calibration) must be completed before Step 5.3."
             )
 
+        target_role = ref_role.strip() if ref_role else self.ROLE_REF_SAMPLE
+        ang_prefix = f"{self.ROLE_REF_SAMPLE}_"
+        ang_label = target_role[len(ang_prefix):] if target_role.startswith(ang_prefix) else None
+
         if sample_image is None:
-            sample_image = self.ref_sample_image
+            if ang_label is not None:
+                sample_image = self.multi_angle_ref_images.get(ang_label)
+            else:
+                sample_image = self.ref_sample_image
         if sample_image is None:
-            raise RuntimeError("No Reference Sample or test frame available to fit.")
+            raise RuntimeError(f"No Reference Sample image available for '{target_role}'.")
 
         data_sample = np.asarray(sample_image, dtype=np.float64)
         freq_map_base = self.rb_calib_result["freq_map"]
@@ -883,8 +929,14 @@ class AcquisitionSession:
             verbose=False,
         )
 
-        path_ref = f"{self.CALIBRATION_GROUP}/{self.ROLE_REF_SAMPLE}"
-        if persist_to_ref_group and self.ref_sample_image is not None:
+        path_ref = f"{self.CALIBRATION_GROUP}/{target_role}"
+        has_stored_ref = (
+            (ang_label in self.multi_angle_ref_images)
+            if ang_label is not None
+            else (self.ref_sample_image is not None)
+        )
+        should_persist = bool(persist_to_ref_group and has_stored_ref)
+        if should_persist:
             spectrum_fitting.save_treated_data(
                 wrapper=self.wrapper,
                 path_sample=path_ref,
@@ -903,8 +955,8 @@ class AcquisitionSession:
         if run_q_calibration:
             q_results = q_vector.extract_q_vector(
                 data_source=dho_results,
-                path_sample=path_ref if (persist_to_ref_group and self.ref_sample_image is not None) else None,
-                wrapper=self.wrapper if (persist_to_ref_group and self.ref_sample_image is not None) else None,
+                path_sample=path_ref if should_persist else None,
+                wrapper=self.wrapper if should_persist else None,
                 bin_val_h=int(bin_val_h),
                 bin_val_w=int(bin_val_w),
                 refractive_index=float(refractive_index),
@@ -918,7 +970,7 @@ class AcquisitionSession:
                 fixed_ellipse_angle_deg=fixed_ellipse_angle_deg,
                 verbose=False,
             )
-            if persist_to_ref_group and self.ref_sample_image is not None:
+            if should_persist:
                 q_vector.save_q_vector_results(
                     wrapper=self.wrapper,
                     path_sample=path_ref,
@@ -928,6 +980,8 @@ class AcquisitionSession:
                 )
 
         result = {
+            "ref_role": target_role,
+            "angle_label": ang_label,
             "data_sample": data_sample,
             "freq_corrected": freq_corrected,
             "df_coarse": float(df_coarse),
@@ -946,7 +1000,10 @@ class AcquisitionSession:
             "lw_bounds_ghz": (float(lw_bounds_ghz[0]), float(lw_bounds_ghz[1])),
             "refractive_index": float(refractive_index),
         }
-        self.ref_sample_calib_result = result
+        if ang_label is not None:
+            self.multi_angle_ref_calibs[ang_label] = result
+        else:
+            self.ref_sample_calib_result = result
         return result
 
     def determine_n_orders(self, bin_val_h: int = 4, bin_val_w: int = 2) -> int:
@@ -973,12 +1030,13 @@ class AcquisitionSession:
         lw_bounds_ghz: Tuple[float, float] = (0.4, 1.3),
         refractive_index: float = 1.33,
         fast_drift_only: bool = True,
+        q_calib_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Step 5.4: On-the-fly treatment of a single spatial map frame `(iy, ix)`:
           1. Fast coarse elastic frequency drift tracking (`df_coarse`) on the calibrated
-             2D frequency map (using the Step 5.3 aberration-corrected map if available,
-             or the Step 5.2 Rb frequency map).
+             2D frequency map (using the active Step 5.3 / angle-specific aberration-corrected map
+             if available, or the Step 5.2 Rb frequency map).
           2. Spatial binning (`bin_val_h x bin_val_w`) & vectorized DHO peak fitting (`fit_sample_dho`).
           3. Fast normal backscattering shift `Shift_0` (GHz) and acoustic velocity `V_s` (m/s)
              deduction using the locked coaxial ellipse & `M_theta` geometry.
@@ -991,10 +1049,11 @@ class AcquisitionSession:
         fsr_val = float(self.rb_calib_result["FSR_cal"])
         y0_fit = float(self.laser_calib_result["y0_fit"])
 
-        if self.ref_sample_calib_result is not None and (
-            self.ref_sample_calib_result["freq_corrected"].shape == (h, w)
+        active_ref = q_calib_result if q_calib_result is not None else self.ref_sample_calib_result
+        if active_ref is not None and (
+            active_ref["freq_corrected"].shape == (h, w)
         ):
-            freq_base = self.ref_sample_calib_result["freq_corrected"]
+            freq_base = active_ref["freq_corrected"]
         else:
             freq_base = self.rb_calib_result["freq_map"]
 
@@ -1074,8 +1133,8 @@ class AcquisitionSession:
 
         # Fast locked-geometry S(0) and V_s deduction
         q_ref = (
-            self.ref_sample_calib_result.get("q_results")
-            if self.ref_sample_calib_result is not None
+            active_ref.get("q_results")
+            if active_ref is not None
             else None
         )
         if q_ref is not None:
@@ -1139,6 +1198,7 @@ class AcquisitionSession:
         bin_val_w: int = 2,
         refractive_index: float = 1.33,
         overwrite: bool = True,
+        extra_attrs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Optional[str], int]:
         """
         Creates `Brillouin/<map_name>` (`Brillouin_type = 'Measure'`) in the HDF5 file,
@@ -1188,6 +1248,8 @@ class AcquisitionSession:
             "save_raw_data": bool(save_raw_data),
             "on_the_fly_treatment": bool(on_the_fly_treatment),
         }
+        if extra_attrs:
+            attrs.update(extra_attrs)
 
         with self._h5_lock:
             self.wrapper.add_dictionary(

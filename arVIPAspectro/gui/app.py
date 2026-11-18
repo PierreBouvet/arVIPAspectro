@@ -21,6 +21,7 @@ from ..hardware import (
 )
 from .image_viewer import ImageViewerWidget
 from .pipeline_panel import PipelineAcquisitionWidget
+from .multi_angle_panel import MultiAngleAcquisitionWidget
 
 
 class HardwareActionWorker(QtCore.QThread):
@@ -227,9 +228,9 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll_vbox.addStretch()
 
         scroll.setWidget(scroll_content)
-        self.tabs_right.addTab(scroll, "🔧 Steps 1–3: Hardware, Camera & Stage")
+        self.tabs_right.addTab(scroll, "Live preview")
 
-        # Tab 2: Step 4 (Guided Calibration Prompt & Spatial Map Acquisition)
+        # Tab 2: Single angle study
         self.pipeline_panel = PipelineAcquisitionWidget(
             camera=self.camera,
             stage=self.stage,
@@ -253,7 +254,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_panel.sig_stage_updated.connect(self._update_stage_ui)
         self.pipeline_panel.sig_camera_updated.connect(self._update_camera_ui)
         self.pipeline_panel.sig_lock_geometry.connect(self.chk_lock_geometry.setChecked)
-        self.tabs_right.addTab(self.pipeline_panel, "🧭 Steps 4–5: Pipeline, Calibration & Mapping")
+        self.tabs_right.addTab(self.pipeline_panel, "Single angle study")
+
+        # Tab 3: Multi angle studies (shares HDF5 container, Laser & Rb calibrations)
+        self.multi_angle_panel = MultiAngleAcquisitionWidget(
+            camera=self.camera,
+            stage=self.stage,
+            session=self.pipeline_panel.session,
+            stop_live_callback=self._stop_live_if_running,
+            parent=self,
+        )
+        self.multi_angle_panel.sig_log.connect(self._append_log_slot)
+        self.multi_angle_panel.sig_display_frame.connect(self._on_frame_acquired)
+        self.multi_angle_panel.sig_show_sample_diagnostics.connect(
+            self.image_viewer.show_sample_treatment_diagnostics
+        )
+        self.multi_angle_panel.sig_update_live_map.connect(
+            self.image_viewer.update_live_map_view
+        )
+        self.multi_angle_panel.sig_stage_updated.connect(self._update_stage_ui)
+        self.multi_angle_panel.sig_camera_updated.connect(self._update_camera_ui)
+        self.multi_angle_panel.sig_lock_geometry.connect(self.chk_lock_geometry.setChecked)
+        self.pipeline_panel.sig_session_updated.connect(self.multi_angle_panel.refresh_from_session)
+        self.multi_angle_panel.sig_session_updated.connect(self.pipeline_panel._refresh_h5_status_banner)
+        self.tabs_right.addTab(self.multi_angle_panel, "Multi angle studies")
 
         right_layout.addWidget(self.tabs_right, stretch=3)
 
@@ -900,9 +924,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_live_preview.setText("▶ Start Live Preview")
         self.btn_live_preview.setStyleSheet("")
         map_running = (
-            hasattr(self, "pipeline_panel")
-            and self.pipeline_panel._map_worker is not None
-            and self.pipeline_panel._map_worker.isRunning()
+            (
+                hasattr(self, "pipeline_panel")
+                and self.pipeline_panel._map_worker is not None
+                and self.pipeline_panel._map_worker.isRunning()
+            )
+            or (
+                hasattr(self, "multi_angle_panel")
+                and self.multi_angle_panel._map_worker is not None
+                and self.multi_angle_panel._map_worker.isRunning()
+            )
         )
         if not map_running:
             self._set_motion_controls_enabled(True)
@@ -1127,6 +1158,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_motion_controls_enabled(not busy)
         if hasattr(self, "pipeline_panel"):
             self.pipeline_panel._update_map_summary()
+        if hasattr(self, "multi_angle_panel"):
+            self.multi_angle_panel._update_sample_summary()
 
     def _update_stage_ui(self):
         try:
@@ -1159,6 +1192,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_motion_controls_enabled(not busy)
         if hasattr(self, "pipeline_panel"):
             self.pipeline_panel._update_map_summary()
+        if hasattr(self, "multi_angle_panel"):
+            self.multi_angle_panel._update_sample_summary()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         """Ensure hardware connections are cleanly closed when exiting the GUI."""
