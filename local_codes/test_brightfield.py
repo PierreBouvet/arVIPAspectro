@@ -250,15 +250,13 @@ def main():
             print(f"Detected Teledyne Spinnaker cameras: {detected}")
             idx = find_chameleon3_camera("CM3-U3-31S4M")
             if idx is None:
-                err_detail = diag.get("pylablib_error") or "0 cameras returned by Spinnaker."
                 raise TeledyneCameraError(
-                    "No Teledyne Spinnaker camera found.\n"
-                    f"SpinnakerC DLL dir: {diag.get('spinnaker_c_dll_dir')}\n"
-                    f"pylablib error: {err_detail}\n"
-                    f"PySpin available: {diag.get('pyspin_available')} "
-                    f"(cameras: {diag.get('pyspin_cameras')})\n\n"
-                    "Make sure the full Teledyne Spinnaker SDK (including Spinnaker C libraries) "
-                    "is installed, SpinView is closed, and the camera is connected via USB 3.0 "
+                    "No Teledyne / Point Grey camera found.\n"
+                    f"PyCapture2 available: {diag.get('pycapture2_available')} "
+                    f"(error: {diag.get('pycapture2_error')})\n"
+                    f"Spinnaker C DLL dir: {diag.get('spinnaker_c_dll_dir')} "
+                    f"(error: {diag.get('spinnaker_error')})\n\n"
+                    "Make sure FlyCapture2 / SpinView is closed and the camera is connected via USB 3.0 "
                     "(or pass --simulate to test offline)."
                 )
             cam.connect(camera_idx=idx)
