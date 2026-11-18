@@ -1,272 +1,83 @@
 """
-Driver for the Teledyne FLIR (Point Grey) Chameleon3 CM3-U3-31S4M-CS monochrome
-USB 3.0 camera (Sony IMX265 Pregius global shutter CMOS, 2048 x 1536 px, 3.45 um).
+Driver for the Teledyne FLIR Chameleon3 CM3-U3-31S4M-CS monochrome USB 3.0 camera
+(Sony IMX265 Pregius global shutter CMOS, 2048 x 1536 px, 3.45 um pixel pitch).
 
-Supports both:
-  1. **PyCapture2** (FlyCapture2 Python wrapper — primary when FlyCapture2 is installed)
-  2. **pylablib.devices.Teledyne** (Teledyne Spinnaker C SDK — fallback/alternative)
-
-Includes a built-in Simulation / Mock mode (`simulate=True`) for offline
-development and UI testing.
+Uses `pylablib.devices.Teledyne` (wrapping the Teledyne Spinnaker C SDK) for
+hardware control and includes a built-in Simulation / Mock mode (`simulate=True`)
+for offline development and UI testing.
 """
 
-import glob
-import os
 import time
 import threading
-from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 
 class TeledyneCameraError(Exception):
-    """Exception raised for Teledyne / Point Grey camera communication or SDK errors."""
+    """Exception raised for Teledyne Spinnaker camera communication or SDK errors."""
 
 
-def _decode_str(val) -> str:
-    if isinstance(val, bytes):
-        return val.decode("utf-8", errors="replace").strip()
-    return str(val).strip()
-
-
-def _find_spinnaker_c_dll_dir() -> Optional[str]:
+def list_teledyne_cameras() -> List[Dict[str, str]]:
     """
-    Searches common Teledyne / FLIR Spinnaker SDK installation paths on Windows
-    for ``SpinnakerC_v*.dll`` and returns the containing directory if found.
+    Returns a list of detected Teledyne Spinnaker cameras as dictionaries with
+    keys ``index``, ``name``, ``model``, ``serial``, and ``vendor``.
+    Returns ``[]`` if the Spinnaker SDK is not installed or no cameras are found.
     """
-    if os.name != "nt":
-        return None
-
-    candidate_dirs: List[Path] = []
-    try:
-        import pylablib as pll
-        configured = pll.par.get("devices/dlls/teledyne_spinnaker", None)
-        if configured:
-            candidate_dirs.append(Path(configured))
-    except Exception:
-        pass
-
-    for env_var in ("SPINNAKER_GENTL64_CTI", "SPINNAKER_GENTL32_CTI"):
-        val = os.environ.get(env_var)
-        if val:
-            p = Path(val).parent
-            candidate_dirs.extend([
-                p,
-                p / "vs2015",
-                p / "vs2017",
-                p / "vs2019",
-                p / "vs2022",
-                p.parent / "bin64" / "vs2015",
-                p.parent / "bin64",
-            ])
-
-    prog_roots = [
-        os.environ.get("ProgramFiles", r"C:\Program Files"),
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-    ]
-    for root in prog_roots:
-        if not root:
-            continue
-        for vendor_dir in ("Teledyne", "FLIR Systems", "Point Grey Research"):
-            base = Path(root) / vendor_dir / "Spinnaker"
-            for sub in (
-                "bin64/vs2015",
-                "bin64/vs2017",
-                "bin64/vs2019",
-                "bin64/vs2022",
-                "bin64",
-                "bin/vs2015",
-                "bin",
-            ):
-                candidate_dirs.append(base / sub)
-
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if entry.strip():
-            candidate_dirs.append(Path(entry.strip()))
-
-    seen = set()
-    for d in candidate_dirs:
-        try:
-            resolved = str(d.resolve())
-        except Exception:
-            resolved = str(d)
-        if resolved in seen or not d.is_dir():
-            continue
-        seen.add(resolved)
-        if glob.glob(str(d / "SpinnakerC_v*.dll")):
-            return resolved
-    return None
-
-
-def _configure_spinnaker_dll_path() -> Optional[str]:
-    """Configures `pylablib` and Windows DLL search paths for `SpinnakerC_v*.dll`."""
-    dll_dir = _find_spinnaker_c_dll_dir()
-    if dll_dir:
-        try:
-            import pylablib as pll
-            pll.par["devices/dlls/teledyne_spinnaker"] = dll_dir
-        except Exception:
-            pass
-        if hasattr(os, "add_dll_directory"):
-            try:
-                os.add_dll_directory(dll_dir)
-            except Exception:
-                pass
-            parent_dir = str(Path(dll_dir).parent)
-            if Path(parent_dir).is_dir():
-                try:
-                    os.add_dll_directory(parent_dir)
-                except Exception:
-                    pass
-    return dll_dir
-
-
-def _list_pycapture2_cameras() -> Tuple[List[Dict[str, object]], Optional[str]]:
-    """Lists connected FlyCapture2 cameras via `PyCapture2`."""
-    try:
-        import PyCapture2
-    except ImportError as exc:
-        return [], f"PyCapture2 not installed: {exc}"
-
-    try:
-        bus = PyCapture2.BusManager()
-        n_cams = int(bus.getNumOfCameras())
-        cams: List[Dict[str, object]] = []
-        for idx in range(n_cams):
-            uid = bus.getCameraFromIndex(idx)
-            entry: Dict[str, object] = {
-                "index": idx,
-                "name": f"FlyCapture2 Camera #{idx}",
-                "model": "",
-                "serial": "",
-                "vendor": "Point Grey / FLIR",
-                "backend": "pycapture2",
-            }
-            tmp = PyCapture2.Camera()
-            try:
-                tmp.connect(uid)
-                info = tmp.getCameraInfo()
-                entry["model"] = _decode_str(getattr(info, "modelName", ""))
-                entry["serial"] = str(getattr(info, "serialNumber", ""))
-                entry["vendor"] = _decode_str(getattr(info, "vendorName", "Point Grey / FLIR"))
-                entry["name"] = f"{entry['vendor']} {entry['model']}".strip()
-            except Exception:
-                try:
-                    entry["serial"] = str(bus.getCameraSerialNumberFromIndex(idx))
-                except Exception:
-                    pass
-            finally:
-                try:
-                    tmp.disconnect()
-                except Exception:
-                    pass
-            cams.append(entry)
-        return cams, None
-    except Exception as exc:
-        return [], f"{type(exc).__name__}: {exc}"
-
-
-def _list_spinnaker_cameras() -> Tuple[List[Dict[str, object]], Optional[str]]:
-    """Lists connected Spinnaker cameras via `pylablib.devices.Teledyne`."""
-    _configure_spinnaker_dll_path()
     try:
         from pylablib.devices import Teledyne
         infos = Teledyne.list_cameras(desc=True)
-        cams = [
-            {
-                "index": idx,
-                "name": str(getattr(info, "name", "")),
-                "model": str(getattr(info, "model", "")),
-                "serial": str(getattr(info, "serial", "")),
-                "vendor": str(getattr(info, "vendor", "")),
-                "backend": "spinnaker",
-            }
-            for idx, info in enumerate(infos)
-        ]
-        return cams, None
-    except Exception as exc:
-        return [], f"{type(exc).__name__}: {exc}"
+    except Exception:
+        return []
 
-
-def diagnose_teledyne_backend() -> Dict[str, object]:
-    """
-    Collects diagnostic information for both PyCapture2 (FlyCapture2) and
-    pylablib Spinnaker backends.
-    """
-    fc2_cams, fc2_err = _list_pycapture2_cameras()
-    dll_dir = _find_spinnaker_c_dll_dir()
-    spin_cams, spin_err = _list_spinnaker_cameras()
-    return {
-        "os": os.name,
-        "pycapture2_available": fc2_err is None or not str(fc2_err).startswith("PyCapture2 not installed"),
-        "pycapture2_cameras": fc2_cams,
-        "pycapture2_error": fc2_err,
-        "spinnaker_c_dll_dir": dll_dir,
-        "spinnaker_cameras": spin_cams,
-        "spinnaker_error": spin_err,
-    }
-
-
-def list_teledyne_cameras() -> List[Dict[str, object]]:
-    """
-    Returns a list of detected Teledyne / Point Grey cameras.
-    Checks PyCapture2 (FlyCapture2) first, then Teledyne Spinnaker (`pylablib`).
-    """
-    fc2_cams, _ = _list_pycapture2_cameras()
-    if fc2_cams:
-        return fc2_cams
-    spin_cams, _ = _list_spinnaker_cameras()
-    return spin_cams
+    cameras: List[Dict[str, str]] = []
+    for idx, info in enumerate(infos):
+        cameras.append({
+            "index": idx,
+            "name": str(getattr(info, "name", "")),
+            "model": str(getattr(info, "model", "")),
+            "serial": str(getattr(info, "serial", "")),
+            "vendor": str(getattr(info, "vendor", "")),
+        })
+    return cameras
 
 
 def count_teledyne_cameras() -> int:
-    """Returns the number of detected cameras across PyCapture2 and Spinnaker."""
-    return len(list_teledyne_cameras())
+    """
+    Returns the number of Teledyne Spinnaker cameras detected on the system.
+    Returns 0 if the Spinnaker SDK is not installed or no cameras are connected.
+    """
+    try:
+        from pylablib.devices import Teledyne
+        return int(Teledyne.get_cameras_number())
+    except Exception:
+        return 0
 
 
 def find_chameleon3_camera(model_substr: str = "CM3-U3-31S4M") -> Optional[int]:
     """
-    Searches connected cameras for a Chameleon3 CM3-U3-31S4M-CS model.
+    Searches connected Spinnaker cameras for a Chameleon3 CM3-U3-31S4M-CS model.
     Returns the matching zero-based camera index, falls back to ``0`` if another
-    Teledyne / Point Grey camera is connected, or returns ``None`` if none found.
+    Teledyne camera is connected, or returns ``None`` if no cameras are detected.
     """
     cams = list_teledyne_cameras()
     if not cams:
         return None
     target = model_substr.lower()
     for cam in cams:
-        if target in str(cam.get("model", "")).lower() or target in str(cam.get("name", "")).lower():
+        if target in cam["model"].lower() or target in cam["name"].lower():
             return int(cam["index"])
     return 0
 
 
-def _pycapture2_image_to_numpy(image) -> np.ndarray:
-    """Converts a `PyCapture2.Image` buffer into a 2D NumPy array."""
-    rows = int(image.getRows())
-    cols = int(image.getCols())
-    raw = np.asarray(image.getData(), dtype=np.uint8)
-    expected_8 = rows * cols
-    if raw.size == expected_8:
-        return raw.reshape((rows, cols)).copy()
-    if raw.size == expected_8 * 2:
-        return raw.view(np.uint16).reshape((rows, cols)).copy()
-    if raw.size == expected_8 * 3:
-        return raw.reshape((rows, cols, 3)).copy()
-    # Fallback using stride if padded
-    data_size = int(image.getDataSize())
-    stride = data_size // max(1, rows)
-    if stride >= cols:
-        return raw[: rows * stride].reshape((rows, stride))[:, :cols].copy()
-    raise TeledyneCameraError(
-        f"Unexpected PyCapture2 image buffer size {raw.size} for shape ({rows}, {cols})."
-    )
-
-
 class TeledyneBrightfieldCamera:
     """
-    Hardware driver for the Teledyne FLIR (Point Grey) CM3-U3-31S4M-CS brightfield camera.
-    Supports PyCapture2 (FlyCapture2) and Teledyne Spinnaker (`pylablib`) backends,
-    plus a built-in Simulation Mode (`simulate=True`).
+    Hardware driver for the Teledyne FLIR CM3-U3-31S4M-CS brightfield camera.
+    Supports drivable acquisition parameters:
+      - Exposure time (seconds)
+      - Analog gain (dB)
+      - Sensor ROI (hstart, hend, vstart, vend)
+      - Multi-frame averaging (N frames averaged per snap)
+      - Continuous live acquisition (`start_live`, `read_live_frame`, `stop_live`)
     """
 
     DEFAULT_DETECTOR_SIZE: Tuple[int, int] = (2048, 1536)  # (width, height) in pixels
@@ -278,7 +89,6 @@ class TeledyneBrightfieldCamera:
         self._connected: bool = False
         self._simulate: bool = False
         self._live_active: bool = False
-        self._backend: str = "none"  # "pycapture2" | "spinnaker" | "simulate"
         self._camera_idx: int = 0
         self._cam = None
 
@@ -293,7 +103,7 @@ class TeledyneBrightfieldCamera:
         self._frame_averaging: int = 1
 
         # Simulated state
-        self._sim_exposure_s: float = 0.020
+        self._sim_exposure_s: float = 0.020  # 20 ms default for brightfield
         self._sim_gain_db: float = 0.0
         self._sim_roi: Tuple[int, int, int, int] = (0, 2048, 0, 1536)
         self._sim_frame_counter: int = 0
@@ -322,10 +132,6 @@ class TeledyneBrightfieldCamera:
         return self._live_active
 
     @property
-    def backend(self) -> str:
-        return self._backend
-
-    @property
     def model(self) -> str:
         return self._model
 
@@ -346,7 +152,6 @@ class TeledyneBrightfieldCamera:
         camera_idx: Optional[int] = None,
         serial: Optional[str] = None,
         simulate: bool = False,
-        backend: str = "auto",
     ) -> Dict[str, object]:
         """
         Opens a connection to the Teledyne CM3-U3-31S4M-CS camera.
@@ -354,15 +159,17 @@ class TeledyneBrightfieldCamera:
         Parameters
         ----------
         camera_idx : int, optional
-            Zero-based camera index. If None (and `serial` is None), automatically
-            searches for a connected CM3-U3-31S4M camera.
+            Zero-based Spinnaker camera index. If None (and `serial` is None),
+            automatically searches for a connected CM3-U3-31S4M camera.
         serial : str, optional
             Specific camera serial number to open.
         simulate : bool
             If True, connects to an internal brightfield camera simulator (2048x1536).
-        backend : str
-            ``"auto"`` (prefers PyCapture2/FlyCapture2, falls back to Spinnaker),
-            ``"pycapture2"``, or ``"spinnaker"``.
+
+        Returns
+        -------
+        status : dict
+            Complete dictionary of camera identity, sensor geometry, and current parameters.
         """
         with self._lock:
             if self._connected:
@@ -372,7 +179,6 @@ class TeledyneBrightfieldCamera:
                 self._connected = True
                 self._simulate = True
                 self._live_active = False
-                self._backend = "simulate"
                 self._camera_idx = 0 if camera_idx is None else int(camera_idx)
                 self._vendor = "Teledyne FLIR (Simulated)"
                 self._model = "Chameleon3 CM3-U3-31S4M-CS (Sim)"
@@ -386,202 +192,94 @@ class TeledyneBrightfieldCamera:
                 )
                 return self.get_status()
 
-            chosen = backend.lower().strip()
-            if chosen == "auto":
-                fc2_cams, _ = _list_pycapture2_cameras()
-                if fc2_cams:
-                    chosen = "pycapture2"
-                else:
-                    chosen = "spinnaker"
+            try:
+                from pylablib.devices import Teledyne
+            except ImportError as exc:
+                raise TeledyneCameraError(
+                    "The `pylablib` package is required for Teledyne Spinnaker camera control. "
+                    f"Import error: {exc}"
+                ) from exc
 
-            if chosen == "pycapture2":
-                return self._connect_pycapture2(camera_idx=camera_idx, serial=serial)
-            if chosen == "spinnaker":
-                return self._connect_spinnaker(camera_idx=camera_idx, serial=serial)
-            raise TeledyneCameraError(f"Unknown backend '{backend}'. Use 'auto', 'pycapture2', or 'spinnaker'.")
+            try:
+                n_cams = Teledyne.get_cameras_number()
+            except Exception as exc:
+                raise TeledyneCameraError(
+                    "Failed to initialize Teledyne Spinnaker SDK. "
+                    "Ensure the Teledyne Spinnaker SDK is installed and the camera is connected via USB 3.0.\n"
+                    f"Details: {exc}"
+                ) from exc
 
-    def _connect_pycapture2(
-        self,
-        camera_idx: Optional[int] = None,
-        serial: Optional[str] = None,
-    ) -> Dict[str, object]:
-        try:
-            import PyCapture2
-        except ImportError as exc:
-            raise TeledyneCameraError(f"PyCapture2 is not installed: {exc}") from exc
-
-        try:
-            bus = PyCapture2.BusManager()
-            n_cams = int(bus.getNumOfCameras())
             if n_cams <= 0:
                 raise TeledyneCameraError(
-                    "PyCapture2 initialized, but 0 FlyCapture2 cameras were detected."
+                    "Teledyne Spinnaker SDK initialized, but 0 cameras were detected. "
+                    "Verify that the CM3-U3-31S4M-CS is connected via USB 3.0."
                 )
 
-            if serial is not None:
-                uid = bus.getCameraFromSerialNumber(int(serial))
-                idx_used = 0
-            else:
+            if serial is None and camera_idx is None:
+                camera_idx = find_chameleon3_camera()
                 if camera_idx is None:
-                    fc2_cams, _ = _list_pycapture2_cameras()
-                    idx_used = 0
-                    for c in fc2_cams:
-                        if "cm3-u3-31s4m" in str(c.get("model", "")).lower():
-                            idx_used = int(c["index"])
-                            break
-                else:
-                    idx_used = int(camera_idx)
-                if idx_used >= n_cams:
-                    raise TeledyneCameraError(
-                        f"Requested camera index {idx_used}, but only {n_cams} FlyCapture2 camera(s) found."
-                    )
-                uid = bus.getCameraFromIndex(idx_used)
+                    camera_idx = 0
 
-            cam = PyCapture2.Camera()
-            cam.connect(uid)
+            if serial is None and camera_idx is not None and camera_idx >= n_cams:
+                raise TeledyneCameraError(
+                    f"Requested camera index {camera_idx}, but only {n_cams} Spinnaker camera(s) found."
+                )
 
-            info = cam.getCameraInfo()
             try:
-                fmt7_info, _ = cam.getFormat7Info(PyCapture2.MODE.MODE_0)
-                det_size = (int(fmt7_info.maxWidth), int(fmt7_info.maxHeight))
-            except Exception:
-                det_size = self.DEFAULT_DETECTOR_SIZE
+                self._log(
+                    f"Opening Teledyne Spinnaker camera "
+                    f"({'serial=' + serial if serial else f'idx={camera_idx}'})..."
+                )
+                cam = (
+                    Teledyne.TeledyneSpinnakerCamera(serial=serial)
+                    if serial is not None
+                    else Teledyne.TeledyneSpinnakerCamera(idx=int(camera_idx))
+                )
+                info = cam.get_device_info()
+                det_size = cam.get_detector_size()
 
-            # Configure low-latency DROP_FRAMES mode for live viewing
+                self._cam = cam
+                self._connected = True
+                self._simulate = False
+                self._live_active = False
+                self._camera_idx = 0 if camera_idx is None else int(camera_idx)
+                self._vendor = str(getattr(info, "vendor", "Teledyne FLIR"))
+                self._model = str(getattr(info, "model", "CM3-U3-31S4M-CS"))
+                self._serial_number = str(getattr(info, "serial", "Unknown"))
+                self._camera_version = str(getattr(info, "devversion", "Unknown"))
+                self._detector_size = (int(det_size[0]), int(det_size[1]))
+
+                self._configure_defaults()
+
+                self._log(
+                    f"Connected to {self._vendor} {self._model} "
+                    f"(S/N: {self._serial_number}, Sensor: {self._detector_size[0]}x{self._detector_size[1]} px)."
+                )
+                return self.get_status()
+            except Exception as exc:
+                if self._cam is not None:
+                    try:
+                        self._cam.close()
+                    except Exception:
+                        pass
+                    self._cam = None
+                raise TeledyneCameraError(f"Error opening Teledyne camera: {exc}") from exc
+
+    def _configure_defaults(self):
+        """Sets manual exposure/gain and Mono16 (fallback Mono8) pixel format when supported."""
+        if self._cam is None:
+            return
+        for attr, val in (("ExposureAuto", "Off"), ("GainAuto", "Off")):
             try:
-                cfg = cam.getConfiguration()
-                cfg.grabMode = PyCapture2.GRAB_MODE.DROP_FRAMES
-                cfg.grabTimeout = 500
-                cam.setConfiguration(cfg)
+                self._cam.set_attribute_value(attr, val, error_on_missing=False)
             except Exception:
                 pass
-
-            # Disable auto-exposure / auto-shutter / auto-gain for deterministic manual control
-            for ptype in (
-                PyCapture2.PROPERTY_TYPE.AUTO_EXPOSURE,
-                PyCapture2.PROPERTY_TYPE.SHUTTER,
-                PyCapture2.PROPERTY_TYPE.GAIN,
-            ):
-                try:
-                    prop = cam.getProperty(ptype)
-                    prop.autoManualMode = False
-                    prop.onOff = True
-                    if ptype in (PyCapture2.PROPERTY_TYPE.SHUTTER, PyCapture2.PROPERTY_TYPE.GAIN):
-                        prop.absControl = True
-                    cam.setProperty(prop)
-                except Exception:
-                    pass
-
-            self._cam = cam
-            self._connected = True
-            self._simulate = False
-            self._live_active = False
-            self._backend = "pycapture2"
-            self._camera_idx = idx_used
-            self._vendor = _decode_str(getattr(info, "vendorName", "Point Grey / FLIR"))
-            self._model = _decode_str(getattr(info, "modelName", "CM3-U3-31S4M-CS"))
-            self._serial_number = str(getattr(info, "serialNumber", "Unknown"))
-            self._camera_version = _decode_str(getattr(info, "firmwareVersion", "Unknown"))
-            self._detector_size = det_size
-
-            self._log(
-                f"Connected via PyCapture2 to {self._vendor} {self._model} "
-                f"(S/N: {self._serial_number}, Sensor: {det_size[0]}x{det_size[1]} px)."
-            )
-            return self.get_status()
-        except TeledyneCameraError:
-            raise
-        except Exception as exc:
-            raise TeledyneCameraError(f"Error opening camera via PyCapture2: {exc}") from exc
-
-    def _connect_spinnaker(
-        self,
-        camera_idx: Optional[int] = None,
-        serial: Optional[str] = None,
-    ) -> Dict[str, object]:
-        dll_dir = _configure_spinnaker_dll_path()
-        if dll_dir:
-            self._log(f"Using Spinnaker C DLL directory: {dll_dir}")
-
-        try:
-            from pylablib.devices import Teledyne
-        except ImportError as exc:
-            raise TeledyneCameraError(
-                f"The `pylablib` package is required for Spinnaker camera control: {exc}"
-            ) from exc
-
-        try:
-            n_cams = Teledyne.get_cameras_number()
-        except Exception as exc:
-            raise TeledyneCameraError(
-                "Failed to initialize Teledyne Spinnaker SDK (and no PyCapture2 camera found).\n"
-                f"Details: {exc}"
-            ) from exc
-
-        if n_cams <= 0:
-            raise TeledyneCameraError(
-                "Teledyne Spinnaker SDK initialized, but 0 cameras were detected."
-            )
-
-        if serial is None and camera_idx is None:
-            spin_cams, _ = _list_spinnaker_cameras()
-            camera_idx = 0
-            for c in spin_cams:
-                if "cm3-u3-31s4m" in str(c.get("model", "")).lower():
-                    camera_idx = int(c["index"])
-                    break
-
-        if serial is None and camera_idx is not None and camera_idx >= n_cams:
-            raise TeledyneCameraError(
-                f"Requested camera index {camera_idx}, but only {n_cams} Spinnaker camera(s) found."
-            )
-
-        try:
-            cam = (
-                Teledyne.TeledyneSpinnakerCamera(serial=serial)
-                if serial is not None
-                else Teledyne.TeledyneSpinnakerCamera(idx=int(camera_idx))
-            )
-            info = cam.get_device_info()
-            det_size = cam.get_detector_size()
-
-            self._cam = cam
-            self._connected = True
-            self._simulate = False
-            self._live_active = False
-            self._backend = "spinnaker"
-            self._camera_idx = 0 if camera_idx is None else int(camera_idx)
-            self._vendor = str(getattr(info, "vendor", "Teledyne FLIR"))
-            self._model = str(getattr(info, "model", "CM3-U3-31S4M-CS"))
-            self._serial_number = str(getattr(info, "serial", "Unknown"))
-            self._camera_version = str(getattr(info, "devversion", "Unknown"))
-            self._detector_size = (int(det_size[0]), int(det_size[1]))
-
-            for attr, val in (("ExposureAuto", "Off"), ("GainAuto", "Off")):
-                try:
-                    self._cam.set_attribute_value(attr, val, error_on_missing=False)
-                except Exception:
-                    pass
-            for fmt in ("Mono16", "Mono8"):
-                try:
-                    self._cam.set_attribute_value("PixelFormat", fmt, error_on_missing=False)
-                    break
-                except Exception:
-                    continue
-
-            self._log(
-                f"Connected via Spinnaker to {self._vendor} {self._model} "
-                f"(S/N: {self._serial_number}, Sensor: {self._detector_size[0]}x{self._detector_size[1]} px)."
-            )
-            return self.get_status()
-        except Exception as exc:
-            if self._cam is not None:
-                try:
-                    self._cam.close()
-                except Exception:
-                    pass
-                self._cam = None
-            raise TeledyneCameraError(f"Error opening Teledyne camera via Spinnaker: {exc}") from exc
+        for fmt in ("Mono16", "Mono8"):
+            try:
+                self._cam.set_attribute_value("PixelFormat", fmt, error_on_missing=False)
+                break
+            except Exception:
+                continue
 
     def disconnect(self):
         """Stops any active acquisition and closes the connection to the camera."""
@@ -594,17 +292,13 @@ class TeledyneBrightfieldCamera:
                     self._live_active = False
             if self._cam is not None:
                 try:
-                    if self._backend == "pycapture2":
-                        self._cam.disconnect()
-                    elif self._backend == "spinnaker":
-                        self._cam.close()
+                    self._cam.close()
                 except Exception:
                     pass
                 self._cam = None
             was_connected = self._connected
             self._connected = False
             self._simulate = False
-            self._backend = "none"
             if was_connected:
                 self._log(f"Disconnected from {model_info}.")
 
@@ -619,10 +313,6 @@ class TeledyneBrightfieldCamera:
                 raise TeledyneCameraError("Camera is not connected.")
             if self._simulate:
                 return float(self._sim_exposure_s)
-            if self._backend == "pycapture2":
-                import PyCapture2
-                prop = self._cam.getProperty(PyCapture2.PROPERTY_TYPE.SHUTTER)
-                return float(prop.absValue) * 1e-3
             return float(self._cam.get_exposure())
 
     def set_exposure(self, exposure_s: float) -> float:
@@ -635,17 +325,6 @@ class TeledyneBrightfieldCamera:
                 self._sim_exposure_s = exposure_s
                 self._log(f"Exposure set (sim) to {exposure_s * 1e3:.3f} ms.")
                 return self._sim_exposure_s
-            if self._backend == "pycapture2":
-                import PyCapture2
-                prop = self._cam.getProperty(PyCapture2.PROPERTY_TYPE.SHUTTER)
-                prop.onOff = True
-                prop.autoManualMode = False
-                prop.absControl = True
-                prop.absValue = float(exposure_s * 1e3)
-                self._cam.setProperty(prop)
-                actual = float(self._cam.getProperty(PyCapture2.PROPERTY_TYPE.SHUTTER).absValue) * 1e-3
-                self._log(f"Exposure set to {actual * 1e3:.3f} ms.")
-                return actual
             try:
                 self._cam.set_attribute_value("ExposureAuto", "Off", error_on_missing=False)
             except Exception:
@@ -661,13 +340,6 @@ class TeledyneBrightfieldCamera:
                 raise TeledyneCameraError("Camera is not connected.")
             if self._simulate:
                 return float(self._sim_gain_db)
-            if self._backend == "pycapture2":
-                try:
-                    import PyCapture2
-                    prop = self._cam.getProperty(PyCapture2.PROPERTY_TYPE.GAIN)
-                    return float(prop.absValue)
-                except Exception:
-                    return None
             try:
                 val = self._cam.get_attribute_value("Gain", default=None)
                 return float(val) if val is not None else None
@@ -684,21 +356,6 @@ class TeledyneBrightfieldCamera:
                 self._sim_gain_db = min(gain_db, 24.0)
                 self._log(f"Gain set (sim) to {self._sim_gain_db:.2f} dB.")
                 return self._sim_gain_db
-            if self._backend == "pycapture2":
-                try:
-                    import PyCapture2
-                    prop = self._cam.getProperty(PyCapture2.PROPERTY_TYPE.GAIN)
-                    prop.onOff = True
-                    prop.autoManualMode = False
-                    prop.absControl = True
-                    prop.absValue = float(gain_db)
-                    self._cam.setProperty(prop)
-                    actual = self.get_gain()
-                    self._log(f"Gain set to {actual} dB.")
-                    return actual
-                except Exception as exc:
-                    self._log(f"Failed to set gain: {exc}")
-                    return self.get_gain()
             try:
                 self._cam.set_attribute_value("GainAuto", "Off", error_on_missing=False)
                 self._cam.set_attribute_value("Gain", gain_db, error_on_missing=False)
@@ -716,17 +373,6 @@ class TeledyneBrightfieldCamera:
                 raise TeledyneCameraError("Camera is not connected.")
             if self._simulate:
                 return self._sim_roi
-            if self._backend == "pycapture2":
-                try:
-                    fmt7_cfg, _, _ = self._cam.getFormat7Configuration()
-                    ox = int(fmt7_cfg.offsetX)
-                    oy = int(fmt7_cfg.offsetY)
-                    w = int(fmt7_cfg.width)
-                    h = int(fmt7_cfg.height)
-                    return (ox, ox + w, oy, oy + h)
-                except Exception:
-                    det_w, det_h = self._detector_size
-                    return (0, det_w, 0, det_h)
             roi = self._cam.get_roi()
             return tuple(int(v) for v in roi[:4])
 
@@ -759,26 +405,6 @@ class TeledyneBrightfieldCamera:
                 self._log(f"ROI set (sim): X=[{hstart}:{hend}], Y=[{vstart}:{vend}].")
                 return self._sim_roi
 
-            if self._backend == "pycapture2":
-                was_live = self._live_active
-                if was_live:
-                    self.stop_live()
-                try:
-                    fmt7_cfg, pkt_size, _ = self._cam.getFormat7Configuration()
-                    fmt7_cfg.offsetX = hstart
-                    fmt7_cfg.offsetY = vstart
-                    fmt7_cfg.width = hend - hstart
-                    fmt7_cfg.height = vend - vstart
-                    pkt_info, is_valid = self._cam.validateFormat7Settings(fmt7_cfg)
-                    if is_valid:
-                        self._cam.setFormat7Configuration(fmt7_cfg, pkt_info.recommendedBytesPerPacket)
-                    else:
-                        self._cam.setFormat7Configuration(fmt7_cfg, pkt_size)
-                finally:
-                    if was_live:
-                        self.start_live()
-                return self.get_roi()
-
             applied = self._cam.set_roi(hstart=hstart, hend=hend, vstart=vstart, vend=vend)
             roi_tuple = tuple(int(v) for v in applied[:4])
             self._log(
@@ -809,14 +435,6 @@ class TeledyneBrightfieldCamera:
                 return None
             if self._simulate:
                 return 32.5
-            if self._backend == "pycapture2":
-                try:
-                    import PyCapture2
-                    prop = self._cam.getProperty(PyCapture2.PROPERTY_TYPE.TEMPERATURE)
-                    # FlyCapture2 reports temperature in tenths of Kelvin
-                    return float(prop.absValue) - 273.15 if prop.absControl else (float(prop.valueA) / 10.0 - 273.15)
-                except Exception:
-                    return None
             try:
                 temp = self._cam.get_attribute_value("DeviceTemperature", default=None)
                 return float(temp) if temp is not None else None
@@ -832,7 +450,9 @@ class TeledyneBrightfieldCamera:
         n_frames: Optional[int] = None,
         timeout_s: Optional[float] = None,
     ) -> np.ndarray:
-        """Acquires a single 2D image frame (or averaged stack of `n_frames`)."""
+        """
+        Acquires a single 2D image frame (or averaged stack of `n_frames`) as `uint16`/`uint8`.
+        """
         with self._lock:
             if not self._connected:
                 raise TeledyneCameraError("Camera is not connected.")
@@ -853,29 +473,6 @@ class TeledyneBrightfieldCamera:
                 for _ in range(n_frames - 1):
                     acc += self._generate_simulated_frame()
                 return np.clip(np.rint(acc / n_frames), 0, 65535).astype(np.uint16)
-
-            if self._backend == "pycapture2":
-                was_live = self._live_active
-                try:
-                    if not was_live:
-                        self._cam.startCapture()
-                    if n_frames == 1:
-                        return _pycapture2_image_to_numpy(self._cam.retrieveBuffer())
-                    first = _pycapture2_image_to_numpy(self._cam.retrieveBuffer())
-                    acc = first.astype(np.float64)
-                    for _ in range(n_frames - 1):
-                        acc += _pycapture2_image_to_numpy(self._cam.retrieveBuffer())
-                    out_dtype = np.uint16 if first.dtype == np.uint16 else np.uint8
-                    max_val = 65535 if out_dtype == np.uint16 else 255
-                    return np.clip(np.rint(acc / n_frames), 0, max_val).astype(out_dtype)
-                except Exception as exc:
-                    raise TeledyneCameraError(f"Failed to acquire PyCapture2 frame: {exc}") from exc
-                finally:
-                    if not was_live:
-                        try:
-                            self._cam.stopCapture()
-                        except Exception:
-                            pass
 
             try:
                 if n_frames == 1:
@@ -899,23 +496,10 @@ class TeledyneBrightfieldCamera:
                 self._live_active = True
                 self._log("Live acquisition started (sim).")
                 return
-            if self._backend == "pycapture2":
-                try:
-                    import PyCapture2
-                    cfg = self._cam.getConfiguration()
-                    cfg.grabMode = PyCapture2.GRAB_MODE.DROP_FRAMES
-                    cfg.grabTimeout = 200
-                    self._cam.setConfiguration(cfg)
-                    self._cam.startCapture()
-                    self._live_active = True
-                    self._log("Live acquisition started (PyCapture2).")
-                    return
-                except Exception as exc:
-                    raise TeledyneCameraError(f"Failed to start PyCapture2 live capture: {exc}") from exc
             try:
                 self._cam.start_acquisition(buffsize=int(buffsize))
                 self._live_active = True
-                self._log("Live acquisition started (Spinnaker).")
+                self._log("Live acquisition started.")
             except Exception as exc:
                 raise TeledyneCameraError(f"Failed to start live acquisition: {exc}") from exc
 
@@ -929,15 +513,6 @@ class TeledyneBrightfieldCamera:
                 return None
             if self._simulate:
                 return self._generate_simulated_frame()
-            if self._backend == "pycapture2":
-                try:
-                    image = self._cam.retrieveBuffer()
-                    return _pycapture2_image_to_numpy(image)
-                except Exception as exc:
-                    msg = str(exc).lower()
-                    if "timeout" in msg or "timed out" in msg:
-                        return None
-                    raise TeledyneCameraError(f"Error reading PyCapture2 frame: {exc}") from exc
             try:
                 self._cam.wait_for_frame(since="now", timeout=float(timeout_s))
                 frame = self._cam.read_newest_image()
@@ -953,19 +528,13 @@ class TeledyneBrightfieldCamera:
             if not self._live_active:
                 return
             if not self._simulate and self._cam is not None:
-                if self._backend == "pycapture2":
+                try:
+                    self._cam.stop_acquisition()
+                finally:
                     try:
-                        self._cam.stopCapture()
+                        self._cam.clear_acquisition()
                     except Exception:
                         pass
-                else:
-                    try:
-                        self._cam.stop_acquisition()
-                    finally:
-                        try:
-                            self._cam.clear_acquisition()
-                        except Exception:
-                            pass
             self._live_active = False
             self._log("Live acquisition stopped.")
 
@@ -986,6 +555,7 @@ class TeledyneBrightfieldCamera:
         xn = (xx - 0.5 * det_w) / (0.5 * det_w)
         yn = (yy - 0.5 * det_h) / (0.5 * det_h)
 
+        # Vignetted brightfield illumination + drifting synthetic sample features + crosshair
         illum = np.exp(-0.35 * (xn ** 2 + yn ** 2))
         drift_x = 0.04 * np.sin(self._sim_frame_counter * 0.08)
         drift_y = 0.04 * np.cos(self._sim_frame_counter * 0.06)
@@ -1010,7 +580,6 @@ class TeledyneBrightfieldCamera:
                     "connected": False,
                     "simulate": False,
                     "live": False,
-                    "backend": "none",
                     "camera_idx": self._camera_idx,
                     "vendor": "",
                     "model": "",
@@ -1032,7 +601,6 @@ class TeledyneBrightfieldCamera:
                 "connected": True,
                 "simulate": self._simulate,
                 "live": self._live_active,
-                "backend": self._backend,
                 "camera_idx": self._camera_idx,
                 "vendor": self._vendor,
                 "model": self._model,
