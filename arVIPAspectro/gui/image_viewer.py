@@ -932,6 +932,84 @@ class ImageViewerWidget(QtWidgets.QWidget):
             )
         self.canvas.draw_idle()
 
+    def show_brightfield_alignment(
+        self,
+        ref_img: np.ndarray,
+        mov_img: np.ndarray,
+        ref_label: str,
+        cur_label: str,
+        dcol_px: float,
+        drow_px: float,
+        dx_um: float,
+        dy_um: float,
+    ):
+        """
+        Displays a before/after RGB false-color overlay comparing `ref_img` (magenta)
+        vs `mov_img` (green) before and after compensating `(dcol_px, drow_px)`.
+        """
+        from scipy.ndimage import shift as nd_shift
+
+        self._in_diagnostic_view = True
+        self._last_live_map_state = None
+        self._im_artist = None
+        self.figure.clear()
+
+        def _norm01(a: np.ndarray) -> np.ndarray:
+            arr = np.asarray(a, dtype=np.float64)
+            lo, hi = np.percentile(arr, [1.0, 99.5])
+            if hi <= lo:
+                return np.zeros_like(arr)
+            return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+        ref_n = _norm01(ref_img)
+        mov_n = _norm01(mov_img)
+        mov_aligned = np.clip(
+            nd_shift(mov_n, shift=(-float(drow_px), -float(dcol_px)), order=1, mode="nearest"),
+            0.0,
+            1.0,
+        )
+
+        # Magenta (R=ref, B=ref) vs Green (G=mov): aligned overlapping features appear neutral gray/white
+        rgb_before = np.stack([ref_n, mov_n, ref_n], axis=-1)
+        rgb_after = np.stack([ref_n, mov_aligned, ref_n], axis=-1)
+
+        ax1 = self.figure.add_subplot(1, 2, 1)
+        ax2 = self.figure.add_subplot(1, 2, 2)
+
+        ax1.imshow(rgb_before, origin="upper", aspect="equal")
+        h, w = ref_n.shape[:2]
+        cx, cy = 0.5 * w, 0.5 * h
+        if abs(dcol_px) > 0.5 or abs(drow_px) > 0.5:
+            ax1.annotate(
+                "",
+                xy=(cx + dcol_px, cy + drow_px),
+                xytext=(cx, cy),
+                arrowprops=dict(arrowstyle="->", color="yellow", lw=2.0),
+            )
+        ax1.set_title(
+            f"Before Alignment: {ref_label} (Mag) vs {cur_label} (Grn)\n"
+            f"Shift = ({dcol_px:+.2f}, {drow_px:+.2f}) px",
+            fontsize=9,
+        )
+        ax1.set_xlabel("X (px)")
+        ax1.set_ylabel("Y (px)")
+
+        ax2.imshow(rgb_after, origin="upper", aspect="equal")
+        ax2.set_title(
+            f"After Stage Correction: ΔX = {dx_um:+.2f} µm, ΔY = {dy_um:+.2f} µm\n"
+            "(Aligned Overlay Preview)",
+            fontsize=9,
+        )
+        ax2.set_xlabel("X (px)")
+        ax2.set_ylabel("Y (px)")
+
+        self.ax = ax1
+        self.lbl_stats.setText(
+            f"BF Align [{cur_label} → {ref_label}]: Δpx=({dcol_px:+.2f}, {drow_px:+.2f}) | "
+            f"Stage Δ=({dx_um:+.2f}, {dy_um:+.2f}) µm"
+        )
+        self.canvas.draw_idle()
+
     def _on_mouse_move(self, event):
         if event.inaxes is None or event.xdata is None or event.ydata is None:
             self.lbl_cursor.setText("Cursor: —")

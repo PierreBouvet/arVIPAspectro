@@ -17,7 +17,7 @@ from typing import Optional, Dict, Any, Callable, Tuple
 import numpy as np
 from PySide6 import QtWidgets, QtCore
 
-from ..hardware import MS2000Stage, OrcaFlashCamera
+from ..hardware import MS2000Stage, OrcaFlashCamera, TeledyneBrightfieldCamera
 from ..acquisition_pipeline import AcquisitionSession, MapGridConfig
 from .. import config
 
@@ -116,6 +116,76 @@ class CalibrationCaptureWorker(QtCore.QThread):
             self.sig_captured.emit(self.role, frame, pos, exp_s, n_avg, binning)
         except Exception as exc:
             self.sig_error.emit(f"Calibration Capture Error ({self.role})", str(exc))
+
+
+class BrightfieldCaptureWorker(QtCore.QThread):
+    """
+    Background worker that acquires a brightfield image using the Teledyne CM3 camera
+    and persists it under `Brillouin/Calibration/<role>/image` in the active HDF5 session.
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_captured = QtCore.Signal(str, object, object, float, int, int)  # (role, frame, pos, exp_s, n_avg, binning=1)
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(
+        self,
+        session: AcquisitionSession,
+        brightfield_cam: TeledyneBrightfieldCamera,
+        stage: MS2000Stage,
+        role: str,
+        n_avg: Optional[int] = None,
+        extra_attrs: Optional[Dict[str, Any]] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.session = session
+        self.brightfield_cam = brightfield_cam
+        self.stage = stage
+        self.role = role
+        self.n_avg = n_avg
+        self.extra_attrs = extra_attrs
+
+    def run(self):
+        try:
+            exp_s = self.brightfield_cam.get_exposure()
+            gain_db = self.brightfield_cam.get_gain()
+            n_avg = (
+                self.brightfield_cam.set_frame_averaging(int(self.n_avg))
+                if self.n_avg is not None
+                else self.brightfield_cam.get_frame_averaging()
+            )
+            roi = self.brightfield_cam.get_roi()
+
+            pos = None
+            if self.stage.is_connected:
+                try:
+                    pos = self.stage.get_position()
+                except Exception:
+                    pos = None
+
+            self.sig_log.emit(
+                f"Acquiring Brightfield '{self.role}' (Exp={exp_s*1e3:.2f} ms, Avg={n_avg})..."
+            )
+            frame = self.brightfield_cam.snap_frame(n_frames=n_avg, stage_pos_um=pos)
+            self.session.save_brightfield_image(
+                role=self.role,
+                image=frame,
+                exposure_s=exp_s,
+                gain_db=gain_db,
+                n_avg=n_avg,
+                roi=roi,
+                stage_pos_um=pos,
+                camera_model=self.brightfield_cam.model or "Teledyne CM3-U3-31S4M-CS",
+                extra_attrs=self.extra_attrs,
+            )
+            self.sig_log.emit(
+                f"Saved Brightfield '{self.role}' to HDF5: Brillouin/Calibration/{self.role}/image "
+                f"({frame.shape[1]}x{frame.shape[0]} px)."
+            )
+            self.sig_captured.emit(self.role, frame, pos, exp_s, n_avg, 1)
+        except Exception as exc:
+            self.sig_error.emit(f"Brightfield Capture Error ({self.role})", str(exc))
 
 
 class LaserCalibrationWorker(QtCore.QThread):
@@ -547,15 +617,18 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         stage: MS2000Stage,
         stop_live_callback: Callable[[], None],
         session: Optional[AcquisitionSession] = None,
+        brightfield_cam: Optional[TeledyneBrightfieldCamera] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.camera = camera
+        self.brightfield_cam = brightfield_cam
         self.stage = stage
         self._stop_live_cb = stop_live_callback
         self.session = session if session is not None else AcquisitionSession()
 
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
+        self._bf_worker: Optional[BrightfieldCaptureWorker] = None
         self._laser_calib_worker: Optional[LaserCalibrationWorker] = None
         self._rb_calib_worker: Optional[RbCalibrationWorker] = None
         self._sample_fit_worker: Optional[SampleTreatmentWorker] = None
@@ -1093,6 +1166,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         top_row.addWidget(QtWidgets.QLabel("Map Name:"))
         self.txt_map_name = QtWidgets.QLineEdit("Map_01")
         self.txt_map_name.setMaximumWidth(130)
+        self.txt_map_name.textChanged.connect(lambda *_: self._update_brightfield_ui())
         top_row.addWidget(self.txt_map_name)
 
         top_row.addSpacing(8)
@@ -1238,6 +1312,25 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         )
         self.lbl_map_summary.setWordWrap(True)
         layout.addWidget(self.lbl_map_summary)
+
+        # 5B. Pre-Map Brightfield Image (Teledyne CM3)
+        bf_row = QtWidgets.QHBoxLayout()
+        bf_row.addWidget(QtWidgets.QLabel("Brightfield Pre-Map:"))
+        self.lbl_bf_map_status = QtWidgets.QLabel("MISSING")
+        self.lbl_bf_map_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_bf_map_status.setMinimumWidth(110)
+        bf_row.addWidget(self.lbl_bf_map_status)
+
+        self.btn_acq_bf_map = QtWidgets.QPushButton("📷 Acquire Brightfield")
+        self.btn_acq_bf_map.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
+        self.btn_acq_bf_map.clicked.connect(self._on_acquire_map_brightfield)
+        bf_row.addWidget(self.btn_acq_bf_map)
+
+        self.btn_view_bf_map = QtWidgets.QPushButton("👁 View Brightfield")
+        self.btn_view_bf_map.clicked.connect(self._on_view_map_brightfield)
+        bf_row.addWidget(self.btn_view_bf_map)
+        bf_row.addStretch()
+        layout.addLayout(bf_row)
 
         # 6. Execution Controls & Progress Bar
         exec_row = QtWidgets.QHBoxLayout()
@@ -1716,7 +1809,78 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_diag_s_freq.setEnabled(has_sf)
         self.btn_diag_s_dho.setEnabled(has_sf)
         self.btn_diag_s_q.setEnabled(has_sf and (sf_res.get("q_results") is not None))
+        self._update_brightfield_ui()
         self.sig_session_updated.emit()
+
+    def _current_map_brightfield_role(self) -> str:
+        name = self.txt_map_name.text().strip() or "Map_01"
+        return AcquisitionSession.brightfield_role_for_target(name)
+
+    def _update_brightfield_ui(self):
+        if not hasattr(self, "lbl_bf_map_status"):
+            return
+        role = self._current_map_brightfield_role()
+        has_bf = role in self.session.brightfield_images
+        if has_bf:
+            self.lbl_bf_map_status.setText("✓ READY (H5)")
+            self.lbl_bf_map_status.setStyleSheet(
+                "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+            )
+        else:
+            self.lbl_bf_map_status.setText("MISSING")
+            self.lbl_bf_map_status.setStyleSheet(
+                "background-color: #c62828; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+            )
+        bf_conn = self.brightfield_cam is not None and self.brightfield_cam.is_connected
+        self.btn_acq_bf_map.setEnabled(bf_conn and not self._is_busy())
+        self.btn_view_bf_map.setEnabled(has_bf and not self._is_busy())
+
+    def _on_acquire_map_brightfield(self):
+        if self.brightfield_cam is None or not self.brightfield_cam.is_connected:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Brightfield Camera Not Connected",
+                "Please connect the Teledyne Brightfield camera in the 'Live preview' tab first.",
+            )
+            return
+        if not self._ensure_h5_open() or self._is_busy():
+            return
+        self._stop_live_cb()
+        role = self._current_map_brightfield_role()
+        map_name = self.txt_map_name.text().strip() or "Map_01"
+        self._set_controls_busy(True)
+        self._bf_worker = BrightfieldCaptureWorker(
+            session=self.session,
+            brightfield_cam=self.brightfield_cam,
+            stage=self.stage,
+            role=role,
+            extra_attrs={"target_map_name": map_name},
+            parent=self,
+        )
+        self._bf_worker.sig_log.connect(self.sig_log.emit)
+        self._bf_worker.sig_captured.connect(self._on_bf_map_captured)
+        self._bf_worker.sig_error.connect(self._on_worker_error)
+        self._bf_worker.finished.connect(lambda: self._set_controls_busy(False))
+        self._bf_worker.start()
+
+    @QtCore.Slot(str, object, object, float, int, int)
+    def _on_bf_map_captured(self, role: str, frame, pos, exp_s: float, n_avg: int, binning: int):
+        self.sig_display_frame.emit(frame, pos, exp_s, n_avg, binning)
+        self._update_brightfield_ui()
+        self.sig_session_updated.emit()
+
+    def _on_view_map_brightfield(self):
+        role = self._current_map_brightfield_role()
+        img = self.session.brightfield_images.get(role)
+        if img is None:
+            return
+        meta = self.session.brightfield_meta.get(role, {})
+        exp_s = float(meta.get("exposure_s", 0.02))
+        n_avg = int(meta.get("frame_averaging", 1))
+        pos = None
+        if "stage_x_um" in meta and "stage_y_um" in meta:
+            pos = {"X": float(meta["stage_x_um"]), "Y": float(meta["stage_y_um"]), "Z": meta.get("stage_z_um")}
+        self.sig_display_frame.emit(img, pos, exp_s, n_avg, 1)
 
     # ==========================================================================
     # Event Handlers: Spatial Map Grid & Teaching
@@ -1867,6 +2031,27 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
 
+        bf_role = self._current_map_brightfield_role()
+        if bf_role not in self.session.brightfield_images:
+            if self.brightfield_cam is not None and self.brightfield_cam.is_connected:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Brightfield Image Required",
+                    f"No Brightfield image has been recorded for '{bf_role}'.\n"
+                    "Please click '📷 Acquire Brightfield' before starting the map.",
+                )
+                return
+            reply_bf = QtWidgets.QMessageBox.question(
+                self,
+                "Brightfield Camera Disconnected",
+                f"The Teledyne Brightfield camera is not connected and no Brightfield image exists for '{bf_role}'.\n"
+                "Cancel to connect & acquire Brightfield first (Recommended), or proceed without Brightfield?",
+                QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Yes,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if reply_bf != QtWidgets.QMessageBox.Yes:
+                return
+
         if self._is_busy():
             return
 
@@ -1960,6 +2145,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     def _is_busy(self) -> bool:
         if self._cal_worker is not None and self._cal_worker.isRunning():
             return True
+        if self._bf_worker is not None and self._bf_worker.isRunning():
+            return True
         if self._laser_calib_worker is not None and self._laser_calib_worker.isRunning():
             return True
         if self._rb_calib_worker is not None and self._rb_calib_worker.isRunning():
@@ -1977,6 +2164,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             self.btn_acq_laser,
             self.btn_acq_rb,
             self.btn_acq_ref,
+            self.btn_acq_bf_map,
             self.btn_run_laser_calib,
             self.btn_run_rb_calib,
             self.btn_run_sample_fit,

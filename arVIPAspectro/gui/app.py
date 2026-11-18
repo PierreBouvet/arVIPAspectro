@@ -18,6 +18,9 @@ from ..hardware import (
     OrcaFlashCamera,
     OrcaCameraError,
     count_dcam_cameras,
+    TeledyneBrightfieldCamera,
+    TeledyneCameraError,
+    count_teledyne_cameras,
 )
 from .image_viewer import ImageViewerWidget
 from .pipeline_panel import PipelineAcquisitionWidget
@@ -41,10 +44,12 @@ class HardwareActionWorker(QtCore.QThread):
         stage: MS2000Stage,
         action: str,
         params: Optional[Dict[str, Any]] = None,
+        brightfield_cam: Optional[TeledyneBrightfieldCamera] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.camera = camera
+        self.brightfield_cam = brightfield_cam
         self.stage = stage
         self.action = action  # 'snap', 'move_rel', 'move_abs', 'live'
         self.params = params or {}
@@ -52,6 +57,9 @@ class HardwareActionWorker(QtCore.QThread):
 
     def request_stop(self):
         self._stop_requested = True
+
+    def _active_source(self) -> str:
+        return str(self.params.get("camera_source", "orca"))
 
     def run(self):
         try:
@@ -86,17 +94,30 @@ class HardwareActionWorker(QtCore.QThread):
             # 2. Acquire image if requested ('snap' or auto_snap after move)
             should_snap = (self.action == "snap") or bool(self.params.get("auto_snap", True))
             if should_snap:
-                if not self.camera.is_connected:
-                    if self.action == "snap":
-                        raise OrcaCameraError("Camera is not connected.")
-                    self.sig_log.emit("Stage move finished (camera not connected -> skipped auto-snap).")
-                    return
-
                 if pos is None and self.stage.is_connected:
                     try:
                         pos = self.stage.get_position()
                     except Exception:
                         pos = None
+
+                if self._active_source() == "teledyne":
+                    bf = self.brightfield_cam
+                    if bf is None or not bf.is_connected:
+                        if self.action == "snap":
+                            raise TeledyneCameraError("Teledyne Brightfield camera is not connected.")
+                        self.sig_log.emit("Stage move finished (brightfield camera not connected -> skipped auto-snap).")
+                        return
+                    exp_s = bf.get_exposure()
+                    n_avg = bf.get_frame_averaging()
+                    frame = bf.snap_frame(n_frames=n_avg, stage_pos_um=pos)
+                    self.sig_frame_acquired.emit(frame, pos, exp_s, n_avg, 1)
+                    return
+
+                if not self.camera.is_connected:
+                    if self.action == "snap":
+                        raise OrcaCameraError("Camera is not connected.")
+                    self.sig_log.emit("Stage move finished (camera not connected -> skipped auto-snap).")
+                    return
 
                 exp_s = self.camera.get_exposure()
                 n_avg = self.camera.get_frame_averaging()
@@ -108,7 +129,6 @@ class HardwareActionWorker(QtCore.QThread):
             self.sig_error.emit("Hardware Action Error", str(exc))
 
     def _run_live_loop(self):
-        self.sig_log.emit("Live Preview started.")
         pos = None
         if self.stage.is_connected:
             try:
@@ -116,6 +136,30 @@ class HardwareActionWorker(QtCore.QThread):
             except Exception:
                 pos = None
 
+        if self._active_source() == "teledyne":
+            bf = self.brightfield_cam
+            if bf is None or not bf.is_connected:
+                return
+            self.sig_log.emit("Live Preview started (Teledyne Brightfield).")
+            bf.start_live()
+            try:
+                while not self._stop_requested and bf.is_connected:
+                    exp_s = bf.get_exposure()
+                    frame = bf.read_live_frame(timeout_s=0.3)
+                    if self._stop_requested:
+                        break
+                    if frame is not None:
+                        self.sig_frame_acquired.emit(frame, pos, exp_s, 1, 1)
+                    time.sleep(0.02)
+            finally:
+                try:
+                    bf.stop_live()
+                except Exception:
+                    pass
+                self.sig_log.emit("Live Preview stopped (Teledyne Brightfield).")
+            return
+
+        self.sig_log.emit("Live Preview started (Orca Flash 4.0 v3).")
         while not self._stop_requested and self.camera.is_connected:
             exp_s = self.camera.get_exposure()
             binning = self.camera.get_binning()
@@ -142,15 +186,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker: Optional[HardwareActionWorker] = None
         self._live_running: bool = False
         self._syncing_cam_widgets: bool = False
+        self._syncing_bf_widgets: bool = False
 
         # Hardware driver instances
         self.camera = OrcaFlashCamera(logger=self._threadsafe_log)
+        self.brightfield_cam = TeledyneBrightfieldCamera(logger=self._threadsafe_log)
         self.stage = MS2000Stage(logger=self._threadsafe_log)
 
         self._build_ui()
         self._refresh_serial_ports()
         self._scan_dcam_cameras()
+        self._scan_bf_cameras()
         self._update_camera_ui()
+        self._update_brightfield_ui()
         self._update_stage_ui()
 
     # ==========================================================================
@@ -223,6 +271,7 @@ class MainWindow(QtWidgets.QMainWindow):
         conn_row.addWidget(self._build_stage_card(), stretch=1)
         scroll_vbox.addLayout(conn_row)
 
+        scroll_vbox.addWidget(self._build_brightfield_card())
         scroll_vbox.addWidget(self._build_step3_camera_parameters_card())
         scroll_vbox.addWidget(self._build_step2_motion_and_capture_card())
         scroll_vbox.addStretch()
@@ -235,6 +284,7 @@ class MainWindow(QtWidgets.QMainWindow):
             camera=self.camera,
             stage=self.stage,
             stop_live_callback=self._stop_live_if_running,
+            brightfield_cam=self.brightfield_cam,
             parent=self,
         )
         self.pipeline_panel.sig_log.connect(self._append_log_slot)
@@ -262,12 +312,16 @@ class MainWindow(QtWidgets.QMainWindow):
             stage=self.stage,
             session=self.pipeline_panel.session,
             stop_live_callback=self._stop_live_if_running,
+            brightfield_cam=self.brightfield_cam,
             parent=self,
         )
         self.multi_angle_panel.sig_log.connect(self._append_log_slot)
         self.multi_angle_panel.sig_display_frame.connect(self._on_frame_acquired)
         self.multi_angle_panel.sig_show_sample_diagnostics.connect(
             self.image_viewer.show_sample_treatment_diagnostics
+        )
+        self.multi_angle_panel.sig_show_brightfield_alignment.connect(
+            self.image_viewer.show_brightfield_alignment
         )
         self.multi_angle_panel.sig_update_live_map.connect(
             self.image_viewer.update_live_map_view
@@ -527,6 +581,77 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return box
 
+    def _build_brightfield_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Brightfield Camera (Teledyne CM3-U3-31S4M-CS)")
+        v = QtWidgets.QVBoxLayout(box)
+        v.setSpacing(6)
+
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(QtWidgets.QLabel("Status:"))
+        self.lbl_bf_status = QtWidgets.QLabel("DISCONNECTED")
+        self.lbl_bf_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_bf_status.setMinimumWidth(115)
+        row1.addWidget(self.lbl_bf_status)
+
+        row1.addSpacing(8)
+        row1.addWidget(QtWidgets.QLabel("Idx:"))
+        self.spin_bf_idx = QtWidgets.QSpinBox()
+        self.spin_bf_idx.setRange(0, 16)
+        row1.addWidget(self.spin_bf_idx)
+
+        self.btn_bf_scan = QtWidgets.QPushButton("Scan")
+        self.btn_bf_scan.clicked.connect(self._scan_bf_cameras)
+        row1.addWidget(self.btn_bf_scan)
+
+        self.lbl_bf_count = QtWidgets.QLabel("—")
+        row1.addWidget(self.lbl_bf_count)
+
+        self.chk_bf_sim = QtWidgets.QCheckBox("Simulate")
+        row1.addWidget(self.chk_bf_sim)
+        row1.addStretch()
+
+        self.btn_bf_connect = QtWidgets.QPushButton("Connect Brightfield")
+        self.btn_bf_connect.setMinimumHeight(28)
+        self.btn_bf_connect.clicked.connect(self._on_toggle_brightfield)
+        row1.addWidget(self.btn_bf_connect)
+        v.addLayout(row1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        row2.addWidget(QtWidgets.QLabel("Exp (ms):"))
+        self.spin_bf_exp_ms = QtWidgets.QDoubleSpinBox()
+        self.spin_bf_exp_ms.setRange(0.05, 5000.0)
+        self.spin_bf_exp_ms.setDecimals(2)
+        self.spin_bf_exp_ms.setValue(20.0)
+        self.spin_bf_exp_ms.setKeyboardTracking(False)
+        self.spin_bf_exp_ms.valueChanged.connect(self._on_apply_bf_exposure)
+        row2.addWidget(self.spin_bf_exp_ms)
+
+        row2.addWidget(QtWidgets.QLabel("Gain (dB):"))
+        self.spin_bf_gain_db = QtWidgets.QDoubleSpinBox()
+        self.spin_bf_gain_db.setRange(0.0, 24.0)
+        self.spin_bf_gain_db.setDecimals(1)
+        self.spin_bf_gain_db.setValue(0.0)
+        self.spin_bf_gain_db.setKeyboardTracking(False)
+        self.spin_bf_gain_db.valueChanged.connect(self._on_apply_bf_gain)
+        row2.addWidget(self.spin_bf_gain_db)
+
+        row2.addWidget(QtWidgets.QLabel("Avg:"))
+        self.spin_bf_avg = QtWidgets.QSpinBox()
+        self.spin_bf_avg.setRange(1, 100)
+        self.spin_bf_avg.setValue(1)
+        self.spin_bf_avg.valueChanged.connect(self._on_apply_bf_avg)
+        row2.addWidget(self.spin_bf_avg)
+
+        self.btn_bf_full_roi = QtWidgets.QPushButton("Reset Full ROI")
+        self.btn_bf_full_roi.clicked.connect(self._on_bf_reset_roi)
+        row2.addWidget(self.btn_bf_full_roi)
+
+        self.lbl_bf_info = QtWidgets.QLabel("—")
+        self.lbl_bf_info.setStyleSheet("font-size: 11px; color: #b0bec5;")
+        row2.addWidget(self.lbl_bf_info, stretch=1)
+        v.addLayout(row2)
+        return box
+
     def _build_step2_motion_and_capture_card(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("Step 2 — Stage Navigation, Snap & Live Preview")
         layout = QtWidgets.QVBoxLayout(box)
@@ -534,11 +659,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # A. Capture trigger, Live Preview & settling time row
         snap_row = QtWidgets.QHBoxLayout()
-        self.chk_auto_snap = QtWidgets.QCheckBox("Auto-acquire image after every move")
+        snap_row.addWidget(QtWidgets.QLabel("Preview Cam:"))
+        self.combo_preview_source = QtWidgets.QComboBox()
+        self.combo_preview_source.addItem("Orca Flash 4.0 v3 (Spectrometer)", "orca")
+        self.combo_preview_source.addItem("Teledyne CM3 (Brightfield)", "teledyne")
+        self.combo_preview_source.currentIndexChanged.connect(self._on_preview_source_changed)
+        snap_row.addWidget(self.combo_preview_source)
+
+        self.chk_auto_snap = QtWidgets.QCheckBox("Auto-snap")
         self.chk_auto_snap.setChecked(True)
 
         snap_row.addWidget(self.chk_auto_snap)
-        snap_row.addSpacing(8)
+        snap_row.addSpacing(6)
         snap_row.addWidget(QtWidgets.QLabel("Settling:"))
         self.spin_settling_ms = QtWidgets.QSpinBox()
         self.spin_settling_ms.setRange(0, 5000)
@@ -693,6 +825,105 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_dcam_count.setText(f"{n_cams} found")
         self._threadsafe_log(f"DCAM scan: {n_cams} Hamamatsu camera(s) detected.")
 
+    def _scan_bf_cameras(self):
+        n_cams = count_teledyne_cameras()
+        self.lbl_bf_count.setText(f"{n_cams} found")
+        self._threadsafe_log(f"Spinnaker scan: {n_cams} Teledyne camera(s) detected.")
+
+    def _on_toggle_brightfield(self):
+        if self._live_running and self._current_preview_source() == "teledyne":
+            self._stop_live_if_running()
+        if self.brightfield_cam.is_connected:
+            self.brightfield_cam.disconnect()
+        else:
+            simulate = self.chk_bf_sim.isChecked()
+            idx = int(self.spin_bf_idx.value())
+            try:
+                self.brightfield_cam.connect(camera_idx=idx, simulate=simulate)
+            except TeledyneCameraError as exc:
+                self._threadsafe_log(f"ERROR (Brightfield): {exc}")
+                QtWidgets.QMessageBox.warning(self, "Brightfield Connection Error", str(exc))
+        self._update_brightfield_ui()
+
+    def _on_apply_bf_exposure(self):
+        if self._syncing_bf_widgets or not self.brightfield_cam.is_connected:
+            return
+        try:
+            actual_s = self.brightfield_cam.set_exposure(float(self.spin_bf_exp_ms.value()) / 1000.0)
+            self._syncing_bf_widgets = True
+            self.spin_bf_exp_ms.setValue(actual_s * 1000.0)
+            self._syncing_bf_widgets = False
+            self._update_brightfield_ui()
+        except Exception as exc:
+            self._threadsafe_log(f"Brightfield exposure error: {exc}")
+
+    def _on_apply_bf_gain(self):
+        if self._syncing_bf_widgets or not self.brightfield_cam.is_connected:
+            return
+        try:
+            actual_g = self.brightfield_cam.set_gain(float(self.spin_bf_gain_db.value()))
+            if actual_g is not None:
+                self._syncing_bf_widgets = True
+                self.spin_bf_gain_db.setValue(float(actual_g))
+                self._syncing_bf_widgets = False
+            self._update_brightfield_ui()
+        except Exception as exc:
+            self._threadsafe_log(f"Brightfield gain error: {exc}")
+
+    def _on_apply_bf_avg(self, val: int):
+        if self._syncing_bf_widgets:
+            return
+        self.brightfield_cam.set_frame_averaging(int(val))
+
+    def _on_bf_reset_roi(self):
+        if not self.brightfield_cam.is_connected:
+            return
+        was_live = self._live_running and self._current_preview_source() == "teledyne"
+        if was_live:
+            self._stop_live_if_running()
+        try:
+            self.brightfield_cam.reset_full_roi()
+            self._update_brightfield_ui()
+        except Exception as exc:
+            self._threadsafe_log(f"Brightfield ROI reset error: {exc}")
+        if was_live:
+            self._on_toggle_live_preview()
+
+    def _update_brightfield_ui(self):
+        st = self.brightfield_cam.get_status()
+        connected = bool(st["connected"])
+        simulated = bool(st["simulate"])
+        self._set_badge_style(self.lbl_bf_status, connected, simulated)
+        self.btn_bf_connect.setText("Disconnect" if connected else "Connect Brightfield")
+        self.chk_bf_sim.setEnabled(not connected)
+        self.spin_bf_idx.setEnabled(not connected)
+
+        self.spin_bf_exp_ms.setEnabled(connected)
+        self.spin_bf_gain_db.setEnabled(connected)
+        self.spin_bf_avg.setEnabled(connected)
+        self.btn_bf_full_roi.setEnabled(connected)
+
+        if connected:
+            self._syncing_bf_widgets = True
+            if st["exposure_s"] is not None:
+                self.spin_bf_exp_ms.setValue(float(st["exposure_s"]) * 1000.0)
+            if st["gain_db"] is not None:
+                self.spin_bf_gain_db.setValue(float(st["gain_db"]))
+            self.spin_bf_avg.setValue(int(st["frame_averaging"]))
+            self._syncing_bf_widgets = False
+            out_h, out_w = st["output_shape"]
+            temp_s = f" | {st['temperature_c']:.1f}°C" if st["temperature_c"] is not None else ""
+            self.lbl_bf_info.setText(f"{st['model']} | {out_w}×{out_h} px{temp_s}")
+        else:
+            self.lbl_bf_info.setText("Disconnected")
+
+        busy = bool(self._worker and self._worker.isRunning() and not self._live_running)
+        self._set_motion_controls_enabled(not busy)
+        if hasattr(self, "pipeline_panel"):
+            self.pipeline_panel._update_brightfield_ui()
+        if hasattr(self, "multi_angle_panel"):
+            self.multi_angle_panel._refresh_active_angle_ui()
+
     def _refresh_serial_ports(self):
         self.combo_stage_port.clear()
         self.combo_stage_port.addItem("auto (Scan COM)", "auto")
@@ -745,6 +976,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.camera.is_connected:
             self.camera.disconnect()
             self._update_camera_ui()
+        if self.brightfield_cam.is_connected:
+            self.brightfield_cam.disconnect()
+            self._update_brightfield_ui()
         if self.stage.is_connected:
             self.stage.disconnect()
             self._update_stage_ui()
@@ -891,14 +1125,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_live_preview.setText("▶ Start Live Preview")
         self.btn_live_preview.setStyleSheet("")
 
+    def _current_preview_source(self) -> str:
+        return str(self.combo_preview_source.currentData() or "orca")
+
+    def _preview_camera_connected(self) -> bool:
+        if self._current_preview_source() == "teledyne":
+            return self.brightfield_cam.is_connected
+        return self.camera.is_connected
+
+    def _on_preview_source_changed(self):
+        was_live = self._live_running
+        if was_live:
+            self._stop_live_if_running()
+        self._set_motion_controls_enabled(not (self._worker and self._worker.isRunning()))
+        if was_live and self._preview_camera_connected():
+            self._on_toggle_live_preview()
+
     def _on_toggle_live_preview(self):
         if self._live_running:
             self._stop_live_if_running()
             self._set_motion_controls_enabled(True)
             return
 
-        if not self.camera.is_connected:
-            QtWidgets.QMessageBox.warning(self, "Camera Not Connected", "Please connect the camera first.")
+        src = self._current_preview_source()
+        if not self._preview_camera_connected():
+            cam_label = "Teledyne Brightfield camera" if src == "teledyne" else "Orca camera"
+            QtWidgets.QMessageBox.warning(self, "Camera Not Connected", f"Please connect the {cam_label} first.")
             return
 
         if self._worker is not None and self._worker.isRunning():
@@ -909,8 +1161,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_live_preview.setStyleSheet("background-color: #ef6c00; color: white; font-weight: bold;")
         self._worker = HardwareActionWorker(
             camera=self.camera,
+            brightfield_cam=self.brightfield_cam,
             stage=self.stage,
             action="live",
+            params={"camera_source": src},
             parent=self,
         )
         self._worker.sig_log.connect(self._append_log_slot)
@@ -946,12 +1200,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._threadsafe_log("Hardware action already in progress; please wait...")
             return
 
+        merged_params = dict(params or {})
+        merged_params.setdefault("camera_source", self._current_preview_source())
+
         self._set_motion_controls_enabled(False)
         self._worker = HardwareActionWorker(
             camera=self.camera,
+            brightfield_cam=self.brightfield_cam,
             stage=self.stage,
             action=action,
-            params=params,
+            params=merged_params,
             parent=self,
         )
         self._worker.sig_log.connect(self._append_log_slot)
@@ -962,8 +1220,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.start()
 
     def _on_snap_now(self):
-        if not self.camera.is_connected:
-            QtWidgets.QMessageBox.warning(self, "Camera Not Connected", "Please connect the camera first.")
+        if not self._preview_camera_connected():
+            cam_label = "Teledyne Brightfield camera" if self._current_preview_source() == "teledyne" else "Orca camera"
+            QtWidgets.QMessageBox.warning(self, "Camera Not Connected", f"Please connect the {cam_label} first.")
             return
         self._start_hardware_worker(action="snap")
 
@@ -1050,12 +1309,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_motion_controls_enabled(self, enabled: bool):
         cam_ok = self.camera.is_connected and enabled
+        preview_ok = self._preview_camera_connected() and enabled
         stage_ok = self.stage.is_connected and enabled
         has_z = self.stage.has_z_axis and stage_ok
         geom_unlocked = cam_ok and (not self.chk_lock_geometry.isChecked())
 
-        self.btn_snap_now.setEnabled(cam_ok)
-        self.btn_live_preview.setEnabled(self.camera.is_connected)
+        self.btn_snap_now.setEnabled(preview_ok)
+        self.btn_live_preview.setEnabled(self._preview_camera_connected())
         self.spin_exposure_ms.setEnabled(cam_ok or self._live_running)
         self.spin_frame_avg.setEnabled(cam_ok)
         self.combo_readout_speed.setEnabled(cam_ok)

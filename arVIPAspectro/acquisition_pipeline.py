@@ -188,6 +188,8 @@ class AcquisitionSession:
     ROLE_LASER = "laser_reference"
     ROLE_RB = "Rb_absorption"
     ROLE_REF_SAMPLE = "reference_sample"
+    ROLE_BF_PREFIX = "brightfield_"
+    ROLE_BF_STAGE_CALIB = "brightfield_stage_calibration"
 
     def __init__(self):
         self._h5_lock = threading.RLock()
@@ -218,6 +220,11 @@ class AcquisitionSession:
         self.multi_angle_ref_meta: Dict[str, Dict[str, Any]] = {}
         self.multi_angle_ref_calibs: Dict[str, Dict[str, Any]] = {}
 
+        # Brightfield images & pixel-to-stage spatial calibration
+        self.brightfield_images: Dict[str, np.ndarray] = {}
+        self.brightfield_meta: Dict[str, Dict[str, Any]] = {}
+        self.brightfield_stage_calib: Optional[Dict[str, Any]] = None
+
     @staticmethod
     def sanitize_angle_label(label: str) -> str:
         clean = str(label).strip().replace("/", "_").replace("\\", "_")
@@ -230,6 +237,10 @@ class AcquisitionSession:
         if angle_label is None or not str(angle_label).strip():
             return cls.ROLE_REF_SAMPLE
         return f"{cls.ROLE_REF_SAMPLE}_{cls.sanitize_angle_label(angle_label)}"
+
+    @classmethod
+    def brightfield_role_for_target(cls, target_name: str) -> str:
+        return f"{cls.ROLE_BF_PREFIX}{cls.sanitize_angle_label(target_name)}"
 
     @property
     def is_open(self) -> bool:
@@ -273,6 +284,8 @@ class AcquisitionSession:
         self.multi_angle_ref_images.clear()
         self.multi_angle_ref_meta.clear()
         self.multi_angle_ref_calibs.clear()
+        self.brightfield_images.clear()
+        self.brightfield_meta.clear()
         prefix = f"{self.ROLE_REF_SAMPLE}_"
         with h5py.File(self.h5_path, "r") as f:
             if self.CALIBRATION_GROUP in f:
@@ -283,6 +296,14 @@ class AcquisitionSession:
                         if img is not None:
                             self.multi_angle_ref_images[ang] = img
                             self.multi_angle_ref_meta[ang] = meta
+                    elif k.startswith(self.ROLE_BF_PREFIX) and k != self.ROLE_BF_STAGE_CALIB:
+                        img, meta = self._try_load_calibration(k)
+                        if img is not None:
+                            self.brightfield_images[k] = img
+                            self.brightfield_meta[k] = meta
+        loaded_bf_cal = self._try_load_brightfield_stage_calibration()
+        if loaded_bf_cal is not None:
+            self.brightfield_stage_calib = loaded_bf_cal
 
         return {
             "h5_path": self.h5_path,
@@ -374,6 +395,122 @@ class AcquisitionSession:
             self.multi_angle_ref_images[ang] = np.asarray(image)
             self.multi_angle_ref_meta[ang] = attrs
             self.multi_angle_ref_calibs.pop(ang, None)
+
+    def save_brightfield_image(
+        self,
+        role: str,
+        image: np.ndarray,
+        exposure_s: float,
+        gain_db: Optional[float],
+        n_avg: int,
+        roi: Tuple[int, int, int, int],
+        stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
+        camera_model: str = "Teledyne CM3-U3-31S4M-CS",
+        extra_attrs: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Saves a 2D brightfield image under `Brillouin/Calibration/<role>/image` (`Calibration_spectrum`).
+        """
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+
+        grp_path = f"{self.CALIBRATION_GROUP}/{role}"
+        attrs: Dict[str, Any] = {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "camera_model": str(camera_model),
+            "exposure_s": float(exposure_s),
+            "exposure_ms": float(exposure_s * 1e3),
+            "frame_averaging": int(n_avg),
+            "roi_hstart": int(roi[0]),
+            "roi_hend": int(roi[1]),
+            "roi_vstart": int(roi[2]),
+            "roi_vend": int(roi[3]),
+        }
+        if gain_db is not None:
+            attrs["gain_db"] = float(gain_db)
+        if self.brightfield_stage_calib is not None:
+            attrs["um_per_px"] = float(self.brightfield_stage_calib["um_per_px"])
+        if stage_pos_um:
+            if stage_pos_um.get("X") is not None:
+                attrs["stage_x_um"] = float(stage_pos_um["X"])
+            if stage_pos_um.get("Y") is not None:
+                attrs["stage_y_um"] = float(stage_pos_um["Y"])
+            if stage_pos_um.get("Z") is not None:
+                attrs["stage_z_um"] = float(stage_pos_um["Z"])
+        if extra_attrs:
+            attrs.update(extra_attrs)
+
+        with self._h5_lock:
+            self.wrapper.add_dictionary(
+                {
+                    "Raw_data": {"Name": "image", "Data": np.asarray(image)},
+                    "Attributes": attrs,
+                },
+                parent_group=grp_path,
+                create_group=True,
+                Brillouin_type_parent_group="Calibration_spectrum",
+                overwrite=True,
+            )
+
+        self.brightfield_images[role] = np.asarray(image)
+        self.brightfield_meta[role] = attrs
+
+    def save_brightfield_stage_calibration(self, calib: Dict[str, Any]):
+        """Persists the brightfield 2x2 pixel-to-stage Jacobian and scalar metadata into HDF5."""
+        self.brightfield_stage_calib = dict(calib)
+        if not self.is_open:
+            return
+        grp_path = f"{self.CALIBRATION_GROUP}/{self.ROLE_BF_STAGE_CALIB}"
+        attrs = {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "method": str(calib.get("method", "unknown")),
+            "um_per_px": float(calib["um_per_px"]),
+            "um_per_px_x": float(calib.get("um_per_px_x", calib["um_per_px"])),
+            "um_per_px_y": float(calib.get("um_per_px_y", calib["um_per_px"])),
+            "rotation_deg": float(calib.get("rotation_deg", 0.0)),
+            "flip_x": bool(calib.get("flip_x", False)),
+            "flip_y": bool(calib.get("flip_y", False)),
+        }
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "a") as f:
+                if grp_path in f:
+                    del f[grp_path]
+                grp = f.create_group(grp_path)
+                grp.attrs["Brillouin_type"] = "Calibration_spectrum"
+                for k, v in attrs.items():
+                    grp.attrs[k] = v
+                grp.create_dataset("M_um_per_px", data=np.asarray(calib["M_um_per_px"], dtype=np.float64))
+                grp.create_dataset("P_px_per_um", data=np.asarray(calib["P_px_per_um"], dtype=np.float64))
+                f.flush()
+
+    def _try_load_brightfield_stage_calibration(self) -> Optional[Dict[str, Any]]:
+        if not self.is_open:
+            return None
+        grp_path = f"{self.CALIBRATION_GROUP}/{self.ROLE_BF_STAGE_CALIB}"
+        try:
+            with self._h5_lock:
+                with h5py.File(self.h5_path, "r") as f:
+                    if grp_path not in f:
+                        return None
+                    grp = f[grp_path]
+                    if "M_um_per_px" not in grp or "P_px_per_um" not in grp:
+                        return None
+                    M = np.asarray(grp["M_um_per_px"][()], dtype=np.float64)
+                    P = np.asarray(grp["P_px_per_um"][()], dtype=np.float64)
+                    attrs = dict(grp.attrs)
+                    return {
+                        "method": str(attrs.get("method", "hdf5")),
+                        "M_um_per_px": M,
+                        "P_px_per_um": P,
+                        "um_per_px": float(attrs.get("um_per_px", 0.345)),
+                        "um_per_px_x": float(attrs.get("um_per_px_x", attrs.get("um_per_px", 0.345))),
+                        "um_per_px_y": float(attrs.get("um_per_px_y", attrs.get("um_per_px", 0.345))),
+                        "rotation_deg": float(attrs.get("rotation_deg", 0.0)),
+                        "flip_x": bool(attrs.get("flip_x", False)),
+                        "flip_y": bool(attrs.get("flip_y", False)),
+                    }
+        except Exception:
+            return None
 
     # ==========================================================================
     # Step 5.1: Laser Reference Calibration (Steps 2 to 6 of arVIPAspectro)

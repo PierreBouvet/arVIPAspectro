@@ -6,20 +6,112 @@ Reference Sample (`Brillouin/Calibration/reference_sample_<angle>`) and Sample m
 (Single Point or 2D Spatial Map at `Brillouin/<Study>_<angle>`) per illumination angle.
 """
 
+import json
 import re
+import time
 from typing import Optional, Dict, Any, Callable, List
 import h5py
+import numpy as np
 from PySide6 import QtWidgets, QtCore
 
-from ..hardware import MS2000Stage, OrcaFlashCamera
+from ..hardware import MS2000Stage, OrcaFlashCamera, TeledyneBrightfieldCamera
 from ..acquisition_pipeline import AcquisitionSession, MapGridConfig
+from ..brightfield_align import (
+    measure_image_shift_px,
+    build_plate_calibration_from_jogs,
+    build_manual_plate_calibration,
+    pixel_shift_to_stage_delta_um,
+)
 from .pipeline_panel import (
     CalibrationCaptureWorker,
+    BrightfieldCaptureWorker,
     SampleTreatmentWorker,
     MapScanWorker,
     _format_bytes,
     _format_duration,
 )
+
+
+class _PlateJogCalibWorker(QtCore.QThread):
+    """
+    Executes a 3-point ASI MS-2000 stage jog calibration (`Base`, `+dx`, `+dy`, return to `Base`)
+    using the Teledyne Brightfield camera and 2D FFT phase cross-correlation to measure the exact
+    2x2 pixel-to-stage Jacobian (um/px & camera rotation).
+    """
+
+    sig_log = QtCore.Signal(str)
+    sig_calibrated = QtCore.Signal(object)  # calib dict
+    sig_stage_updated = QtCore.Signal()
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(
+        self,
+        stage: MS2000Stage,
+        brightfield_cam: TeledyneBrightfieldCamera,
+        jog_step_um: float = 20.0,
+        settling_ms: float = 150.0,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.stage = stage
+        self.brightfield_cam = brightfield_cam
+        self.jog_step_um = float(jog_step_um)
+        self.settling_ms = max(0.0, float(settling_ms))
+
+    def run(self):
+        base_pos = None
+        try:
+            base_pos = self.stage.get_position()
+            x0 = float(base_pos["X"])
+            y0 = float(base_pos["Y"])
+            settling_s = self.settling_ms / 1000.0
+            d = self.jog_step_um
+
+            self.sig_log.emit(f"Brightfield 3-pt plate calibration starting at ({x0:.2f}, {y0:.2f}) µm (step={d:.1f} µm)...")
+            img0 = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=base_pos)
+
+            # 1. Jog +X
+            px = self.stage.move_to(x_um=x0 + d, y_um=y0, wait=True)
+            self.sig_stage_updated.emit()
+            if settling_s > 0:
+                time.sleep(settling_s)
+            img_x = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=px)
+            dc_x, dr_x, resp_x = measure_image_shift_px(img0, img_x)
+
+            # 2. Jog +Y relative to base
+            py = self.stage.move_to(x_um=x0, y_um=y0 + d, wait=True)
+            self.sig_stage_updated.emit()
+            if settling_s > 0:
+                time.sleep(settling_s)
+            img_y = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=py)
+            dc_y, dr_y, resp_y = measure_image_shift_px(img0, img_y)
+
+            # 3. Return cleanly to base position
+            self.stage.move_to(x_um=x0, y_um=y0, wait=True)
+            self.sig_stage_updated.emit()
+
+            dx_actual = float(px["X"]) - x0
+            dy_actual = float(py["Y"]) - y0
+            calib = build_plate_calibration_from_jogs(
+                dx_um=dx_actual if abs(dx_actual) > 0.1 else d,
+                dy_um=dy_actual if abs(dy_actual) > 0.1 else d,
+                dp_from_x_px=(dc_x, dr_x),
+                dp_from_y_px=(dc_y, dr_y),
+            )
+            self.sig_log.emit(
+                f"Brightfield plate calibration complete: scale={calib['um_per_px']:.4f} µm/px "
+                f"(X={calib['um_per_px_x']:.4f}, Y={calib['um_per_px_y']:.4f}), "
+                f"rot={calib['rotation_deg']:+.2f}°, CC peaks=({resp_x:.3f}, {resp_y:.3f})."
+            )
+            self.sig_calibrated.emit(calib)
+        except Exception as exc:
+            if base_pos is not None:
+                try:
+                    self.stage.move_to(x_um=base_pos.get("X"), y_um=base_pos.get("Y"), wait=True)
+                    self.sig_stage_updated.emit()
+                except Exception:
+                    pass
+            self.sig_error.emit("Plate Calibration Error", str(exc))
 
 
 class _StageMoveWorker(QtCore.QThread):
@@ -82,6 +174,7 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
     sig_log = QtCore.Signal(str)
     sig_display_frame = QtCore.Signal(object, object, float, int, int)
     sig_show_sample_diagnostics = QtCore.Signal(object, str)
+    sig_show_brightfield_alignment = QtCore.Signal(object, object, str, str, float, float, float, float)
     sig_update_live_map = QtCore.Signal(
         object, object, object, object, object, object, object, int, int, object, object, object
     )
@@ -96,10 +189,12 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         stage: MS2000Stage,
         session: AcquisitionSession,
         stop_live_callback: Callable[[], None],
+        brightfield_cam: Optional[TeledyneBrightfieldCamera] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.camera = camera
+        self.brightfield_cam = brightfield_cam
         self.stage = stage
         self.session = session
         self._stop_live_cb = stop_live_callback
@@ -109,10 +204,13 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self._map_paused: bool = False
 
         self._move_worker: Optional[_StageMoveWorker] = None
+        self._plate_calib_worker: Optional[_PlateJogCalibWorker] = None
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
+        self._bf_worker: Optional[BrightfieldCaptureWorker] = None
         self._ref_fit_worker: Optional[SampleTreatmentWorker] = None
         self._map_worker: Optional[MapScanWorker] = None
 
+        self._load_bf_calib_from_settings()
         self._build_ui()
         self.refresh_from_session()
 
@@ -134,8 +232,10 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
 
         layout.addWidget(self._build_shared_calib_card())
         layout.addWidget(self._build_positions_card())
+        layout.addWidget(self._build_bf_plate_calib_card())
         layout.addWidget(self._build_angles_card())
         layout.addWidget(self._build_angle_ref_card())
+        layout.addWidget(self._build_angle_bf_card())
         layout.addWidget(self._build_angle_sample_card())
         layout.addStretch()
 
@@ -234,8 +334,10 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         ctrl.addWidget(self.btn_next_angle)
         v.addLayout(ctrl)
 
-        self.table_angles = QtWidgets.QTableWidget(0, 4)
-        self.table_angles.setHorizontalHeaderLabels(["Angle Label", "Ref Image", "Ref Fit (S0 / Mθ / Vs)", "Saved Measures"])
+        self.table_angles = QtWidgets.QTableWidget(0, 5)
+        self.table_angles.setHorizontalHeaderLabels(
+            ["Angle Label", "Ref Image", "Ref Fit (S0 / Mθ / Vs)", "Brightfield", "Saved Measures"]
+        )
         self.table_angles.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table_angles.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.table_angles.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -244,7 +346,8 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
-        hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
         self.table_angles.setMinimumHeight(115)
         self.table_angles.setMaximumHeight(180)
         self.table_angles.currentCellChanged.connect(lambda *_: self._on_angle_selection_changed())
@@ -387,6 +490,92 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self.lbl_angle_ref_summary.setWordWrap(True)
         self.lbl_angle_ref_summary.setStyleSheet("font-size: 11px; color: #b0bec5;")
         v.addWidget(self.lbl_angle_ref_summary)
+        return box
+
+    def _build_bf_plate_calib_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("2B. Brightfield Plate Spatial Calibration (Pixel ↔ Stage µm/px)")
+        v = QtWidgets.QVBoxLayout(box)
+
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(QtWidgets.QLabel("Plate Scale:"))
+        self.lbl_bf_plate_status = QtWidgets.QLabel("NOT CALIBRATED")
+        row1.addWidget(self.lbl_bf_plate_status)
+
+        row1.addSpacing(8)
+        row1.addWidget(QtWidgets.QLabel("Jog Step:"))
+        self.spin_bf_jog_step = QtWidgets.QDoubleSpinBox()
+        self.spin_bf_jog_step.setRange(1.0, 500.0)
+        self.spin_bf_jog_step.setValue(20.0)
+        self.spin_bf_jog_step.setDecimals(1)
+        self.spin_bf_jog_step.setSuffix(" µm")
+        row1.addWidget(self.spin_bf_jog_step)
+
+        self.btn_auto_calib_plate = QtWidgets.QPushButton("🎯 Auto-Calibrate Plate (3-Pt Jog)")
+        self.btn_auto_calib_plate.setStyleSheet("background-color: #00695c; color: white; font-weight: bold;")
+        self.btn_auto_calib_plate.clicked.connect(self._on_auto_calibrate_plate)
+        row1.addWidget(self.btn_auto_calib_plate)
+        row1.addStretch()
+        v.addLayout(row1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        row2.addWidget(QtWidgets.QLabel("Manual Fallback (µm/px):"))
+        self.spin_bf_manual_scale = QtWidgets.QDoubleSpinBox()
+        self.spin_bf_manual_scale.setRange(0.01, 50.0)
+        self.spin_bf_manual_scale.setDecimals(4)
+        self.spin_bf_manual_scale.setSingleStep(0.01)
+        self.spin_bf_manual_scale.setValue(0.3450)
+        row2.addWidget(self.spin_bf_manual_scale)
+
+        self.chk_bf_flip_x = QtWidgets.QCheckBox("Flip X")
+        self.chk_bf_flip_y = QtWidgets.QCheckBox("Flip Y")
+        row2.addWidget(self.chk_bf_flip_x)
+        row2.addWidget(self.chk_bf_flip_y)
+
+        self.btn_apply_bf_manual = QtWidgets.QPushButton("Apply Manual")
+        self.btn_apply_bf_manual.clicked.connect(self._on_apply_manual_plate_calib)
+        row2.addWidget(self.btn_apply_bf_manual)
+        row2.addStretch()
+        v.addLayout(row2)
+        return box
+
+    def _build_angle_bf_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("4B. Active Angle — Brightfield Pre-Map Capture & Fine Alignment")
+        v = QtWidgets.QVBoxLayout(box)
+
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(QtWidgets.QLabel("Angle Brightfield:"))
+        self.lbl_angle_bf_status = QtWidgets.QLabel("MISSING")
+        row1.addWidget(self.lbl_angle_bf_status)
+
+        self.btn_acq_angle_bf = QtWidgets.QPushButton("📷 Acquire Brightfield")
+        self.btn_acq_angle_bf.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
+        self.btn_acq_angle_bf.clicked.connect(self._on_acquire_angle_brightfield)
+        row1.addWidget(self.btn_acq_angle_bf)
+
+        self.btn_view_angle_bf = QtWidgets.QPushButton("👁 View BF")
+        self.btn_view_angle_bf.clicked.connect(self._on_view_angle_brightfield)
+        row1.addWidget(self.btn_view_angle_bf)
+        row1.addStretch()
+        v.addLayout(row1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        row2.addWidget(QtWidgets.QLabel("Align to Ref Angle:"))
+        self.combo_bf_ref_angle = QtWidgets.QComboBox()
+        row2.addWidget(self.combo_bf_ref_angle)
+
+        self.btn_align_to_ref = QtWidgets.QPushButton("🎯 Align Map to Ref Angle")
+        self.btn_align_to_ref.setStyleSheet("background-color: #ef6c00; color: white; font-weight: bold;")
+        self.btn_align_to_ref.clicked.connect(self._on_align_to_ref_angle)
+        row2.addWidget(self.btn_align_to_ref)
+        row2.addStretch()
+        v.addLayout(row2)
+
+        self.lbl_angle_bf_summary = QtWidgets.QLabel(
+            "Acquire a Brightfield image for this angle before starting a map."
+        )
+        self.lbl_angle_bf_summary.setWordWrap(True)
+        self.lbl_angle_bf_summary.setStyleSheet("font-size: 11px; color: #b0bec5;")
+        v.addWidget(self.lbl_angle_bf_summary)
         return box
 
     def _build_angle_sample_card(self) -> QtWidgets.QGroupBox:
@@ -607,13 +796,14 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self._style_status_badge(self.lbl_laser_badge, has_lc)
         self._style_status_badge(self.lbl_rb_badge, has_rb)
 
-        # Include any reference_sample_<angle> already stored in HDF5
+        # Include any reference_sample_<angle> or brightfield_<angle> already stored in HDF5
         for ang in self.session.multi_angle_ref_images.keys():
             if ang not in self._angles:
                 self._angles.append(ang)
         self._scan_multi_angle_measures_from_h5()
 
         self._rebuild_angles_table()
+        self._refresh_bf_calib_ui()
         self._refresh_active_angle_ui()
 
     def _rebuild_angles_table(self):
@@ -637,13 +827,17 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
                 else:
                     fit_str = "Not fitted"
 
+                bf_role = AcquisitionSession.brightfield_role_for_target(ang)
+                has_bf = bf_role in self.session.brightfield_images
+
                 meas_list = self._angle_measures.get(ang, [])
                 meas_str = ", ".join(meas_list) if meas_list else "—"
 
                 self.table_angles.setItem(row_idx, 0, QtWidgets.QTableWidgetItem(ang))
                 self.table_angles.setItem(row_idx, 1, QtWidgets.QTableWidgetItem("✓" if has_img else "—"))
                 self.table_angles.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(fit_str))
-                self.table_angles.setItem(row_idx, 3, QtWidgets.QTableWidgetItem(meas_str))
+                self.table_angles.setItem(row_idx, 3, QtWidgets.QTableWidgetItem("✓" if has_bf else "—"))
+                self.table_angles.setItem(row_idx, 4, QtWidgets.QTableWidgetItem(meas_str))
 
             target_row = self._angles.index(prev) if (prev in self._angles) else 0
             if self._angles:
@@ -683,6 +877,47 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self.btn_diag_dho.setEnabled(has_fit)
         self.btn_diag_q.setEnabled(has_fit and (fit_res.get("q_results") is not None))
         self.btn_start_sample.setEnabled((self._map_worker is None) or (not self._map_worker.isRunning()))
+
+        # Update Active Angle Brightfield & Alignment controls
+        bf_role = AcquisitionSession.brightfield_role_for_target(ang)
+        has_bf = bf_role in self.session.brightfield_images
+        bf_conn = self.brightfield_cam is not None and self.brightfield_cam.is_connected
+        self._style_status_badge(self.lbl_angle_bf_status, has_bf, ok_text="✓ READY", bad_text="MISSING")
+        self.btn_acq_angle_bf.setEnabled(bf_conn and not busy)
+        self.btn_view_angle_bf.setEnabled(has_bf and not busy)
+
+        prev_ref_ang = self.combo_bf_ref_angle.currentData()
+        self.combo_bf_ref_angle.clear()
+        for a in self._angles:
+            if AcquisitionSession.brightfield_role_for_target(a) in self.session.brightfield_images:
+                self.combo_bf_ref_angle.addItem(a, a)
+        if prev_ref_ang is not None:
+            idx = self.combo_bf_ref_angle.findData(prev_ref_ang)
+            if idx >= 0:
+                self.combo_bf_ref_angle.setCurrentIndex(idx)
+
+        can_align = (
+            has_bf
+            and (self.combo_bf_ref_angle.count() > 0)
+            and (self.session.brightfield_stage_calib is not None)
+            and not busy
+        )
+        self.btn_align_to_ref.setEnabled(can_align)
+        if has_bf:
+            bf_meta = self.session.brightfield_meta.get(bf_role, {})
+            pos_txt = (
+                f"@ ({float(bf_meta['stage_x_um']):.2f}, {float(bf_meta['stage_y_um']):.2f}) µm"
+                if "stage_x_um" in bf_meta and "stage_y_um" in bf_meta
+                else ""
+            )
+            self.lbl_angle_bf_summary.setText(
+                f"Brightfield stored at Brillouin/Calibration/{bf_role}/image {pos_txt}."
+            )
+        else:
+            self.lbl_angle_bf_summary.setText(
+                f"Click 'Acquire Brightfield' at '{ang}' before starting a map or aligning to another angle."
+            )
+        self._refresh_bf_calib_ui()
 
         if has_fit:
             dho = fit_res["dho_results"]
@@ -763,7 +998,14 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
     # ==========================================================================
 
     def _is_busy(self) -> bool:
-        for w in (self._move_worker, self._cal_worker, self._ref_fit_worker, self._map_worker):
+        for w in (
+            self._move_worker,
+            self._plate_calib_worker,
+            self._cal_worker,
+            self._bf_worker,
+            self._ref_fit_worker,
+            self._map_worker,
+        ):
             if w is not None and w.isRunning():
                 return True
         return False
@@ -775,8 +1017,12 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self.table_angles.setEnabled(not busy)
         self.btn_go_ref_pos.setEnabled(not busy)
         self.btn_go_smp_pos.setEnabled(not busy)
+        self.btn_auto_calib_plate.setEnabled(not busy)
+        self.btn_apply_bf_manual.setEnabled(not busy)
         self.btn_acq_ref.setEnabled(not busy)
         self.btn_fit_ref.setEnabled(not busy)
+        self.btn_acq_angle_bf.setEnabled(not busy)
+        self.btn_align_to_ref.setEnabled(not busy)
         self.btn_start_sample.setEnabled(not busy)
         self.btn_pause_sample.setEnabled(map_running)
         self.btn_abort_sample.setEnabled(map_running)
@@ -976,6 +1222,270 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self.sig_show_sample_diagnostics.emit(res, view_mode)
 
     # ==========================================================================
+    # Brightfield Plate Calibration & Fine Multi-Angle Alignment
+    # ==========================================================================
+
+    def _load_bf_calib_from_settings(self):
+        if self.session.brightfield_stage_calib is not None:
+            return
+        settings = QtCore.QSettings("arVIPAspectro", "BrightfieldCalibration")
+        raw = settings.value("calib_json", "")
+        if not raw:
+            return
+        try:
+            data = json.loads(str(raw))
+            data["M_um_per_px"] = np.asarray(data["M_um_per_px"], dtype=np.float64)
+            data["P_px_per_um"] = np.asarray(data["P_px_per_um"], dtype=np.float64)
+            self.session.brightfield_stage_calib = data
+        except Exception:
+            pass
+
+    def _save_bf_calib_to_settings(self, calib: Dict[str, Any]):
+        settings = QtCore.QSettings("arVIPAspectro", "BrightfieldCalibration")
+        payload = {
+            "method": str(calib.get("method", "unknown")),
+            "um_per_px": float(calib["um_per_px"]),
+            "um_per_px_x": float(calib.get("um_per_px_x", calib["um_per_px"])),
+            "um_per_px_y": float(calib.get("um_per_px_y", calib["um_per_px"])),
+            "rotation_deg": float(calib.get("rotation_deg", 0.0)),
+            "flip_x": bool(calib.get("flip_x", False)),
+            "flip_y": bool(calib.get("flip_y", False)),
+            "M_um_per_px": np.asarray(calib["M_um_per_px"], dtype=np.float64).tolist(),
+            "P_px_per_um": np.asarray(calib["P_px_per_um"], dtype=np.float64).tolist(),
+        }
+        settings.setValue("calib_json", json.dumps(payload))
+
+    def _refresh_bf_calib_ui(self):
+        cal = self.session.brightfield_stage_calib
+        if cal is not None:
+            self._style_status_badge(
+                self.lbl_bf_plate_status,
+                True,
+                ok_text=f"✓ {cal['um_per_px']:.4f} µm/px (rot={cal.get('rotation_deg', 0.0):+.1f}°)",
+            )
+            self.spin_bf_manual_scale.blockSignals(True)
+            self.spin_bf_manual_scale.setValue(float(cal["um_per_px"]))
+            self.spin_bf_manual_scale.blockSignals(False)
+        else:
+            self._style_status_badge(self.lbl_bf_plate_status, False, bad_text="NOT CALIBRATED")
+
+        ready_hw = (
+            self.brightfield_cam is not None
+            and self.brightfield_cam.is_connected
+            and self.stage.is_connected
+            and not self._is_busy()
+        )
+        self.btn_auto_calib_plate.setEnabled(ready_hw)
+        self.btn_apply_bf_manual.setEnabled(not self._is_busy())
+
+    def _on_auto_calibrate_plate(self):
+        if self.brightfield_cam is None or not self.brightfield_cam.is_connected:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Brightfield Camera Not Connected",
+                "Please connect the Teledyne Brightfield camera in 'Live preview' first.",
+            )
+            return
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the ASI MS-2000 stage first.")
+            return
+        if self._is_busy():
+            return
+
+        self._stop_live_cb()
+        self._set_controls_busy(True)
+        self._plate_calib_worker = _PlateJogCalibWorker(
+            stage=self.stage,
+            brightfield_cam=self.brightfield_cam,
+            jog_step_um=float(self.spin_bf_jog_step.value()),
+            settling_ms=150.0,
+            parent=self,
+        )
+        self._plate_calib_worker.sig_log.connect(self.sig_log.emit)
+        self._plate_calib_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
+        self._plate_calib_worker.sig_calibrated.connect(self._on_plate_calibrated)
+        self._plate_calib_worker.sig_error.connect(self._on_worker_error)
+        self._plate_calib_worker.finished.connect(self._on_worker_done)
+        self._plate_calib_worker.start()
+
+    @QtCore.Slot(object)
+    def _on_plate_calibrated(self, calib: dict):
+        self.session.save_brightfield_stage_calibration(calib)
+        self._save_bf_calib_to_settings(calib)
+        self._refresh_bf_calib_ui()
+        self._refresh_active_angle_ui()
+
+    def _on_apply_manual_plate_calib(self):
+        calib = build_manual_plate_calibration(
+            um_per_px=float(self.spin_bf_manual_scale.value()),
+            flip_x=bool(self.chk_bf_flip_x.isChecked()),
+            flip_y=bool(self.chk_bf_flip_y.isChecked()),
+            rotation_deg=0.0,
+        )
+        self.session.save_brightfield_stage_calibration(calib)
+        self._save_bf_calib_to_settings(calib)
+        self.sig_log.emit(
+            f"Applied manual brightfield plate calibration: {calib['um_per_px']:.4f} µm/px "
+            f"(flip_x={calib['flip_x']}, flip_y={calib['flip_y']})."
+        )
+        self._refresh_bf_calib_ui()
+        self._refresh_active_angle_ui()
+
+    def _on_acquire_angle_brightfield(self):
+        if self.brightfield_cam is None or not self.brightfield_cam.is_connected:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Brightfield Camera Not Connected",
+                "Please connect the Teledyne Brightfield camera in 'Live preview' first.",
+            )
+            return
+        if not self._ensure_ready_for_multi_angle():
+            return
+        ang = self.current_angle_label()
+        if ang is None or self._is_busy():
+            return
+
+        self._stop_live_cb()
+        role = AcquisitionSession.brightfield_role_for_target(ang)
+        self._set_controls_busy(True)
+        self._bf_worker = BrightfieldCaptureWorker(
+            session=self.session,
+            brightfield_cam=self.brightfield_cam,
+            stage=self.stage,
+            role=role,
+            extra_attrs={"illumination_angle_label": str(ang)},
+            parent=self,
+        )
+        self._bf_worker.sig_log.connect(self.sig_log.emit)
+        self._bf_worker.sig_captured.connect(self._on_angle_bf_captured)
+        self._bf_worker.sig_error.connect(self._on_worker_error)
+        self._bf_worker.finished.connect(self._on_worker_done)
+        self._bf_worker.start()
+
+    @QtCore.Slot(str, object, object, float, int, int)
+    def _on_angle_bf_captured(self, role: str, frame, pos, exp_s: float, n_avg: int, binning: int):
+        self.sig_display_frame.emit(frame, pos, exp_s, n_avg, binning)
+        self._rebuild_angles_table()
+        self._refresh_active_angle_ui()
+        self.sig_session_updated.emit()
+
+    def _on_view_angle_brightfield(self):
+        ang = self.current_angle_label()
+        if not ang:
+            return
+        role = AcquisitionSession.brightfield_role_for_target(ang)
+        img = self.session.brightfield_images.get(role)
+        if img is None:
+            return
+        meta = self.session.brightfield_meta.get(role, {})
+        exp_s = float(meta.get("exposure_s", 0.02))
+        n_avg = int(meta.get("frame_averaging", 1))
+        pos = None
+        if "stage_x_um" in meta and "stage_y_um" in meta:
+            pos = {"X": float(meta["stage_x_um"]), "Y": float(meta["stage_y_um"]), "Z": meta.get("stage_z_um")}
+        self.sig_display_frame.emit(img, pos, exp_s, n_avg, 1)
+
+    def compute_alignment_to_ref(self, ref_ang: str, cur_ang: str) -> Dict[str, Any]:
+        """
+        Computes sub-pixel brightfield offset between `ref_ang` and `cur_ang`, converts it
+        to `(dx_um, dy_um)` via the calibrated 2x2 Jacobian, and updates the preview viewer.
+        """
+        calib = self.session.brightfield_stage_calib
+        if calib is None:
+            raise RuntimeError("Brightfield plate calibration (µm/px) must be run or applied first.")
+        ref_role = AcquisitionSession.brightfield_role_for_target(ref_ang)
+        cur_role = AcquisitionSession.brightfield_role_for_target(cur_ang)
+        ref_img = self.session.brightfield_images.get(ref_role)
+        cur_img = self.session.brightfield_images.get(cur_role)
+        if ref_img is None or cur_img is None:
+            raise RuntimeError("Both Reference Angle and Active Angle Brightfield images are required.")
+
+        dcol_px, drow_px, peak_val = measure_image_shift_px(ref_img, cur_img)
+        dx_um, dy_um = pixel_shift_to_stage_delta_um(calib, dcol_px, drow_px)
+
+        cur_meta = self.session.brightfield_meta.get(cur_role, {})
+        if "stage_x_um" in cur_meta and "stage_y_um" in cur_meta:
+            base_x = float(cur_meta["stage_x_um"])
+            base_y = float(cur_meta["stage_y_um"])
+        elif self.stage.is_connected:
+            pos = self.stage.get_position()
+            base_x = float(pos.get("X") or self.spin_xc.value())
+            base_y = float(pos.get("Y") or self.spin_yc.value())
+        else:
+            base_x = float(self.spin_xc.value())
+            base_y = float(self.spin_yc.value())
+
+        self.sig_show_brightfield_alignment.emit(
+            ref_img, cur_img, ref_ang, cur_ang, dcol_px, drow_px, dx_um, dy_um
+        )
+        return {
+            "ref_ang": ref_ang,
+            "cur_ang": cur_ang,
+            "dcol_px": dcol_px,
+            "drow_px": drow_px,
+            "peak": peak_val,
+            "dx_um": dx_um,
+            "dy_um": dy_um,
+            "target_x_um": base_x + dx_um,
+            "target_y_um": base_y + dy_um,
+        }
+
+    def apply_alignment_coordinates(self, target_x_um: float, target_y_um: float, move_stage: bool = False):
+        self.spin_xc.setValue(float(target_x_um))
+        self.spin_yc.setValue(float(target_y_um))
+        self.spin_smp_x.setValue(float(target_x_um))
+        self.spin_smp_y.setValue(float(target_y_um))
+        self.sig_log.emit(
+            f"[Multi-Angle] Updated Map Center & Sample Pos to ({target_x_um:.2f}, {target_y_um:.2f}) µm."
+        )
+        if move_stage and self.stage.is_connected and not self._is_busy():
+            self._stop_live_cb()
+            self._set_controls_busy(True)
+            self._move_worker = _StageMoveWorker(
+                stage=self.stage,
+                camera=self.camera,
+                target_pos={"X": float(target_x_um), "Y": float(target_y_um), "Z": None},
+                label="Aligned Map Center",
+                snap_preview=False,
+                parent=self,
+            )
+            self._move_worker.sig_log.connect(self.sig_log.emit)
+            self._move_worker.sig_moved.connect(self._on_stage_moved)
+            self._move_worker.sig_error.connect(self._on_worker_error)
+            self._move_worker.finished.connect(self._on_worker_done)
+            self._move_worker.start()
+
+    def _on_align_to_ref_angle(self):
+        cur_ang = self.current_angle_label()
+        ref_ang = self.combo_bf_ref_angle.currentData()
+        if not cur_ang or not ref_ang:
+            return
+        try:
+            res = self.compute_alignment_to_ref(ref_ang, cur_ang)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Brightfield Alignment Error", str(exc))
+            return
+
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle(f"Align '{cur_ang}' → '{ref_ang}'")
+        msg.setIcon(QtWidgets.QMessageBox.Question)
+        msg.setText(
+            f"Measured pixel shift ({cur_ang} vs {ref_ang}): "
+            f"ΔX = {res['dcol_px']:+.2f} px, ΔY = {res['drow_px']:+.2f} px (CC={res['peak']:.3f})\n"
+            f"Stage correction: ΔX = {res['dx_um']:+.2f} µm, ΔY = {res['dy_um']:+.2f} µm\n\n"
+            f"Aligned Map Center / Sample Pos: ({res['target_x_um']:.2f}, {res['target_y_um']:.2f}) µm"
+        )
+        btn_move = msg.addButton("Apply Shift && Move Stage", QtWidgets.QMessageBox.AcceptRole)
+        btn_center = msg.addButton("Apply to Center Only", QtWidgets.QMessageBox.ActionRole)
+        msg.addButton(QtWidgets.QMessageBox.Cancel)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == btn_move:
+            self.apply_alignment_coordinates(res["target_x_um"], res["target_y_um"], move_stage=True)
+        elif clicked == btn_center:
+            self.apply_alignment_coordinates(res["target_x_um"], res["target_y_um"], move_stage=False)
+
+    # ==========================================================================
     # Active Angle Sample Acquisition (Single Point or 2D Spatial Map)
     # ==========================================================================
 
@@ -1070,6 +1580,27 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.Cancel,
             )
             if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+        bf_role = AcquisitionSession.brightfield_role_for_target(ang)
+        if bf_role not in self.session.brightfield_images:
+            if self.brightfield_cam is not None and self.brightfield_cam.is_connected:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Brightfield Image Required",
+                    f"No Brightfield image has been recorded for angle '{ang}'.\n"
+                    "Please click '📷 Acquire Brightfield' in Section 4B before starting the sample/map.",
+                )
+                return
+            reply_bf = QtWidgets.QMessageBox.question(
+                self,
+                "Brightfield Camera Disconnected",
+                f"The Teledyne Brightfield camera is not connected and no Brightfield image exists for '{ang}'.\n"
+                "Cancel to connect & acquire Brightfield first (Recommended), or proceed without Brightfield?",
+                QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Yes,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if reply_bf != QtWidgets.QMessageBox.Yes:
                 return
 
         self._stop_live_cb()

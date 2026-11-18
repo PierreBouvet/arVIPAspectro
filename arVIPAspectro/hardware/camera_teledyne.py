@@ -523,9 +523,12 @@ class TeledyneBrightfieldCamera:
         self,
         n_frames: Optional[int] = None,
         timeout_s: Optional[float] = None,
+        stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
     ) -> np.ndarray:
         """
         Acquires a single 2D image frame (or averaged stack of `n_frames`) as `uint16`/`uint8`.
+        Optional `stage_pos_um` is used only in Simulation Mode to synthesize realistic
+        stage-coupled sample translations for brightfield plate calibration and alignment.
         """
         with self._lock:
             if not self._connected:
@@ -542,10 +545,10 @@ class TeledyneBrightfieldCamera:
             if self._simulate:
                 time.sleep(min(exp_s * n_frames, 0.1))
                 if n_frames == 1:
-                    return self._generate_simulated_frame()
-                acc = self._generate_simulated_frame().astype(np.float64)
+                    return self._generate_simulated_frame(stage_pos_um=stage_pos_um)
+                acc = self._generate_simulated_frame(stage_pos_um=stage_pos_um).astype(np.float64)
                 for _ in range(n_frames - 1):
-                    acc += self._generate_simulated_frame()
+                    acc += self._generate_simulated_frame(stage_pos_um=stage_pos_um)
                 return np.clip(np.rint(acc / n_frames), 0, 65535).astype(np.uint16)
 
             try:
@@ -612,7 +615,10 @@ class TeledyneBrightfieldCamera:
             self._live_active = False
             self._log("Live acquisition stopped.")
 
-    def _generate_simulated_frame(self) -> np.ndarray:
+    def _generate_simulated_frame(
+        self,
+        stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
+    ) -> np.ndarray:
         """Generates a synthetic brightfield microscopy image (`uint16`) matching the active ROI."""
         self._sim_frame_counter += 1
         det_w, det_h = self._detector_size
@@ -629,10 +635,18 @@ class TeledyneBrightfieldCamera:
         xn = (xx - 0.5 * det_w) / (0.5 * det_w)
         yn = (yy - 0.5 * det_h) / (0.5 * det_h)
 
-        # Vignetted brightfield illumination + drifting synthetic sample features + crosshair
+        # Vignetted brightfield illumination + stage-coupled (or drifting) synthetic sample features
         illum = np.exp(-0.35 * (xn ** 2 + yn ** 2))
-        drift_x = 0.04 * np.sin(self._sim_frame_counter * 0.08)
-        drift_y = 0.04 * np.cos(self._sim_frame_counter * 0.06)
+        if stage_pos_um is not None:
+            # Simulated 10x objective => 0.345 um/px -> convert um displacement to normalized sensor coords
+            sim_um_per_px = self.PIXEL_SIZE_UM / 10.0
+            sx_um = float(stage_pos_um.get("X") or 0.0)
+            sy_um = float(stage_pos_um.get("Y") or 0.0)
+            drift_x = (sx_um / sim_um_per_px) / (0.5 * det_w)
+            drift_y = (sy_um / sim_um_per_px) / (0.5 * det_h)
+        else:
+            drift_x = 0.04 * np.sin(self._sim_frame_counter * 0.08)
+            drift_y = 0.04 * np.cos(self._sim_frame_counter * 0.06)
 
         obj1 = 0.45 * np.exp(-(((xn - 0.15 - drift_x) / 0.18) ** 2 + ((yn + 0.10 - drift_y) / 0.12) ** 2))
         obj2 = 0.35 * np.exp(-(((xn + 0.25 - drift_x) / 0.10) ** 2 + ((yn - 0.20 - drift_y) / 0.10) ** 2))
