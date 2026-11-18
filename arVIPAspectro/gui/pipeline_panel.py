@@ -618,6 +618,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     sig_camera_updated = QtCore.Signal()
     sig_lock_geometry = QtCore.Signal(bool)
     sig_session_updated = QtCore.Signal()
+    sig_mapping_ready_changed = QtCore.Signal(bool)
+    sig_set_bf_reference = QtCore.Signal(object, str)
 
     def __init__(
         self,
@@ -650,6 +652,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self._build_ui()
         self._update_calibration_badges()
         self._update_map_summary()
+        self._update_section_states()
 
     # ==========================================================================
     # UI Construction
@@ -667,49 +670,48 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         layout.setContentsMargins(2, 2, 6, 2)
         layout.setSpacing(8)
 
-        layout.addWidget(self._build_h5_session_card())
-        layout.addWidget(self._build_calibration_prompt_card())
-        layout.addWidget(self._build_step5_1_laser_calib_card())
-        layout.addWidget(self._build_step5_2_rb_calib_card())
-        layout.addWidget(self._build_step5_3_sample_fit_card())
-        layout.addWidget(self._build_map_configuration_card())
+        self.sec_h5 = self._build_h5_session_card()
+        self.sec_calib = self._build_calibration_prompt_card()
+        self.sec_preview_calib = self._build_preview_calibration_card()
+        self.sec_mapping_calib = self._build_step5_3_sample_fit_card()
+        self.sec_map_params = self._build_map_configuration_card()
+
+        layout.addWidget(self.sec_h5)
+        layout.addWidget(self.sec_calib)
+        layout.addWidget(self.sec_preview_calib)
+        layout.addWidget(self.sec_mapping_calib)
+        layout.addWidget(self.sec_map_params)
         layout.addStretch()
 
         scroll.setWidget(content)
         outer_layout.addWidget(scroll)
 
     def _build_h5_session_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("4A. HDF5_BLS Session Container")
+        box = QtWidgets.QGroupBox("1. HDF5 File")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(6)
 
         row = QtWidgets.QHBoxLayout()
         self.txt_h5_path = QtWidgets.QLineEdit()
-        default_path = os.path.abspath("Measures.h5")
-        self.txt_h5_path.setText(default_path)
-        self.txt_h5_path.setPlaceholderText("Path to output/existing .h5 file...")
+        self.txt_h5_path.setText("")
+        self.txt_h5_path.setReadOnly(True)
+        self.txt_h5_path.setPlaceholderText("No HDF5 file selected...")
 
-        self.btn_browse_h5 = QtWidgets.QPushButton("Browse / New...")
-        self.btn_browse_h5.clicked.connect(self._on_browse_h5)
-
-        self.btn_open_h5 = QtWidgets.QPushButton("Open / Create HDF5")
+        self.btn_open_h5 = QtWidgets.QPushButton("Open HDF5 file")
         self.btn_open_h5.setStyleSheet("font-weight: bold;")
-        self.btn_open_h5.clicked.connect(self._on_open_or_create_h5)
+        self.btn_open_h5.clicked.connect(self._on_browse_h5)
 
         row.addWidget(self.txt_h5_path, stretch=1)
-        row.addWidget(self.btn_browse_h5)
         row.addWidget(self.btn_open_h5)
         layout.addLayout(row)
 
-        self.lbl_h5_status = QtWidgets.QLabel("No HDF5 file opened yet. Click 'Open / Create HDF5' to begin.")
+        self.lbl_h5_status = QtWidgets.QLabel("No HDF5 file opened yet. Click 'Open HDF5 file' to begin.")
         self.lbl_h5_status.setStyleSheet("font-size: 11px; color: #b0bec5;")
         layout.addWidget(self.lbl_h5_status)
         return box
 
     def _build_calibration_prompt_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox(
-            "4B. Step-by-Step Calibration Spectra (Brillouin/Calibration/<role>/image)"
-        )
+        box = QtWidgets.QGroupBox("2. Calibration")
         grid = QtWidgets.QGridLayout(box)
         grid.setSpacing(6)
 
@@ -786,39 +788,14 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.lbl_status_rb.setMinimumWidth(95)
         grid.addWidget(self.lbl_status_rb, 2, 5)
 
-        # Row 3: Reference Sample (Optional, e.g. Water / Polystyrene)
-        grid.addWidget(QtWidgets.QLabel("3. Ref Sample (opt):"), 3, 0)
-        self.spin_ref_exp = QtWidgets.QDoubleSpinBox()
-        self.spin_ref_exp.setDecimals(2)
-        self.spin_ref_exp.setRange(0.02, 30000.0)
-        self.spin_ref_exp.setValue(500.0)
-        self.spin_ref_exp.setSuffix(" ms")
-        grid.addWidget(self.spin_ref_exp, 3, 1)
+        return box
 
-        self.spin_ref_avg = QtWidgets.QSpinBox()
-        self.spin_ref_avg.setRange(1, 500)
-        self.spin_ref_avg.setValue(1)
-        grid.addWidget(self.spin_ref_avg, 3, 2)
-
-        self.btn_acq_ref = QtWidgets.QPushButton("📷 Acquire Ref")
-        self.btn_acq_ref.clicked.connect(
-            lambda: self._on_acquire_calibration(
-                AcquisitionSession.ROLE_REF_SAMPLE,
-                self.spin_ref_exp.value(),
-                self.spin_ref_avg.value(),
-            )
-        )
-        grid.addWidget(self.btn_acq_ref, 3, 3)
-
-        self.btn_view_ref = QtWidgets.QPushButton("👁 View")
-        self.btn_view_ref.clicked.connect(lambda: self._on_view_calibration(AcquisitionSession.ROLE_REF_SAMPLE))
-        grid.addWidget(self.btn_view_ref, 3, 4)
-
-        self.lbl_status_ref = QtWidgets.QLabel("OPTIONAL")
-        self.lbl_status_ref.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_status_ref.setMinimumWidth(95)
-        grid.addWidget(self.lbl_status_ref, 3, 5)
-
+    def _build_preview_calibration_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("3. Preview calibration")
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(8)
+        layout.addWidget(self._build_step5_1_laser_calib_card())
+        layout.addWidget(self._build_step5_2_rb_calib_card())
         return box
 
     def _build_step5_1_laser_calib_card(self) -> QtWidgets.QGroupBox:
@@ -1018,11 +995,46 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         return box
 
     def _build_step5_3_sample_fit_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox(
-            "Step 5.3 — Sample DHO Fitting & Reference Geometry Calibration (Steps 11–14)"
-        )
+        box = QtWidgets.QGroupBox("4. Mapping - Calibration")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(6)
+
+        # Row 0: Acquire Calibration Sample Spectrum
+        acq_row = QtWidgets.QHBoxLayout()
+        acq_row.addWidget(QtWidgets.QLabel("Calibration Sample:"))
+        self.spin_ref_exp = QtWidgets.QDoubleSpinBox()
+        self.spin_ref_exp.setDecimals(2)
+        self.spin_ref_exp.setRange(0.02, 30000.0)
+        self.spin_ref_exp.setValue(500.0)
+        self.spin_ref_exp.setSuffix(" ms")
+        acq_row.addWidget(self.spin_ref_exp)
+
+        self.spin_ref_avg = QtWidgets.QSpinBox()
+        self.spin_ref_avg.setRange(1, 500)
+        self.spin_ref_avg.setValue(1)
+        self.spin_ref_avg.setSuffix(" avg")
+        acq_row.addWidget(self.spin_ref_avg)
+
+        self.btn_acq_ref = QtWidgets.QPushButton("📷 Acquire Sample")
+        self.btn_acq_ref.clicked.connect(
+            lambda: self._on_acquire_calibration(
+                AcquisitionSession.ROLE_REF_SAMPLE,
+                self.spin_ref_exp.value(),
+                self.spin_ref_avg.value(),
+            )
+        )
+        acq_row.addWidget(self.btn_acq_ref)
+
+        self.btn_view_ref = QtWidgets.QPushButton("👁 View")
+        self.btn_view_ref.clicked.connect(lambda: self._on_view_calibration(AcquisitionSession.ROLE_REF_SAMPLE))
+        acq_row.addWidget(self.btn_view_ref)
+
+        self.lbl_status_ref = QtWidgets.QLabel("MISSING")
+        self.lbl_status_ref.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_status_ref.setMinimumWidth(95)
+        acq_row.addWidget(self.lbl_status_ref)
+        acq_row.addStretch()
+        layout.addLayout(acq_row)
 
         # Row 1: Auto-fit toggle + Presets + Status badge
         top_row = QtWidgets.QHBoxLayout()
@@ -1165,154 +1177,163 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         return box
 
     def _build_map_configuration_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("4C. Spatial Map Configuration & Scan Execution (Brillouin/<Map_name>)")
+        box = QtWidgets.QGroupBox("5. Mapping Parameters")
         layout = QtWidgets.QVBoxLayout(box)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
-        # 1. Map Name + Point Exposure + Averaging
-        top_row = QtWidgets.QHBoxLayout()
-        top_row.addWidget(QtWidgets.QLabel("Map Name:"))
+        # 1. Name of the mapping + Go to saved position
+        name_row = QtWidgets.QHBoxLayout()
+        name_row.addWidget(QtWidgets.QLabel("Name of the mapping:"))
         self.txt_map_name = QtWidgets.QLineEdit("Map_01")
-        self.txt_map_name.setMaximumWidth(130)
         self.txt_map_name.textChanged.connect(lambda *_: self._update_brightfield_ui())
-        top_row.addWidget(self.txt_map_name)
+        name_row.addWidget(self.txt_map_name, stretch=1)
+        self.btn_goto_saved_pos = QtWidgets.QPushButton("Go to saved position...")
+        self.btn_goto_saved_pos.clicked.connect(self._on_goto_saved_position)
+        name_row.addWidget(self.btn_goto_saved_pos)
+        layout.addLayout(name_row)
 
-        top_row.addSpacing(8)
-        top_row.addWidget(QtWidgets.QLabel("Point Exposure:"))
-        self.spin_map_exp = QtWidgets.QDoubleSpinBox()
-        self.spin_map_exp.setDecimals(2)
-        self.spin_map_exp.setRange(0.02, 30000.0)
-        self.spin_map_exp.setValue(100.0)
-        self.spin_map_exp.setSuffix(" ms")
-        self.spin_map_exp.valueChanged.connect(self._update_map_summary)
-        top_row.addWidget(self.spin_map_exp)
+        # 2. Brightfield: Acquire & Load Reference
+        bf_row = QtWidgets.QHBoxLayout()
+        bf_row.addWidget(QtWidgets.QLabel("Brightfield:"))
+        self.btn_acq_bf_map = QtWidgets.QPushButton("Acquire")
+        self.btn_acq_bf_map.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
+        self.btn_acq_bf_map.clicked.connect(self._on_acquire_map_brightfield)
+        bf_row.addWidget(self.btn_acq_bf_map)
 
-        top_row.addSpacing(8)
-        top_row.addWidget(QtWidgets.QLabel("Avg:"))
-        self.spin_map_avg = QtWidgets.QSpinBox()
-        self.spin_map_avg.setRange(1, 500)
-        self.spin_map_avg.setValue(1)
-        self.spin_map_avg.setSuffix(" frame(s)")
-        self.spin_map_avg.valueChanged.connect(self._update_map_summary)
-        top_row.addWidget(self.spin_map_avg)
-        top_row.addStretch()
-        layout.addLayout(top_row)
+        self.btn_load_bf_ref = QtWidgets.QPushButton("Load Reference")
+        self.btn_load_bf_ref.clicked.connect(self._on_load_bf_reference)
+        bf_row.addWidget(self.btn_load_bf_ref)
 
-        # 2. Grid Coordinates & Step Sizes
-        grid_form = QtWidgets.QGridLayout()
-        grid_form.setSpacing(6)
+        self.lbl_bf_map_status = QtWidgets.QLabel("NO CENTER")
+        self.lbl_bf_map_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_bf_map_status.setMinimumWidth(110)
+        bf_row.addWidget(self.lbl_bf_map_status)
 
-        grid_form.addWidget(QtWidgets.QLabel("Center Xc:"), 0, 0)
+        bf_row.addSpacing(8)
+        bf_row.addWidget(QtWidgets.QLabel("Center Xc:"))
         self.spin_x_center = QtWidgets.QDoubleSpinBox()
         self.spin_x_center.setDecimals(2)
         self.spin_x_center.setRange(-100000.0, 100000.0)
         self.spin_x_center.setValue(0.0)
         self.spin_x_center.setSuffix(" µm")
         self.spin_x_center.valueChanged.connect(self._update_map_summary)
-        grid_form.addWidget(self.spin_x_center, 0, 1)
+        bf_row.addWidget(self.spin_x_center)
 
-        grid_form.addWidget(QtWidgets.QLabel("Step ΔX:"), 0, 2)
-        self.spin_dx = QtWidgets.QDoubleSpinBox()
-        self.spin_dx.setDecimals(2)
-        self.spin_dx.setRange(-50000.0, 50000.0)
-        self.spin_dx.setValue(25.0)
-        self.spin_dx.setSuffix(" µm")
-        self.spin_dx.valueChanged.connect(self._update_map_summary)
-        grid_form.addWidget(self.spin_dx, 0, 3)
-
-        grid_form.addWidget(QtWidgets.QLabel("Points Nx:"), 0, 4)
-        self.spin_nx = QtWidgets.QSpinBox()
-        self.spin_nx.setRange(1, 5000)
-        self.spin_nx.setValue(4)
-        self.spin_nx.valueChanged.connect(self._update_map_summary)
-        grid_form.addWidget(self.spin_nx, 0, 5)
-
-        grid_form.addWidget(QtWidgets.QLabel("Center Yc:"), 1, 0)
+        bf_row.addWidget(QtWidgets.QLabel("Yc:"))
         self.spin_y_center = QtWidgets.QDoubleSpinBox()
         self.spin_y_center.setDecimals(2)
         self.spin_y_center.setRange(-100000.0, 100000.0)
         self.spin_y_center.setValue(0.0)
         self.spin_y_center.setSuffix(" µm")
         self.spin_y_center.valueChanged.connect(self._update_map_summary)
-        grid_form.addWidget(self.spin_y_center, 1, 1)
+        bf_row.addWidget(self.spin_y_center)
+        bf_row.addStretch()
+        layout.addLayout(bf_row)
 
-        grid_form.addWidget(QtWidgets.QLabel("Step ΔY:"), 1, 2)
+        # 3. Exposure (on its own line)
+        exp_row = QtWidgets.QHBoxLayout()
+        exp_row.addWidget(QtWidgets.QLabel("Exposure:"))
+        self.spin_map_exp = QtWidgets.QDoubleSpinBox()
+        self.spin_map_exp.setDecimals(2)
+        self.spin_map_exp.setRange(0.02, 30000.0)
+        self.spin_map_exp.setValue(100.0)
+        self.spin_map_exp.setSuffix(" ms")
+        self.spin_map_exp.valueChanged.connect(self._update_map_summary)
+        exp_row.addWidget(self.spin_map_exp)
+        exp_row.addStretch()
+        layout.addLayout(exp_row)
+
+        # 4. Frame average (on its own line)
+        avg_row = QtWidgets.QHBoxLayout()
+        avg_row.addWidget(QtWidgets.QLabel("Frame average:"))
+        self.spin_map_avg = QtWidgets.QSpinBox()
+        self.spin_map_avg.setRange(1, 500)
+        self.spin_map_avg.setValue(1)
+        self.spin_map_avg.setSuffix(" frame(s)")
+        self.spin_map_avg.valueChanged.connect(self._update_map_summary)
+        avg_row.addWidget(self.spin_map_avg)
+        avg_row.addStretch()
+        layout.addLayout(avg_row)
+
+        # 5. Points Nx, Step x (same line)
+        nx_row = QtWidgets.QHBoxLayout()
+        nx_row.addWidget(QtWidgets.QLabel("Points Nx:"))
+        self.spin_nx = QtWidgets.QSpinBox()
+        self.spin_nx.setRange(1, 5000)
+        self.spin_nx.setValue(4)
+        self.spin_nx.valueChanged.connect(self._update_map_summary)
+        nx_row.addWidget(self.spin_nx)
+        nx_row.addSpacing(12)
+        nx_row.addWidget(QtWidgets.QLabel("Step x:"))
+        self.spin_dx = QtWidgets.QDoubleSpinBox()
+        self.spin_dx.setDecimals(2)
+        self.spin_dx.setRange(-50000.0, 50000.0)
+        self.spin_dx.setValue(25.0)
+        self.spin_dx.setSuffix(" µm")
+        self.spin_dx.valueChanged.connect(self._update_map_summary)
+        nx_row.addWidget(self.spin_dx)
+        nx_row.addStretch()
+        layout.addLayout(nx_row)
+
+        # 6. Points Ny, Step y (same line)
+        ny_row = QtWidgets.QHBoxLayout()
+        ny_row.addWidget(QtWidgets.QLabel("Points Ny:"))
+        self.spin_ny = QtWidgets.QSpinBox()
+        self.spin_ny.setRange(1, 5000)
+        self.spin_ny.setValue(4)
+        self.spin_ny.valueChanged.connect(self._update_map_summary)
+        ny_row.addWidget(self.spin_ny)
+        ny_row.addSpacing(12)
+        ny_row.addWidget(QtWidgets.QLabel("Step y:"))
         self.spin_dy = QtWidgets.QDoubleSpinBox()
         self.spin_dy.setDecimals(2)
         self.spin_dy.setRange(-50000.0, 50000.0)
         self.spin_dy.setValue(25.0)
         self.spin_dy.setSuffix(" µm")
         self.spin_dy.valueChanged.connect(self._update_map_summary)
-        grid_form.addWidget(self.spin_dy, 1, 3)
+        ny_row.addWidget(self.spin_dy)
+        ny_row.addStretch()
+        layout.addLayout(ny_row)
 
-        grid_form.addWidget(QtWidgets.QLabel("Points Ny:"), 1, 4)
-        self.spin_ny = QtWidgets.QSpinBox()
-        self.spin_ny.setRange(1, 5000)
-        self.spin_ny.setValue(4)
-        self.spin_ny.valueChanged.connect(self._update_map_summary)
-        grid_form.addWidget(self.spin_ny, 1, 5)
-
-        layout.addLayout(grid_form)
-
-        # 3. Stage Teaching Helpers (Set Center / Teach Corner A & Corner B)
-        teach_row = QtWidgets.QHBoxLayout()
-        self.btn_set_start_current = QtWidgets.QPushButton("Set Center (Xc, Yc) from Current Stage")
-        self.btn_set_start_current.clicked.connect(self._on_set_center_from_stage)
-        teach_row.addWidget(self.btn_set_start_current)
-
-        self.btn_teach_a = QtWidgets.QPushButton("Teach Corner A")
-        self.btn_teach_a.clicked.connect(self._on_teach_corner_a)
-        teach_row.addWidget(self.btn_teach_a)
-
-        self.btn_teach_b = QtWidgets.QPushButton("Teach Corner B -> Compute Grid")
-        self.btn_teach_b.clicked.connect(self._on_teach_corner_b)
-        teach_row.addWidget(self.btn_teach_b)
-        teach_row.addStretch()
-        layout.addLayout(teach_row)
-
-        # 4. Scan Pattern, Settling Delay & Optional Raw Data Saving
-        opt_row = QtWidgets.QHBoxLayout()
-        opt_row.addWidget(QtWidgets.QLabel("Pattern:"))
-        self.combo_pattern = QtWidgets.QComboBox()
-        self.combo_pattern.addItem("Snake / Serpentine (Alternating X)", "snake")
-        self.combo_pattern.addItem("Raster (Unidirectional X)", "raster")
-        self.combo_pattern.currentIndexChanged.connect(self._update_map_summary)
-        opt_row.addWidget(self.combo_pattern)
-
-        opt_row.addSpacing(8)
-        opt_row.addWidget(QtWidgets.QLabel("Settling:"))
+        # 7. Settling (on its own line)
+        settle_row = QtWidgets.QHBoxLayout()
+        settle_row.addWidget(QtWidgets.QLabel("Settling:"))
         self.spin_map_settling = QtWidgets.QSpinBox()
         self.spin_map_settling.setRange(0, 5000)
         self.spin_map_settling.setValue(50)
         self.spin_map_settling.setSuffix(" ms")
         self.spin_map_settling.valueChanged.connect(self._update_map_summary)
-        opt_row.addWidget(self.spin_map_settling)
+        settle_row.addWidget(self.spin_map_settling)
+        settle_row.addStretch()
+        layout.addLayout(settle_row)
 
-        opt_row.addSpacing(12)
-        self.chk_save_raw = QtWidgets.QCheckBox("Save 4D Raw Data Dataset (Ny×Nx×H×W) in HDF5")
-        self.chk_save_raw.setChecked(False)
-        self.chk_save_raw.toggled.connect(self._update_map_summary)
-        opt_row.addWidget(self.chk_save_raw)
-        opt_row.addStretch()
-        layout.addLayout(opt_row)
+        # 8. Pattern (on its own line)
+        pat_row = QtWidgets.QHBoxLayout()
+        pat_row.addWidget(QtWidgets.QLabel("Pattern:"))
+        self.combo_pattern = QtWidgets.QComboBox()
+        self.combo_pattern.addItem("Snake / Serpentine (Alternating X)", "snake")
+        self.combo_pattern.addItem("Raster (Unidirectional X)", "raster")
+        self.combo_pattern.currentIndexChanged.connect(self._update_map_summary)
+        pat_row.addWidget(self.combo_pattern)
+        pat_row.addStretch()
+        layout.addLayout(pat_row)
 
-        # 4B. Step 5.4 On-the-Fly Treatment Options Row
-        otf_row = QtWidgets.QHBoxLayout()
-        self.chk_treat_on_the_fly = QtWidgets.QCheckBox(
-            "Step 5.4: Treat on the fly & save 4D fitted DHO parameters (Treated H×W bins)"
-        )
+        # 9-11. Checkboxes (each on its own line)
+        self.chk_treat_on_the_fly = QtWidgets.QCheckBox("Treat on the fly")
         self.chk_treat_on_the_fly.setChecked(True)
         self.chk_treat_on_the_fly.toggled.connect(self._update_map_summary)
-        otf_row.addWidget(self.chk_treat_on_the_fly)
+        layout.addWidget(self.chk_treat_on_the_fly)
 
-        otf_row.addSpacing(12)
         self.chk_fast_drift = QtWidgets.QCheckBox("Fast elastic drift tracking per point")
         self.chk_fast_drift.setChecked(True)
-        otf_row.addWidget(self.chk_fast_drift)
-        otf_row.addStretch()
-        layout.addLayout(otf_row)
+        layout.addWidget(self.chk_fast_drift)
 
-        # 5. Live Map Summary Banner
+        self.chk_save_raw = QtWidgets.QCheckBox("Save 4D raw data dataset")
+        self.chk_save_raw.setChecked(False)
+        self.chk_save_raw.toggled.connect(self._update_map_summary)
+        layout.addWidget(self.chk_save_raw)
+
+        # Live Map Summary Banner
         self.lbl_map_summary = QtWidgets.QLabel("")
         self.lbl_map_summary.setStyleSheet(
             "background-color: #1e293b; color: #e2e8f0; font-family: monospace; "
@@ -1321,28 +1342,9 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.lbl_map_summary.setWordWrap(True)
         layout.addWidget(self.lbl_map_summary)
 
-        # 5B. Pre-Map Brightfield Image (Teledyne CM3)
-        bf_row = QtWidgets.QHBoxLayout()
-        bf_row.addWidget(QtWidgets.QLabel("Brightfield Pre-Map:"))
-        self.lbl_bf_map_status = QtWidgets.QLabel("MISSING")
-        self.lbl_bf_map_status.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_bf_map_status.setMinimumWidth(110)
-        bf_row.addWidget(self.lbl_bf_map_status)
-
-        self.btn_acq_bf_map = QtWidgets.QPushButton("📷 Acquire Brightfield")
-        self.btn_acq_bf_map.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
-        self.btn_acq_bf_map.clicked.connect(self._on_acquire_map_brightfield)
-        bf_row.addWidget(self.btn_acq_bf_map)
-
-        self.btn_view_bf_map = QtWidgets.QPushButton("👁 View Brightfield")
-        self.btn_view_bf_map.clicked.connect(self._on_view_map_brightfield)
-        bf_row.addWidget(self.btn_view_bf_map)
-        bf_row.addStretch()
-        layout.addLayout(bf_row)
-
-        # 6. Execution Controls & Progress Bar
+        # Execution Controls & Progress Bar
         exec_row = QtWidgets.QHBoxLayout()
-        self.btn_start_map = QtWidgets.QPushButton("▶ Start Map Acquisition")
+        self.btn_start_map = QtWidgets.QPushButton("Start Map Acquisition")
         self.btn_start_map.setMinimumHeight(32)
         self.btn_start_map.setStyleSheet(
             "background-color: #2e7d32; color: white; font-weight: bold; padding: 4px 12px;"
@@ -1350,13 +1352,13 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_start_map.clicked.connect(self._on_start_map)
         exec_row.addWidget(self.btn_start_map)
 
-        self.btn_pause_map = QtWidgets.QPushButton("⏸ Pause")
+        self.btn_pause_map = QtWidgets.QPushButton("Pause")
         self.btn_pause_map.setMinimumHeight(32)
         self.btn_pause_map.setEnabled(False)
         self.btn_pause_map.clicked.connect(self._on_toggle_pause_map)
         exec_row.addWidget(self.btn_pause_map)
 
-        self.btn_abort_map = QtWidgets.QPushButton("⏹ Abort Map")
+        self.btn_abort_map = QtWidgets.QPushButton("Stop")
         self.btn_abort_map.setMinimumHeight(32)
         self.btn_abort_map.setEnabled(False)
         self.btn_abort_map.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
@@ -1396,6 +1398,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         try:
             info = self.session.open_or_create_h5(path)
             self.txt_h5_path.setText(info["h5_path"])
+            self.btn_open_h5.setText("Change HDF5 file")
             maps_str = ", ".join(info["existing_maps"]) if info["existing_maps"] else "none"
             self.lbl_h5_status.setText(
                 f"Opened: {os.path.basename(info['h5_path'])}  |  "
@@ -1828,7 +1831,36 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_diag_s_dho.setEnabled(has_sf)
         self.btn_diag_s_q.setEnabled(has_sf and (sf_res.get("q_results") is not None))
         self._update_brightfield_ui()
+        self._update_section_states()
         self.sig_session_updated.emit()
+
+    def is_mapping_ready(self) -> bool:
+        return (
+            self.session.is_open
+            and self.session.laser_image is not None
+            and self.session.rb_image is not None
+            and self.session.laser_calib_result is not None
+            and self.session.rb_calib_result is not None
+            and self.session.sample_fit_result is not None
+        )
+
+    def _update_section_states(self):
+        h5_open = self.session.is_open
+        has_spectra = h5_open and (self.session.laser_image is not None) and (self.session.rb_image is not None)
+        has_calibs = has_spectra and (self.session.laser_calib_result is not None) and (self.session.rb_calib_result is not None)
+        mapping_ready = self.is_mapping_ready()
+
+        prev_ready = getattr(self, "_prev_mapping_ready", False)
+        self._prev_mapping_ready = mapping_ready
+
+        self.sec_calib.setEnabled(h5_open)
+        self.sec_preview_calib.setVisible(has_spectra)
+        self.sec_preview_calib.setEnabled(has_spectra)
+        self.sec_mapping_calib.setEnabled(has_calibs)
+        self.sec_map_params.setEnabled(mapping_ready)
+
+        if mapping_ready != prev_ready:
+            self.sig_mapping_ready_changed.emit(mapping_ready)
 
     def _current_map_brightfield_role(self) -> str:
         name = self.txt_map_name.text().strip() or "Map_01"
@@ -1845,20 +1877,21 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
                 "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
             )
         else:
-            self.lbl_bf_map_status.setText("MISSING")
+            self.lbl_bf_map_status.setText("NO CENTER")
             self.lbl_bf_map_status.setStyleSheet(
-                "background-color: #c62828; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
+                "background-color: #455a64; color: #cfd8dc; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
             )
         bf_conn = self.brightfield_cam is not None and self.brightfield_cam.is_connected
         self.btn_acq_bf_map.setEnabled(bf_conn and not self._is_busy())
-        self.btn_view_bf_map.setEnabled(has_bf and not self._is_busy())
+        self.btn_load_bf_ref.setEnabled(self.session.is_open and not self._is_busy())
+        self.btn_goto_saved_pos.setEnabled(self.session.is_open and self.stage.is_connected and not self._is_busy())
 
     def _on_acquire_map_brightfield(self):
         if self.brightfield_cam is None or not self.brightfield_cam.is_connected:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Brightfield Camera Not Connected",
-                "Please connect the Teledyne Brightfield camera in the 'Live preview' tab first.",
+                "Please connect the Teledyne Brightfield camera in the 'Hardware' tab first.",
             )
             return
         if not self._ensure_h5_open() or self._is_busy():
@@ -1883,9 +1916,112 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
     @QtCore.Slot(str, object, object, float, int, int)
     def _on_bf_map_captured(self, role: str, frame, pos, exp_s: float, n_avg: int, binning: int):
-        self.sig_display_frame.emit(frame, pos, exp_s, n_avg, binning)
+        # Automatically set the captured position as the center position for the mapping
+        if isinstance(pos, dict):
+            if pos.get("X") is not None:
+                self.spin_x_center.setValue(float(pos["X"]))
+            if pos.get("Y") is not None:
+                self.spin_y_center.setValue(float(pos["Y"]))
+        map_name = self.txt_map_name.text().strip() or "Map_01"
+        self.sig_set_bf_reference.emit(frame, f"Reference: {map_name}")
         self._update_brightfield_ui()
+        self._update_map_summary()
         self.sig_session_updated.emit()
+
+    def _on_load_bf_reference(self):
+        if not self.session.is_open:
+            QtWidgets.QMessageBox.information(self, "No HDF5 File", "Please open an HDF5 file first.")
+            return
+        items = list(self.session.brightfield_images.keys())
+        if not items:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Brightfield References",
+                "No Brightfield reference images are currently stored in the Calibration group of this HDF5 file.",
+            )
+            return
+        labels = []
+        for role in items:
+            meta = self.session.brightfield_meta.get(role, {})
+            x_um = meta.get("stage_x_um")
+            y_um = meta.get("stage_y_um")
+            pos_str = f" (X={float(x_um):.1f}, Y={float(y_um):.1f} µm)" if x_um is not None and y_um is not None else ""
+            labels.append(f"{role}{pos_str}")
+
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "Load Brightfield Reference",
+            "Select a reference image from Calibration:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return
+        idx = labels.index(choice)
+        role = items[idx]
+        img = self.session.brightfield_images.get(role)
+        if img is not None:
+            self.sig_set_bf_reference.emit(img, f"Reference: {role}")
+            self.sig_log.emit(f"Loaded Brightfield reference '{role}' into Reference viewer.")
+
+    def _on_goto_saved_position(self):
+        if not self.session.is_open:
+            QtWidgets.QMessageBox.information(self, "No HDF5 File", "Please open an HDF5 file first.")
+            return
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the ASI MS-2000 stage first.")
+            return
+
+        positions: List[Tuple[str, float, float]] = []
+        for role, meta in self.session.brightfield_meta.items():
+            if "stage_x_um" in meta and "stage_y_um" in meta:
+                x = float(meta["stage_x_um"])
+                y = float(meta["stage_y_um"])
+                positions.append((f"Ref [{role}]  (X={x:.2f}, Y={y:.2f} µm)", x, y))
+
+        if self.session.h5_path and os.path.exists(self.session.h5_path):
+            try:
+                import h5py
+                with h5py.File(self.session.h5_path, "r") as f:
+                    if "Brillouin" in f:
+                        for name, grp in f["Brillouin"].items():
+                            if name == "Calibration" or not isinstance(grp, h5py.Group):
+                                continue
+                            if "stage_x_center_um" in grp.attrs and "stage_y_center_um" in grp.attrs:
+                                x = float(grp.attrs["stage_x_center_um"])
+                                y = float(grp.attrs["stage_y_center_um"])
+                                positions.append((f"Map [{name}]  (X={x:.2f}, Y={y:.2f} µm)", x, y))
+            except Exception:
+                pass
+
+        if not positions:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Saved Positions",
+                "No saved stage positions were found in this HDF5 file.",
+            )
+            return
+
+        labels = [p[0] for p in positions]
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "Go to Saved Position",
+            "Select a saved acquisition / reference position:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return
+        _, tx, ty = positions[labels.index(choice)]
+        try:
+            self._stop_live_cb()
+            self.stage.move_to(x_um=tx, y_um=ty, wait=True)
+            self.sig_stage_updated.emit()
+            self.sig_log.emit(f"Moved stage to saved position: X={tx:.2f} µm, Y={ty:.2f} µm.")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Stage Move Error", str(exc))
 
     def _on_view_map_brightfield(self):
         role = self._current_map_brightfield_role()
@@ -2177,19 +2313,17 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
     def _set_controls_busy(self, busy: bool, map_running: bool = False):
         for w in (
-            self.btn_browse_h5,
             self.btn_open_h5,
             self.btn_acq_laser,
             self.btn_acq_rb,
             self.btn_acq_ref,
             self.btn_acq_bf_map,
+            self.btn_load_bf_ref,
+            self.btn_goto_saved_pos,
             self.btn_run_laser_calib,
             self.btn_run_rb_calib,
             self.btn_run_sample_fit,
             self.btn_start_map,
-            self.btn_set_start_current,
-            self.btn_teach_a,
-            self.btn_teach_b,
         ):
             w.setEnabled(not busy)
         if not busy:

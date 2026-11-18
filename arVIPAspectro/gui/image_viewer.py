@@ -19,17 +19,22 @@ class ImageViewerWidget(QtWidgets.QWidget):
     controls, frame statistics, live cursor coordinate/value readout, and per-metric map limits.
     """
 
-    COLORMAPS = ["inferno", "viridis", "magma", "plasma", "gray", "turbo"]
+    DEFAULT_CMAP = "gray"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_image: Optional[np.ndarray] = None
         self._current_title: str = "No image acquired yet"
         self._in_diagnostic_view: bool = False
-        self._view_mode: str = "single"  # "single", "live_map", or "diagnostic"
+        self._view_mode: str = "single"  # "single", "live_map", "diagnostic", or "dual_brightfield"
         self._last_live_map_state: Optional[Dict[str, Any]] = None
         self._live_map_widgets: Optional[Dict[str, Any]] = None
+        self._dual_bf_widgets: Optional[Dict[str, Any]] = None
+        self._dual_ref_img: Optional[np.ndarray] = None
+        self._dual_ref_title: str = "Reference"
+        self._dual_live_img: Optional[np.ndarray] = None
         self._syncing_map_range: bool = False
+        self._syncing_contrast: bool = False
         self._last_pg_shape: Optional[tuple] = None
         self._last_pg_cmap: Optional[str] = None
         self._last_stats_ts: float = 0.0
@@ -125,23 +130,28 @@ class ImageViewerWidget(QtWidgets.QWidget):
         # 1. Top Detector Display Controls Bar
         ctrl_bar = QtWidgets.QHBoxLayout()
 
-        ctrl_bar.addWidget(QtWidgets.QLabel("Colormap:"))
-        self.combo_cmap = QtWidgets.QComboBox()
-        self.combo_cmap.addItems(self.COLORMAPS)
-        self.combo_cmap.currentTextChanged.connect(self._on_display_settings_changed)
-        ctrl_bar.addWidget(self.combo_cmap)
+        ctrl_bar.addWidget(QtWidgets.QLabel("Contrast Quantiles:"))
+        ctrl_bar.addWidget(QtWidgets.QLabel("Low:"))
+        self.spin_contrast_low = QtWidgets.QDoubleSpinBox()
+        self.spin_contrast_low.setRange(0.0, 99.9)
+        self.spin_contrast_low.setDecimals(1)
+        self.spin_contrast_low.setSingleStep(0.5)
+        self.spin_contrast_low.setValue(1.0)
+        self.spin_contrast_low.setSuffix(" %")
+        self.spin_contrast_low.setKeyboardTracking(False)
+        self.spin_contrast_low.valueChanged.connect(self._on_contrast_bounds_changed)
+        ctrl_bar.addWidget(self.spin_contrast_low)
 
-        ctrl_bar.addSpacing(12)
-        ctrl_bar.addWidget(QtWidgets.QLabel("Contrast:"))
-        self.combo_contrast = QtWidgets.QComboBox()
-        self.combo_contrast.addItem("Auto (1% – 99.8%)", (1.0, 99.8))
-        self.combo_contrast.addItem("5% – 95%", (5.0, 95.0))
-        self.combo_contrast.addItem("10% – 90%", (10.0, 90.0))
-        self.combo_contrast.addItem("0% – 50%", (0.0, 50.0))
-        self.combo_contrast.addItem("Min – Max", "minmax")
-        self.combo_contrast.addItem("Full 16-bit (0 – 65535)", "uint16")
-        self.combo_contrast.currentIndexChanged.connect(self._on_display_settings_changed)
-        ctrl_bar.addWidget(self.combo_contrast)
+        ctrl_bar.addWidget(QtWidgets.QLabel("High:"))
+        self.spin_contrast_high = QtWidgets.QDoubleSpinBox()
+        self.spin_contrast_high.setRange(0.1, 100.0)
+        self.spin_contrast_high.setDecimals(1)
+        self.spin_contrast_high.setSingleStep(0.5)
+        self.spin_contrast_high.setValue(99.8)
+        self.spin_contrast_high.setSuffix(" %")
+        self.spin_contrast_high.setKeyboardTracking(False)
+        self.spin_contrast_high.valueChanged.connect(self._on_contrast_bounds_changed)
+        ctrl_bar.addWidget(self.spin_contrast_high)
 
         ctrl_bar.addStretch()
         self.lbl_stats = QtWidgets.QLabel("No frame loaded")
@@ -149,8 +159,10 @@ class ImageViewerWidget(QtWidgets.QWidget):
         ctrl_bar.addWidget(self.lbl_stats)
         layout.addLayout(ctrl_bar)
 
-        # 1b. Live Spatial Map Display & Colorscale Range Bar
-        map_bar = QtWidgets.QHBoxLayout()
+        # 1b. Live Spatial Map Display & Colorscale Range Bar (shown only during mapping)
+        self.map_bar_widget = QtWidgets.QWidget()
+        map_bar = QtWidgets.QHBoxLayout(self.map_bar_widget)
+        map_bar.setContentsMargins(0, 0, 0, 0)
         map_bar.addWidget(QtWidgets.QLabel("Map Metric:"))
         self.combo_map_metric = QtWidgets.QComboBox()
         self.combo_map_metric.addItem("Mean Shift ν_B (GHz)", "mean_shift")
@@ -185,7 +197,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
         map_bar.addWidget(self.spin_map_vmax)
 
         map_bar.addStretch()
-        layout.addLayout(map_bar)
+        self.map_bar_widget.setVisible(False)
+        layout.addWidget(self.map_bar_widget)
         self._sync_map_range_widgets()
 
         # 2. Unified PyQtGraph GraphicsLayoutWidget (handles single-frame, live 2D maps & diagnostics)
@@ -232,13 +245,19 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._pg_widget.clear()
         self._hover_plots = []
         self._live_map_widgets = None
+        self._dual_bf_widgets = None
         self._pg_plot = None
         self._pg_img_item = None
         self._pg_cbar = None
 
+    def set_map_bar_visible(self, visible: bool):
+        if hasattr(self, "map_bar_widget"):
+            self.map_bar_widget.setVisible(bool(visible))
+
     def _build_single_plot(self):
         self._clear_pg_grid()
         self._view_mode = "single"
+        self.set_map_bar_visible(False)
         self._pg_plot = self._pg_widget.addPlot(title=self._current_title)
         self._pg_plot.invertY(True)
         self._pg_plot.setAspectLocked(True)
@@ -251,7 +270,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._pg_img_item = pg.ImageItem(axisOrder="row-major")
         self._pg_plot.addItem(self._pg_img_item)
 
-        init_cmap = pg_helpers.get_pg_colormap(self.combo_cmap.currentText())
+        init_cmap = pg_helpers.get_pg_colormap(self.DEFAULT_CMAP)
         self._pg_cbar = pg.ColorBarItem(
             values=(0, 65535),
             colorMap=init_cmap,
@@ -260,12 +279,13 @@ class ImageViewerWidget(QtWidgets.QWidget):
         )
         self._pg_cbar.axis.setTextPen(pg.mkPen("#cfd8dc"))
         self._pg_cbar.setImageItem(self._pg_img_item, insert_in=self._pg_plot)
-        self._last_pg_cmap = self.combo_cmap.currentText()
+        self._last_pg_cmap = self.DEFAULT_CMAP
         self._last_pg_shape = None
 
     def _enter_diagnostic_mode(self):
         self._in_diagnostic_view = True
         self._view_mode = "diagnostic"
+        self.set_map_bar_visible(False)
         self._clear_pg_grid()
 
     def _add_dark_image_panel(
@@ -460,14 +480,35 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._last_live_map_state = None
         self._render_image()
 
+    def _on_contrast_bounds_changed(self):
+        if self._syncing_contrast:
+            return
+        self._syncing_contrast = True
+        try:
+            low = float(self.spin_contrast_low.value())
+            high = float(self.spin_contrast_high.value())
+            if low >= high:
+                if self.sender() is self.spin_contrast_low:
+                    high = min(100.0, low + 0.1)
+                    if high <= low:
+                        low = max(0.0, high - 0.1)
+                        self.spin_contrast_low.setValue(low)
+                    self.spin_contrast_high.setValue(high)
+                else:
+                    low = max(0.0, high - 0.1)
+                    if low >= high:
+                        high = min(100.0, low + 0.1)
+                        self.spin_contrast_high.setValue(high)
+                    self.spin_contrast_low.setValue(low)
+        finally:
+            self._syncing_contrast = False
+        self._on_display_settings_changed()
+
     def _compute_clim(self, img: np.ndarray) -> Tuple[float, float]:
-        mode = self.combo_contrast.currentData()
-        if mode == "uint16":
-            return 0.0, 65535.0
-        if mode == "minmax":
-            vmin, vmax = float(np.min(img)), float(np.max(img))
-            return (vmin, vmax) if vmax > vmin else (vmin, vmin + 1.0)
-        low_pct, high_pct = mode if isinstance(mode, tuple) else (1.0, 99.8)
+        low_pct = float(self.spin_contrast_low.value())
+        high_pct = float(self.spin_contrast_high.value())
+        if high_pct <= low_pct:
+            high_pct = min(100.0, low_pct + 0.1)
         sample = img[::4, ::4] if img.size > 65536 else img
         vmin, vmax = np.percentile(sample, [low_pct, high_pct])
         if vmax <= vmin:
@@ -483,7 +524,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         if self._view_mode != "single" or self._pg_plot is None or self._pg_img_item is None:
             self._build_single_plot()
 
-        cmap_name = self.combo_cmap.currentText()
+        cmap_name = self.DEFAULT_CMAP
         vmin, vmax = self._compute_clim(self._current_image)
         h, w = self._current_image.shape[:2]
 
@@ -503,8 +544,115 @@ class ImageViewerWidget(QtWidgets.QWidget):
     def _on_display_settings_changed(self):
         if self._view_mode == "live_map" and self._last_live_map_state is not None:
             self._render_live_map_state()
+        elif self._view_mode == "dual_brightfield":
+            self._refresh_dual_brightfield_images()
         elif self._view_mode == "single":
             self._render_image()
+
+    # ==========================================================================
+    # Dual-Graph Mode ('Reference' | 'Current Brightfield') for Mapping Parameters
+    # ==========================================================================
+
+    def show_dual_brightfield_view(
+        self,
+        ref_img: Optional[np.ndarray] = None,
+        ref_title: str = "Reference",
+        live_img: Optional[np.ndarray] = None,
+    ):
+        """Splits the viewer into 'Reference' (left) and 'Current Brightfield' (right)."""
+        self._last_live_map_state = None
+        self._in_diagnostic_view = False
+        self._clear_pg_grid()
+        self._view_mode = "dual_brightfield"
+        self.set_map_bar_visible(False)
+
+        if ref_img is not None:
+            self._dual_ref_img = np.asarray(ref_img)
+            self._dual_ref_title = ref_title
+        if live_img is not None:
+            self._dual_live_img = np.asarray(live_img)
+
+        p_ref = self._pg_widget.addPlot(row=0, col=0, title=self._dual_ref_title)
+        p_ref.invertY(True)
+        p_ref.setAspectLocked(True)
+        self._style_dark_plot(p_ref, title=self._dual_ref_title, xlabel="X (px)", ylabel="Y (px)")
+        im_ref = pg.ImageItem(axisOrder="row-major")
+        p_ref.addItem(im_ref)
+
+        p_live = self._pg_widget.addPlot(row=0, col=1, title="Current Brightfield")
+        p_live.invertY(True)
+        p_live.setAspectLocked(True)
+        self._style_dark_plot(p_live, title="Current Brightfield", xlabel="X (px)", ylabel="Y (px)")
+        im_live = pg.ImageItem(axisOrder="row-major")
+        p_live.addItem(im_live)
+
+        gray_lut = pg_helpers.get_pg_colormap(self.DEFAULT_CMAP).getLookupTable(nPts=256)
+        im_ref.setLookupTable(gray_lut)
+        im_live.setLookupTable(gray_lut)
+
+        self._dual_bf_widgets = {
+            "ref_plot": p_ref,
+            "ref_img_item": im_ref,
+            "ref_shape": None,
+            "live_plot": p_live,
+            "live_img_item": im_live,
+            "live_shape": None,
+        }
+        self._hover_plots = [
+            {"plot": p_ref, "data": self._dual_ref_img, "unit": "ADU", "origin": "upper", "extent": None},
+            {"plot": p_live, "data": self._dual_live_img, "unit": "ADU", "origin": "upper", "extent": None},
+        ]
+        self._refresh_dual_brightfield_images()
+
+    def set_dual_reference_image(self, ref_img: Optional[np.ndarray], ref_title: str = "Reference"):
+        self._dual_ref_img = np.asarray(ref_img) if ref_img is not None else None
+        self._dual_ref_title = ref_title
+        if self._view_mode != "dual_brightfield" or self._dual_bf_widgets is None:
+            self.show_dual_brightfield_view(ref_img=self._dual_ref_img, ref_title=ref_title)
+            return
+        self._dual_bf_widgets["ref_plot"].setTitle(ref_title, color="#e0e0e0", size="10pt")
+        if len(self._hover_plots) >= 1:
+            self._hover_plots[0]["data"] = self._dual_ref_img
+        self._refresh_dual_brightfield_images()
+
+    def set_dual_live_image(self, live_img: np.ndarray):
+        self._dual_live_img = np.asarray(live_img)
+        if self._view_mode != "dual_brightfield" or self._dual_bf_widgets is None:
+            self.show_dual_brightfield_view(live_img=self._dual_live_img)
+            return
+        if len(self._hover_plots) >= 2:
+            self._hover_plots[1]["data"] = self._dual_live_img
+        self._refresh_dual_brightfield_images()
+
+    def _refresh_dual_brightfield_images(self):
+        if self._dual_bf_widgets is None:
+            return
+        w = self._dual_bf_widgets
+        if self._dual_ref_img is not None:
+            arr = self._dual_ref_img
+            vmin, vmax = self._compute_clim(arr)
+            h, wd = arr.shape[:2]
+            w["ref_img_item"].setImage(arr, autoLevels=False, levels=(vmin, vmax))
+            w["ref_img_item"].setRect(QtCore.QRectF(-0.5, -0.5, float(wd), float(h)))
+            if w["ref_shape"] != (h, wd):
+                w["ref_shape"] = (h, wd)
+                w["ref_plot"].autoRange()
+        else:
+            w["ref_img_item"].clear()
+            w["ref_shape"] = None
+
+        if self._dual_live_img is not None:
+            arr = self._dual_live_img
+            vmin, vmax = self._compute_clim(arr)
+            h, wd = arr.shape[:2]
+            w["live_img_item"].setImage(arr, autoLevels=False, levels=(vmin, vmax))
+            w["live_img_item"].setRect(QtCore.QRectF(-0.5, -0.5, float(wd), float(h)))
+            if w["live_shape"] != (h, wd):
+                w["live_shape"] = (h, wd)
+                w["live_plot"].autoRange()
+        else:
+            w["live_img_item"].clear()
+            w["live_shape"] = None
 
     # ==========================================================================
     # Step 5.1: Laser Reference Calibration Diagnostic Views
@@ -524,7 +672,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._last_live_map_state = None
         self._enter_diagnostic_mode()
 
-        cmap = self.combo_cmap.currentText()
+        cmap = self.DEFAULT_CMAP
         data_sub = calib_res["data_subtracted"]
         vmin, vmax = self._compute_clim(data_sub)
 
@@ -664,7 +812,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._last_live_map_state = None
         self._enter_diagnostic_mode()
 
-        cmap = self.combo_cmap.currentText()
+        cmap = self.DEFAULT_CMAP
         fsr_cal = float(rb_res["FSR_cal"])
         dnu = float(rb_res["delta_nu_opt"])
 
@@ -965,7 +1113,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         p_img.addItem(im_frame)
         cb_frame = pg.ColorBarItem(
             values=(0, 65535),
-            colorMap=pg_helpers.get_pg_colormap(self.combo_cmap.currentText()),
+            colorMap=pg_helpers.get_pg_colormap(self.DEFAULT_CMAP),
             label="Counts (ADU)",
             interactive=True,
             width=14,
@@ -1009,7 +1157,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             "cb_frame": cb_frame,
             "txt_waiting": txt_waiting,
             "last_frame_shape": None,
-            "last_frame_cmap": self.combo_cmap.currentText(),
+            "last_frame_cmap": self.DEFAULT_CMAP,
             "p_map": p_map,
             "im_map": im_map,
             "cb_map": cb_map,
@@ -1045,6 +1193,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
           - Right panel: Live 2D spatial heatmap `(X_um, Y_um)` of the selected Brillouin metric
             with proportional physical step aspect ratio (`setAspectLocked(True)`).
         """
+        self.set_map_bar_visible(True)
         shift_arr = np.array(map_mean_shift, dtype=np.float64, copy=True)
         amp_arr = (
             np.full_like(shift_arr, np.nan)
@@ -1180,7 +1329,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             y_val = float(ys[min(iy, len(ys) - 1)])
 
         if frame is not None:
-            cmap_img = self.combo_cmap.currentText()
+            cmap_img = self.DEFAULT_CMAP
             vmin, vmax = self._compute_clim(frame)
             fh, fw = frame.shape[:2]
             if cmap_img != w_map["last_frame_cmap"]:
@@ -1383,7 +1532,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._last_live_map_state = None
         self._enter_diagnostic_mode()
 
-        cmap = self.combo_cmap.currentText()
+        cmap = self.DEFAULT_CMAP
         specs = [
             (0, 0, img0, f"1. Base ({x0:.1f}, {y0:.1f}) µm"),
             (0, 1, img_x, f"2. +X ({x0 + dx_um:.1f}, {y0:.1f}) µm [ΔX={dx_um:+.1f}]"),

@@ -24,7 +24,101 @@ from ..hardware import (
 )
 from .image_viewer import ImageViewerWidget
 from .pipeline_panel import PipelineAcquisitionWidget
-from .multi_angle_panel import MultiAngleAcquisitionWidget
+from ..brightfield_align import build_plate_calibration_from_jogs
+
+
+class CollapsibleSection(QtWidgets.QWidget):
+    """Collapsible section with a clickable header bar and toggleable content area."""
+
+    def __init__(self, title: str, expanded: bool = True, parent=None):
+        super().__init__(parent)
+        self._expanded = expanded
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        self.toggle_btn = QtWidgets.QToolButton()
+        self.toggle_btn.setText(title)
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setChecked(expanded)
+        self.toggle_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.toggle_btn.setArrowType(QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
+        self.toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.toggle_btn.setStyleSheet(
+            "QToolButton { font-weight: bold; padding: 5px 8px; text-align: left; "
+            "background-color: #2b2b2b; border: 1px solid #455a64; border-radius: 4px; }"
+        )
+        self.toggle_btn.toggled.connect(self._on_toggled)
+        outer.addWidget(self.toggle_btn)
+
+        self.content_area = QtWidgets.QFrame()
+        self.content_area.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.content_layout = QtWidgets.QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(8, 8, 8, 8)
+        self.content_layout.setSpacing(6)
+        self.content_area.setVisible(expanded)
+        outer.addWidget(self.content_area)
+
+    def _on_toggled(self, checked: bool):
+        self._expanded = checked
+        self.toggle_btn.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
+        self.content_area.setVisible(checked)
+
+
+class AutoCalibratePlateWorker(QtCore.QThread):
+    """Runs a 3-point stage jog (base, +X, +Y) with Brightfield capture to calibrate µm/px."""
+
+    sig_log = QtCore.Signal(str)
+    sig_stage_updated = QtCore.Signal()
+    sig_finished_calib = QtCore.Signal(object)
+    sig_error = QtCore.Signal(str, str)
+
+    def __init__(self, brightfield_cam: TeledyneBrightfieldCamera, stage: MS2000Stage, step_um: float, parent=None):
+        super().__init__(parent)
+        self.brightfield_cam = brightfield_cam
+        self.stage = stage
+        self.step_um = float(step_um)
+
+    def run(self):
+        try:
+            if not self.brightfield_cam.is_connected:
+                raise TeledyneCameraError("Brightfield camera is not connected.")
+            if not self.stage.is_connected:
+                raise MS2000Error("Stage is not connected.")
+
+            pos0 = self.stage.get_position()
+            x0, y0 = float(pos0["X"]), float(pos0["Y"])
+            n_avg = self.brightfield_cam.get_frame_averaging()
+
+            self.sig_log.emit(f"Plate auto-calibrate: capturing base frame at ({x0:.1f}, {y0:.1f}) µm...")
+            img0 = self.brightfield_cam.snap_frame(n_frames=n_avg, stage_pos_um=pos0)
+
+            self.sig_log.emit(f"Plate auto-calibrate: moving +{self.step_um:.1f} µm in X...")
+            pos_x = self.stage.move_to(x_um=x0 + self.step_um, y_um=y0, wait=True)
+            self.sig_stage_updated.emit()
+            time.sleep(0.08)
+            img_x = self.brightfield_cam.snap_frame(n_frames=n_avg, stage_pos_um=pos_x)
+
+            self.sig_log.emit(f"Plate auto-calibrate: moving +{self.step_um:.1f} µm in Y...")
+            pos_y = self.stage.move_to(x_um=x0, y_um=y0 + self.step_um, wait=True)
+            self.sig_stage_updated.emit()
+            time.sleep(0.08)
+            img_y = self.brightfield_cam.snap_frame(n_frames=n_avg, stage_pos_um=pos_y)
+
+            self.stage.move_to(x_um=x0, y_um=y0, wait=True)
+            self.sig_stage_updated.emit()
+
+            calib = build_plate_calibration_from_jogs(
+                img0=img0,
+                img_x=img_x,
+                img_y=img_y,
+                dx_um=self.step_um,
+                dy_um=self.step_um,
+            )
+            self.sig_finished_calib.emit(calib)
+        except Exception as exc:
+            self.sig_error.emit("Plate Auto-Calibrate Error", str(exc))
 
 
 class HardwareActionWorker(QtCore.QThread):
@@ -184,7 +278,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1460, 900)
 
         self._worker: Optional[HardwareActionWorker] = None
+        self._plate_calib_worker: Optional[AutoCalibratePlateWorker] = None
         self._live_running: bool = False
+        self._active_live_source: str = "orca"
         self._syncing_cam_widgets: bool = False
         self._syncing_bf_widgets: bool = False
         self._pending_frame: Optional[tuple] = None
@@ -238,26 +334,33 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self.btn_disconnect_all)
         main_layout.addLayout(top_bar)
 
-        # Horizontal Splitter: Left = 2D Image Viewer, Right = Scrollable Controls + Log
+        # Horizontal Splitter: Left = Viewer, Right = Tabbed Controls
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        main_layout.addWidget(splitter, stretch=1)
+        main_layout.addWidget(splitter, stretch=4)
 
-        # --- LEFT PANEL: 2D Camera Image Viewer ---
-        viewer_box = QtWidgets.QGroupBox("Acquired Camera Frame (Spectrometer & Brightfield)")
+        # --- LEFT PANEL: Viewer ---
+        viewer_box = QtWidgets.QGroupBox("Viewer")
         viewer_layout = QtWidgets.QVBoxLayout(viewer_box)
         viewer_layout.setContentsMargins(6, 6, 6, 6)
 
         quick_live_row = QtWidgets.QHBoxLayout()
         quick_live_row.setSpacing(6)
-        self.btn_quick_live_orca = QtWidgets.QPushButton("▶ Live Spectrometer (Orca)")
+        self.btn_quick_live_orca = QtWidgets.QPushButton("Spectrometer")
         self.btn_quick_live_orca.setMinimumHeight(28)
         self.btn_quick_live_orca.clicked.connect(lambda: self._start_quick_live("orca"))
         quick_live_row.addWidget(self.btn_quick_live_orca)
 
-        self.btn_quick_live_bf = QtWidgets.QPushButton("▶ Live Brightfield (Teledyne)")
+        self.btn_quick_live_bf = QtWidgets.QPushButton("Brightfield")
         self.btn_quick_live_bf.setMinimumHeight(28)
         self.btn_quick_live_bf.clicked.connect(lambda: self._start_quick_live("teledyne"))
         quick_live_row.addWidget(self.btn_quick_live_bf)
+
+        self.btn_stop_live = QtWidgets.QPushButton("Stop acquisition")
+        self.btn_stop_live.setMinimumHeight(28)
+        self.btn_stop_live.setEnabled(False)
+        self.btn_stop_live.clicked.connect(self._stop_live_if_running)
+        quick_live_row.addWidget(self.btn_stop_live)
+
         quick_live_row.addStretch()
         viewer_layout.addLayout(quick_live_row)
 
@@ -265,7 +368,7 @@ class MainWindow(QtWidgets.QMainWindow):
         viewer_layout.addWidget(self.image_viewer)
         splitter.addWidget(viewer_box)
 
-        # --- RIGHT PANEL: Tabbed Controls (Tab 1: Steps 1-3 Hardware/Camera/Stage, Tab 2: Step 4 Pipeline) + Log ---
+        # --- RIGHT PANEL: Tabbed Controls (Hardware, Live preview, Mapping) ---
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setContentsMargins(4, 0, 0, 0)
@@ -273,30 +376,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tabs_right = QtWidgets.QTabWidget()
 
-        # Tab 1: Steps 1, 2, 3 (Hardware Connections, Camera Parameters, Stage Motion & Live Preview)
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll_content = QtWidgets.QWidget()
-        scroll_vbox = QtWidgets.QVBoxLayout(scroll_content)
-        scroll_vbox.setContentsMargins(4, 4, 4, 4)
-        scroll_vbox.setSpacing(8)
+        # Tab 1: Hardware (Spectrometer Camera, Brightfield Camera, Plate)
+        hw_scroll = QtWidgets.QScrollArea()
+        hw_scroll.setWidgetResizable(True)
+        hw_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        hw_content = QtWidgets.QWidget()
+        hw_vbox = QtWidgets.QVBoxLayout(hw_content)
+        hw_vbox.setContentsMargins(4, 4, 4, 4)
+        hw_vbox.setSpacing(8)
+        hw_vbox.addWidget(self._build_camera_card())
+        hw_vbox.addWidget(self._build_brightfield_card())
+        hw_vbox.addWidget(self._build_stage_card())
+        hw_vbox.addStretch()
+        hw_scroll.setWidget(hw_content)
+        self.tabs_right.addTab(hw_scroll, "Hardware")
 
-        conn_row = QtWidgets.QHBoxLayout()
-        conn_row.setSpacing(8)
-        conn_row.addWidget(self._build_camera_card(), stretch=1)
-        conn_row.addWidget(self._build_stage_card(), stretch=1)
-        scroll_vbox.addLayout(conn_row)
+        # Tab 2: Live preview (3 collapsible sections: Spectrometer Camera, Brightfield Camera, Plate)
+        lp_scroll = QtWidgets.QScrollArea()
+        lp_scroll.setWidgetResizable(True)
+        lp_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        lp_content = QtWidgets.QWidget()
+        lp_vbox = QtWidgets.QVBoxLayout(lp_content)
+        lp_vbox.setContentsMargins(4, 4, 4, 4)
+        lp_vbox.setSpacing(8)
 
-        scroll_vbox.addWidget(self._build_brightfield_card())
-        scroll_vbox.addWidget(self._build_step3_camera_parameters_card())
-        scroll_vbox.addWidget(self._build_step2_motion_and_capture_card())
-        scroll_vbox.addStretch()
+        sec_spec = CollapsibleSection("Spectrometer Camera", expanded=True)
+        sec_spec.content_layout.addWidget(self._build_step3_camera_parameters_card())
+        lp_vbox.addWidget(sec_spec)
 
-        scroll.setWidget(scroll_content)
-        self.tabs_right.addTab(scroll, "Live preview")
+        sec_bf = CollapsibleSection("Brightfield Camera", expanded=True)
+        sec_bf.content_layout.addWidget(self._build_brightfield_preview_card())
+        lp_vbox.addWidget(sec_bf)
 
-        # Tab 2: Single angle study
+        sec_plate = CollapsibleSection("Plate", expanded=True)
+        sec_plate.content_layout.addWidget(self._build_step2_motion_and_capture_card())
+        lp_vbox.addWidget(sec_plate)
+
+        lp_vbox.addStretch()
+        lp_scroll.setWidget(lp_content)
+        self.tabs_right.addTab(lp_scroll, "Live preview")
+
+        # Tab 3: Mapping (merged Single + Multi angle study)
         self.pipeline_panel = PipelineAcquisitionWidget(
             camera=self.camera,
             stage=self.stage,
@@ -320,45 +440,17 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.pipeline_panel.sig_stage_updated.connect(self._update_stage_ui)
         self.pipeline_panel.sig_camera_updated.connect(self._update_camera_ui)
-        self.pipeline_panel.sig_lock_geometry.connect(self.chk_lock_geometry.setChecked)
-        self.tabs_right.addTab(self.pipeline_panel, "Single angle study")
+        self.pipeline_panel.sig_mapping_ready_changed.connect(self._on_mapping_ready_changed)
+        self.pipeline_panel.sig_set_bf_reference.connect(self._on_set_bf_reference)
+        self.tabs_right.addTab(self.pipeline_panel, "Mapping")
+        self.tabs_right.currentChanged.connect(self._on_right_tab_changed)
 
-        # Tab 3: Multi angle studies (shares HDF5 container, Laser & Rb calibrations)
-        self.multi_angle_panel = MultiAngleAcquisitionWidget(
-            camera=self.camera,
-            stage=self.stage,
-            session=self.pipeline_panel.session,
-            stop_live_callback=self._stop_live_if_running,
-            brightfield_cam=self.brightfield_cam,
-            parent=self,
-        )
-        self.multi_angle_panel.sig_log.connect(self._append_log_slot)
-        self.multi_angle_panel.sig_display_frame.connect(self._on_frame_acquired)
-        self.multi_angle_panel.sig_show_sample_diagnostics.connect(
-            self.image_viewer.show_sample_treatment_diagnostics
-        )
-        self.multi_angle_panel.sig_show_brightfield_alignment.connect(
-            self.image_viewer.show_brightfield_alignment
-        )
-        self.multi_angle_panel.sig_show_plate_calib_images.connect(
-            self.image_viewer.show_plate_calib_images
-        )
-        self.multi_angle_panel.sig_show_plate_calib_correlation.connect(
-            self.image_viewer.show_plate_calib_correlation
-        )
-        self.multi_angle_panel.sig_update_live_map.connect(
-            self.image_viewer.update_live_map_view
-        )
-        self.multi_angle_panel.sig_stage_updated.connect(self._update_stage_ui)
-        self.multi_angle_panel.sig_camera_updated.connect(self._update_camera_ui)
-        self.multi_angle_panel.sig_lock_geometry.connect(self.chk_lock_geometry.setChecked)
-        self.pipeline_panel.sig_session_updated.connect(self.multi_angle_panel.refresh_from_session)
-        self.multi_angle_panel.sig_session_updated.connect(self.pipeline_panel._refresh_h5_status_banner)
-        self.tabs_right.addTab(self.multi_angle_panel, "Multi angle studies")
+        right_layout.addWidget(self.tabs_right)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 6)
+        splitter.setStretchFactor(1, 5)
 
-        right_layout.addWidget(self.tabs_right, stretch=3)
-
-        # Bottom Hardware Log
+        # Bottom Hardware Log (spanning full width under both left & right frames)
         log_group = QtWidgets.QGroupBox("Hardware Communication Log")
         log_layout = QtWidgets.QVBoxLayout(log_group)
         log_layout.setContentsMargins(6, 6, 6, 6)
@@ -366,7 +458,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.txt_log = QtWidgets.QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setFont(QtGui.QFont("Courier", 10))
-        self.txt_log.setMinimumHeight(100)
+        self.txt_log.setMinimumHeight(90)
+        self.txt_log.setMaximumHeight(160)
 
         btn_clear_log = QtWidgets.QPushButton("Clear Log")
         btn_clear_log.setFixedWidth(85)
@@ -377,14 +470,10 @@ class MainWindow(QtWidgets.QMainWindow):
         log_hdr.addWidget(btn_clear_log)
         log_layout.addWidget(self.txt_log)
         log_layout.addLayout(log_hdr)
-        right_layout.addWidget(log_group, stretch=1)
-
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 6)
-        splitter.setStretchFactor(1, 5)
+        main_layout.addWidget(log_group, stretch=1)
 
     def _build_camera_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("1A. Camera — Orca Flash 4.0 v3")
+        box = QtWidgets.QGroupBox("Spectrometer Camera — Orca Flash 4.0 v3")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(5)
 
@@ -429,7 +518,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return box
 
     def _build_stage_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("1B. Stage — ASI MS-2000")
+        box = QtWidgets.QGroupBox("Plate — ASI MS-2000")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(5)
 
@@ -485,12 +574,13 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(info_form)
         return box
 
-    def _build_step3_camera_parameters_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("Step 3 — Drivable Camera Acquisition Parameters")
+    def _build_step3_camera_parameters_card(self) -> QtWidgets.QWidget:
+        box = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(box)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
-        # 1. Exposure Time & Frame Averaging
+        # 1. Exposure Time (with quick presets)
         exp_row = QtWidgets.QHBoxLayout()
         exp_row.addWidget(QtWidgets.QLabel("Exposure:"))
         self.spin_exposure_ms = QtWidgets.QDoubleSpinBox()
@@ -502,25 +592,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_exposure_ms.editingFinished.connect(self._on_apply_exposure)
         exp_row.addWidget(self.spin_exposure_ms)
 
-        # Quick exposure presets
         for ms_val, lbl in [(5.0, "5ms"), (20.0, "20ms"), (50.0, "50ms"), (200.0, "200ms"), (1000.0, "1s"), (5000.0, "5s")]:
             btn_e = QtWidgets.QPushButton(lbl)
             btn_e.setFixedWidth(46)
             btn_e.clicked.connect(lambda checked=False, v=ms_val: self._set_exposure_preset(v))
             exp_row.addWidget(btn_e)
+        exp_row.addStretch()
+        layout.addLayout(exp_row)
 
-        exp_row.addSpacing(10)
-        exp_row.addWidget(QtWidgets.QLabel("Frame Avg:"))
+        # 2. Frame Average
+        avg_row = QtWidgets.QHBoxLayout()
+        avg_row.addWidget(QtWidgets.QLabel("Frame average:"))
         self.spin_frame_avg = QtWidgets.QSpinBox()
         self.spin_frame_avg.setRange(1, 500)
         self.spin_frame_avg.setValue(1)
         self.spin_frame_avg.setSuffix(" frame(s)")
         self.spin_frame_avg.valueChanged.connect(self._on_apply_frame_averaging)
-        exp_row.addWidget(self.spin_frame_avg)
-        exp_row.addStretch()
-        layout.addLayout(exp_row)
+        avg_row.addWidget(self.spin_frame_avg)
+        avg_row.addStretch()
+        layout.addLayout(avg_row)
 
-        # 2. Readout Speed & Defect Pixel Correction
+        # 3. Readout Speed
         speed_row = QtWidgets.QHBoxLayout()
         speed_row.addWidget(QtWidgets.QLabel("Readout Speed:"))
         self.combo_readout_speed = QtWidgets.QComboBox()
@@ -528,95 +620,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_readout_speed.addItem("Slow (Ultra-Quiet Low-Noise Scan)", "slow")
         self.combo_readout_speed.currentIndexChanged.connect(self._on_apply_readout_speed)
         speed_row.addWidget(self.combo_readout_speed)
-
-        speed_row.addSpacing(16)
-        self.chk_defect_correct = QtWidgets.QCheckBox("On-Camera Defect Pixel Correction")
-        self.chk_defect_correct.setChecked(True)
-        self.chk_defect_correct.toggled.connect(self._on_apply_defect_correction)
-        speed_row.addWidget(self.chk_defect_correct)
         speed_row.addStretch()
         layout.addLayout(speed_row)
 
-        # Separator
-        line = QtWidgets.QFrame()
-        line.setFrameShape(QtWidgets.QFrame.HLine)
-        line.setFrameShadow(QtWidgets.QFrame.Sunken)
-        layout.addWidget(line)
-
-        # 3. Hardware Binning & Sensor Sub-Array ROI (with Geometry Lock)
-        geom_hdr = QtWidgets.QHBoxLayout()
-        geom_hdr.addWidget(QtWidgets.QLabel("Hardware Binning:"))
-        self.combo_hw_binning = QtWidgets.QComboBox()
-        self.combo_hw_binning.addItem("1 × 1 (Unbinned)", 1)
-        self.combo_hw_binning.addItem("2 × 2", 2)
-        self.combo_hw_binning.addItem("4 × 4", 4)
-        geom_hdr.addWidget(self.combo_hw_binning)
-
-        geom_hdr.addSpacing(12)
-        self.btn_roi_full = QtWidgets.QPushButton("Full Sensor (2048×2048)")
-        self.btn_roi_full.clicked.connect(self._on_preset_full_roi)
-        geom_hdr.addWidget(self.btn_roi_full)
-
-        self.btn_roi_center = QtWidgets.QPushButton("Center (1024×1024)")
-        self.btn_roi_center.clicked.connect(self._on_preset_center_roi)
-        geom_hdr.addWidget(self.btn_roi_center)
-
-        geom_hdr.addStretch()
-        self.chk_lock_geometry = QtWidgets.QCheckBox("Lock ROI & Binning (preserve calibration geometry)")
-        self.chk_lock_geometry.toggled.connect(self._on_geometry_lock_toggled)
-        geom_hdr.addWidget(self.chk_lock_geometry)
-        layout.addLayout(geom_hdr)
-
-        roi_row = QtWidgets.QHBoxLayout()
-        roi_row.addWidget(QtWidgets.QLabel("ROI X [start..end]:"))
-        self.spin_roi_hstart = QtWidgets.QSpinBox()
-        self.spin_roi_hstart.setRange(0, 2044)
-        self.spin_roi_hstart.setSingleStep(4)
-        self.spin_roi_hstart.setValue(0)
-        roi_row.addWidget(self.spin_roi_hstart)
-
-        self.spin_roi_hend = QtWidgets.QSpinBox()
-        self.spin_roi_hend.setRange(4, 2048)
-        self.spin_roi_hend.setSingleStep(4)
-        self.spin_roi_hend.setValue(2048)
-        roi_row.addWidget(self.spin_roi_hend)
-
-        roi_row.addSpacing(10)
-        roi_row.addWidget(QtWidgets.QLabel("Y [start..end]:"))
-        self.spin_roi_vstart = QtWidgets.QSpinBox()
-        self.spin_roi_vstart.setRange(0, 2044)
-        self.spin_roi_vstart.setSingleStep(4)
-        self.spin_roi_vstart.setValue(0)
-        roi_row.addWidget(self.spin_roi_vstart)
-
-        self.spin_roi_vend = QtWidgets.QSpinBox()
-        self.spin_roi_vend.setRange(4, 2048)
-        self.spin_roi_vend.setSingleStep(4)
-        self.spin_roi_vend.setValue(2048)
-        roi_row.addWidget(self.spin_roi_vend)
-
-        self.btn_apply_roi = QtWidgets.QPushButton("Apply ROI & Binning")
-        self.btn_apply_roi.setStyleSheet("font-weight: bold;")
-        self.btn_apply_roi.clicked.connect(self._on_apply_roi_and_binning)
-        roi_row.addWidget(self.btn_apply_roi)
-        roi_row.addStretch()
-        layout.addLayout(roi_row)
+        # 4. On-camera Defect Pixel Correction
+        defect_row = QtWidgets.QHBoxLayout()
+        self.chk_defect_correct = QtWidgets.QCheckBox("On camera Defect Pixel Correction")
+        self.chk_defect_correct.setChecked(True)
+        self.chk_defect_correct.toggled.connect(self._on_apply_defect_correction)
+        defect_row.addWidget(self.chk_defect_correct)
+        defect_row.addStretch()
+        layout.addLayout(defect_row)
 
         return box
 
     def _build_brightfield_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("Brightfield Camera (Teledyne CM3-U3-31S4M-CS)")
+        box = QtWidgets.QGroupBox("Brightfield Camera — Teledyne CM3-U3-31S4M-CS")
         v = QtWidgets.QVBoxLayout(box)
         v.setSpacing(6)
 
-        row1 = QtWidgets.QHBoxLayout()
-        row1.addWidget(QtWidgets.QLabel("Status:"))
-        self.lbl_bf_status = QtWidgets.QLabel("DISCONNECTED")
+        self.lbl_bf_status = QtWidgets.QLabel("Unconnected")
         self.lbl_bf_status.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_bf_status.setMinimumWidth(115)
-        row1.addWidget(self.lbl_bf_status)
+        self.lbl_bf_status.setMinimumHeight(24)
+        v.addWidget(self.lbl_bf_status)
 
-        row1.addSpacing(8)
+        row1 = QtWidgets.QHBoxLayout()
         row1.addWidget(QtWidgets.QLabel("Idx:"))
         self.spin_bf_idx = QtWidgets.QSpinBox()
         self.spin_bf_idx.setRange(0, 16)
@@ -629,7 +657,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_bf_count = QtWidgets.QLabel("—")
         row1.addWidget(self.lbl_bf_count)
 
-        self.chk_bf_sim = QtWidgets.QCheckBox("Simulate")
+        self.chk_bf_sim = QtWidgets.QCheckBox("Simulation Mode")
         row1.addWidget(self.chk_bf_sim)
         row1.addStretch()
 
@@ -639,185 +667,133 @@ class MainWindow(QtWidgets.QMainWindow):
         row1.addWidget(self.btn_bf_connect)
         v.addLayout(row1)
 
-        row2 = QtWidgets.QHBoxLayout()
-        row2.addWidget(QtWidgets.QLabel("Exp (ms):"))
+        self.lbl_bf_info = QtWidgets.QLabel("—")
+        self.lbl_bf_info.setStyleSheet("font-size: 11px; color: #b0bec5;")
+        v.addWidget(self.lbl_bf_info)
+        return box
+
+    def _build_brightfield_preview_card(self) -> QtWidgets.QWidget:
+        box = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        # 1. Exposure
+        exp_row = QtWidgets.QHBoxLayout()
+        exp_row.addWidget(QtWidgets.QLabel("Exposure:"))
         self.spin_bf_exp_ms = QtWidgets.QDoubleSpinBox()
         self.spin_bf_exp_ms.setRange(0.05, 5000.0)
         self.spin_bf_exp_ms.setDecimals(2)
         self.spin_bf_exp_ms.setValue(20.0)
+        self.spin_bf_exp_ms.setSuffix(" ms")
         self.spin_bf_exp_ms.setKeyboardTracking(False)
         self.spin_bf_exp_ms.valueChanged.connect(self._on_apply_bf_exposure)
-        row2.addWidget(self.spin_bf_exp_ms)
+        exp_row.addWidget(self.spin_bf_exp_ms)
+        exp_row.addStretch()
+        layout.addLayout(exp_row)
 
-        row2.addWidget(QtWidgets.QLabel("Gain (dB):"))
+        # 2. Frame average
+        avg_row = QtWidgets.QHBoxLayout()
+        avg_row.addWidget(QtWidgets.QLabel("Frame average:"))
+        self.spin_bf_avg = QtWidgets.QSpinBox()
+        self.spin_bf_avg.setRange(1, 100)
+        self.spin_bf_avg.setValue(1)
+        self.spin_bf_avg.setSuffix(" frame(s)")
+        self.spin_bf_avg.valueChanged.connect(self._on_apply_bf_avg)
+        avg_row.addWidget(self.spin_bf_avg)
+        avg_row.addStretch()
+        layout.addLayout(avg_row)
+
+        # 3. Gain
+        gain_row = QtWidgets.QHBoxLayout()
+        gain_row.addWidget(QtWidgets.QLabel("Gain:"))
         self.spin_bf_gain_db = QtWidgets.QDoubleSpinBox()
         self.spin_bf_gain_db.setRange(0.0, 24.0)
         self.spin_bf_gain_db.setDecimals(1)
         self.spin_bf_gain_db.setValue(0.0)
+        self.spin_bf_gain_db.setSuffix(" dB")
         self.spin_bf_gain_db.setKeyboardTracking(False)
         self.spin_bf_gain_db.valueChanged.connect(self._on_apply_bf_gain)
-        row2.addWidget(self.spin_bf_gain_db)
+        gain_row.addWidget(self.spin_bf_gain_db)
+        gain_row.addStretch()
+        layout.addLayout(gain_row)
 
-        row2.addWidget(QtWidgets.QLabel("Avg:"))
-        self.spin_bf_avg = QtWidgets.QSpinBox()
-        self.spin_bf_avg.setRange(1, 100)
-        self.spin_bf_avg.setValue(1)
-        self.spin_bf_avg.valueChanged.connect(self._on_apply_bf_avg)
-        row2.addWidget(self.spin_bf_avg)
+        # 4. Auto-calibrate + step spinbox placed right of the button
+        cal_row = QtWidgets.QHBoxLayout()
+        self.btn_bf_auto_calib = QtWidgets.QPushButton("Auto-calibrate")
+        self.btn_bf_auto_calib.setStyleSheet("background-color: #00695c; color: white; font-weight: bold;")
+        self.btn_bf_auto_calib.clicked.connect(self._on_bf_auto_calibrate)
+        cal_row.addWidget(self.btn_bf_auto_calib)
 
-        self.btn_bf_full_roi = QtWidgets.QPushButton("Reset Full ROI")
-        self.btn_bf_full_roi.clicked.connect(self._on_bf_reset_roi)
-        row2.addWidget(self.btn_bf_full_roi)
+        self.spin_bf_calib_step = QtWidgets.QDoubleSpinBox()
+        self.spin_bf_calib_step.setRange(1.0, 500.0)
+        self.spin_bf_calib_step.setDecimals(1)
+        self.spin_bf_calib_step.setValue(20.0)
+        self.spin_bf_calib_step.setSuffix(" µm")
+        cal_row.addWidget(self.spin_bf_calib_step)
 
-        self.lbl_bf_info = QtWidgets.QLabel("—")
-        self.lbl_bf_info.setStyleSheet("font-size: 11px; color: #b0bec5;")
-        row2.addWidget(self.lbl_bf_info, stretch=1)
-        v.addLayout(row2)
+        self.lbl_bf_calib_scale = QtWidgets.QLabel("Not calibrated")
+        self.lbl_bf_calib_scale.setStyleSheet("font-size: 11px; color: #b0bec5;")
+        cal_row.addWidget(self.lbl_bf_calib_scale)
+        cal_row.addStretch()
+        layout.addLayout(cal_row)
+
         return box
 
-    def _build_step2_motion_and_capture_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("Step 2 — Stage Navigation, Snap & Live Preview")
-        layout = QtWidgets.QVBoxLayout(box)
-        layout.setSpacing(8)
+    def _build_step2_motion_and_capture_card(self) -> QtWidgets.QWidget:
+        box = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
 
-        # A. Capture trigger, Live Preview & settling time row
-        snap_row = QtWidgets.QHBoxLayout()
-        snap_row.addWidget(QtWidgets.QLabel("Preview Cam:"))
-        self.combo_preview_source = QtWidgets.QComboBox()
-        self.combo_preview_source.addItem("Orca Flash 4.0 v3 (Spectrometer)", "orca")
-        self.combo_preview_source.addItem("Teledyne CM3 (Brightfield)", "teledyne")
-        self.combo_preview_source.currentIndexChanged.connect(self._on_preview_source_changed)
-        snap_row.addWidget(self.combo_preview_source)
-
-        self.chk_auto_snap = QtWidgets.QCheckBox("Auto-snap")
-        self.chk_auto_snap.setChecked(True)
-
-        snap_row.addWidget(self.chk_auto_snap)
-        snap_row.addSpacing(6)
-        snap_row.addWidget(QtWidgets.QLabel("Settling:"))
-        self.spin_settling_ms = QtWidgets.QSpinBox()
-        self.spin_settling_ms.setRange(0, 5000)
-        self.spin_settling_ms.setValue(50)
-        self.spin_settling_ms.setSuffix(" ms")
-        snap_row.addWidget(self.spin_settling_ms)
-        snap_row.addStretch()
-
-        self.btn_live_preview = QtWidgets.QPushButton("▶ Start Live Preview")
-        self.btn_live_preview.setMinimumHeight(30)
-        self.btn_live_preview.clicked.connect(self._on_toggle_live_preview)
-        snap_row.addWidget(self.btn_live_preview)
-
-        self.btn_snap_now = QtWidgets.QPushButton("📷 Snap Single Image")
-        self.btn_snap_now.setMinimumHeight(30)
-        self.btn_snap_now.setStyleSheet("font-weight: bold;")
-        self.btn_snap_now.clicked.connect(self._on_snap_now)
-        snap_row.addWidget(self.btn_snap_now)
-        layout.addLayout(snap_row)
-
-        # Separator
-        line1 = QtWidgets.QFrame()
-        line1.setFrameShape(QtWidgets.QFrame.HLine)
-        line1.setFrameShadow(QtWidgets.QFrame.Sunken)
-        layout.addWidget(line1)
-
-        # B. Relative Jog Pad + Step Size Presets
-        jog_outer = QtWidgets.QHBoxLayout()
-        jog_outer.setSpacing(16)
-
-        step_col = QtWidgets.QVBoxLayout()
-        step_form = QtWidgets.QFormLayout()
-        self.spin_jog_step = QtWidgets.QDoubleSpinBox()
-        self.spin_jog_step.setDecimals(2)
-        self.spin_jog_step.setRange(0.1, 50000.0)
-        self.spin_jog_step.setValue(50.0)
-        self.spin_jog_step.setSuffix(" µm")
-        step_form.addRow("Jog Step (Δ):", self.spin_jog_step)
-        step_col.addLayout(step_form)
-
-        preset_row = QtWidgets.QHBoxLayout()
-        for val in (1.0, 10.0, 50.0, 100.0, 500.0):
-            btn_p = QtWidgets.QPushButton(f"{val:g} µm")
-            btn_p.setFixedWidth(56)
-            btn_p.clicked.connect(lambda checked=False, v=val: self.spin_jog_step.setValue(v))
-            preset_row.addWidget(btn_p)
-        step_col.addLayout(preset_row)
-
-        stage_ctrl_row = QtWidgets.QHBoxLayout()
-        self.btn_zero_xy_nav = QtWidgets.QPushButton("Zero XY (0, 0)")
-        self.btn_zero_xy_nav.setToolTip("Set current physical X, Y position as (0.0, 0.0) µm")
-        self.btn_zero_xy_nav.clicked.connect(lambda: self._on_zero_stage(("X", "Y")))
-        stage_ctrl_row.addWidget(self.btn_zero_xy_nav)
-
-        self.btn_halt_stage = QtWidgets.QPushButton("HALT / Stop Stage")
-        self.btn_halt_stage.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
-        self.btn_halt_stage.clicked.connect(self._on_halt_stage)
-        stage_ctrl_row.addWidget(self.btn_halt_stage)
-        step_col.addLayout(stage_ctrl_row)
-        step_col.addStretch()
-        jog_outer.addLayout(step_col)
-
+        # Cross pattern of 4 high-speed (100 µm/s) + 4 low-speed (10 µm/s) press-and-hold buttons
         pad_grid = QtWidgets.QGridLayout()
         pad_grid.setSpacing(4)
 
-        self.btn_jog_yp = QtWidgets.QPushButton("▲ +Y")
-        self.btn_jog_ym = QtWidgets.QPushButton("▼ -Y")
-        self.btn_jog_xm = QtWidgets.QPushButton("◀ -X")
-        self.btn_jog_xp = QtWidgets.QPushButton("▶ +X")
-        self.btn_jog_zp = QtWidgets.QPushButton("▲ +Z")
-        self.btn_jog_zm = QtWidgets.QPushButton("▼ -Z")
+        self.btn_jog_yp_fast = QtWidgets.QPushButton("▲▲ +Y")
+        self.btn_jog_yp_slow = QtWidgets.QPushButton("▲ +Y")
+        self.btn_jog_ym_slow = QtWidgets.QPushButton("▼ -Y")
+        self.btn_jog_ym_fast = QtWidgets.QPushButton("▼▼ -Y")
+        self.btn_jog_xm_fast = QtWidgets.QPushButton("◀◀ -X")
+        self.btn_jog_xm_slow = QtWidgets.QPushButton("◀ -X")
+        self.btn_jog_xp_slow = QtWidgets.QPushButton("▶ +X")
+        self.btn_jog_xp_fast = QtWidgets.QPushButton("▶▶ +X")
 
-        for b in (self.btn_jog_yp, self.btn_jog_ym, self.btn_jog_xm, self.btn_jog_xp, self.btn_jog_zp, self.btn_jog_zm):
-            b.setMinimumSize(68, 28)
+        jog_specs = [
+            (self.btn_jog_yp_fast, 0.0, +100.0, 0, 2, "High speed +Y (100 µm/s)"),
+            (self.btn_jog_yp_slow, 0.0, +10.0, 1, 2, "Low speed +Y (10 µm/s)"),
+            (self.btn_jog_xm_fast, -100.0, 0.0, 2, 0, "High speed -X (100 µm/s)"),
+            (self.btn_jog_xm_slow, -10.0, 0.0, 2, 1, "Low speed -X (10 µm/s)"),
+            (self.btn_jog_xp_slow, +10.0, 0.0, 2, 3, "Low speed +X (10 µm/s)"),
+            (self.btn_jog_xp_fast, +100.0, 0.0, 2, 4, "High speed +X (100 µm/s)"),
+            (self.btn_jog_ym_slow, 0.0, -10.0, 3, 2, "Low speed -Y (10 µm/s)"),
+            (self.btn_jog_ym_fast, 0.0, -100.0, 4, 2, "High speed -Y (100 µm/s)"),
+        ]
+        for btn, vx, vy, r, c, tip in jog_specs:
+            btn.setMinimumSize(64, 30)
+            btn.setToolTip(tip)
+            btn.pressed.connect(lambda vx_=vx, vy_=vy: self._on_jog_hold_start(vx_, vy_))
+            btn.released.connect(self._on_jog_hold_stop)
+            pad_grid.addWidget(btn, r, c)
 
-        self.btn_jog_yp.clicked.connect(lambda: self._on_jog(0.0, +1.0, 0.0))
-        self.btn_jog_ym.clicked.connect(lambda: self._on_jog(0.0, -1.0, 0.0))
-        self.btn_jog_xm.clicked.connect(lambda: self._on_jog(-1.0, 0.0, 0.0))
-        self.btn_jog_xp.clicked.connect(lambda: self._on_jog(+1.0, 0.0, 0.0))
-        self.btn_jog_zp.clicked.connect(lambda: self._on_jog(0.0, 0.0, +1.0))
-        self.btn_jog_zm.clicked.connect(lambda: self._on_jog(0.0, 0.0, -1.0))
+        layout.addLayout(pad_grid)
 
-        pad_grid.addWidget(self.btn_jog_yp, 0, 1)
-        pad_grid.addWidget(self.btn_jog_xm, 1, 0)
-        pad_grid.addWidget(self.btn_jog_xp, 1, 2)
-        pad_grid.addWidget(self.btn_jog_ym, 2, 1)
-        pad_grid.addWidget(self.btn_jog_zp, 0, 3)
-        pad_grid.addWidget(self.btn_jog_zm, 2, 3)
+        ctrl_col = QtWidgets.QVBoxLayout()
+        ctrl_col.setSpacing(8)
+        self.btn_zero_xy_nav = QtWidgets.QPushButton("Zero")
+        self.btn_zero_xy_nav.setMinimumHeight(32)
+        self.btn_zero_xy_nav.setToolTip("Set current physical X, Y position as (0.0, 0.0) µm")
+        self.btn_zero_xy_nav.clicked.connect(lambda: self._on_zero_stage(("X", "Y")))
+        ctrl_col.addWidget(self.btn_zero_xy_nav)
 
-        jog_outer.addLayout(pad_grid)
-        layout.addLayout(jog_outer)
-
-        # Separator
-        line2 = QtWidgets.QFrame()
-        line2.setFrameShape(QtWidgets.QFrame.HLine)
-        line2.setFrameShadow(QtWidgets.QFrame.Sunken)
-        layout.addWidget(line2)
-
-        # C. Absolute Move (Go To X, Y)
-        abs_row = QtWidgets.QHBoxLayout()
-        abs_row.addWidget(QtWidgets.QLabel("Go To X:"))
-        self.spin_target_x = QtWidgets.QDoubleSpinBox()
-        self.spin_target_x.setDecimals(2)
-        self.spin_target_x.setRange(-100000.0, 100000.0)
-        self.spin_target_x.setSuffix(" µm")
-        abs_row.addWidget(self.spin_target_x)
-
-        abs_row.addWidget(QtWidgets.QLabel("Y:"))
-        self.spin_target_y = QtWidgets.QDoubleSpinBox()
-        self.spin_target_y.setDecimals(2)
-        self.spin_target_y.setRange(-100000.0, 100000.0)
-        self.spin_target_y.setSuffix(" µm")
-        abs_row.addWidget(self.spin_target_y)
-
-        self.btn_copy_pos = QtWidgets.QPushButton("Use Current")
-        self.btn_copy_pos.setToolTip("Copy current stage X, Y into target fields")
-        self.btn_copy_pos.clicked.connect(self._on_copy_current_pos)
-        abs_row.addWidget(self.btn_copy_pos)
-
-        self.btn_move_abs = QtWidgets.QPushButton("Move to (X, Y)")
-        self.btn_move_abs.setStyleSheet("font-weight: bold;")
-        self.btn_move_abs.clicked.connect(self._on_move_absolute)
-        abs_row.addWidget(self.btn_move_abs)
-        layout.addLayout(abs_row)
+        self.btn_halt_stage = QtWidgets.QPushButton("Emergency Stop")
+        self.btn_halt_stage.setMinimumHeight(36)
+        self.btn_halt_stage.setStyleSheet("background-color: #c62828; color: white; font-weight: bold;")
+        self.btn_halt_stage.clicked.connect(self._on_halt_stage)
+        ctrl_col.addWidget(self.btn_halt_stage)
+        ctrl_col.addStretch()
+        layout.addLayout(ctrl_col)
+        layout.addStretch()
 
         return box
 
@@ -924,7 +900,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_bf_exp_ms.setEnabled(connected)
         self.spin_bf_gain_db.setEnabled(connected)
         self.spin_bf_avg.setEnabled(connected)
-        self.btn_bf_full_roi.setEnabled(connected)
+        self.btn_bf_auto_calib.setEnabled(connected and self.stage.is_connected)
 
         if connected:
             self._syncing_bf_widgets = True
@@ -938,14 +914,12 @@ class MainWindow(QtWidgets.QMainWindow):
             temp_s = f" | {st['temperature_c']:.1f}°C" if st["temperature_c"] is not None else ""
             self.lbl_bf_info.setText(f"{st['model']} | {out_w}×{out_h} px{temp_s}")
         else:
-            self.lbl_bf_info.setText("Disconnected")
+            self.lbl_bf_info.setText("Unconnected")
 
         busy = bool(self._worker and self._worker.isRunning() and not self._live_running)
         self._set_motion_controls_enabled(not busy)
         if hasattr(self, "pipeline_panel"):
             self.pipeline_panel._update_brightfield_ui()
-        if hasattr(self, "multi_angle_panel"):
-            self.multi_angle_panel._refresh_active_angle_ui()
 
     def _refresh_serial_ports(self):
         self.combo_stage_port.clear()
@@ -980,7 +954,6 @@ class MainWindow(QtWidgets.QMainWindow):
             baudrate = int(self.combo_stage_baud.currentData() or 115200)
             try:
                 self.stage.connect(port=port, baudrate=baudrate, simulate=simulate)
-                self._on_copy_current_pos()
             except MS2000Error as exc:
                 self._threadsafe_log(f"ERROR (Stage): {exc}")
                 QtWidgets.QMessageBox.warning(self, "Stage Connection Error", str(exc))
@@ -1064,75 +1037,72 @@ class MainWindow(QtWidgets.QMainWindow):
         if was_live:
             self._on_toggle_live_preview()
 
-    def _on_preset_full_roi(self):
-        if self.chk_lock_geometry.isChecked():
+    # ==========================================================================
+    # Brightfield Auto-Calibrate & Tab / Dual-Viewer Coordination
+    # ==========================================================================
+
+    def _on_bf_auto_calibrate(self):
+        if not self.brightfield_cam.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Camera Not Connected", "Please connect the Brightfield camera first.")
             return
-        det_w, det_h = self.camera.detector_size
-        self.spin_roi_hstart.setValue(0)
-        self.spin_roi_hend.setValue(det_w)
-        self.spin_roi_vstart.setValue(0)
-        self.spin_roi_vend.setValue(det_h)
-        self._on_apply_roi_and_binning()
-
-    def _on_preset_center_roi(self):
-        if self.chk_lock_geometry.isChecked():
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
             return
-        det_w, det_h = self.camera.detector_size
-        sub_w, sub_h = min(1024, det_w), min(1024, det_h)
-        hs = ((det_w - sub_w) // 2 // 4) * 4
-        vs = ((det_h - sub_h) // 2 // 4) * 4
-        self.spin_roi_hstart.setValue(hs)
-        self.spin_roi_hend.setValue(hs + sub_w)
-        self.spin_roi_vstart.setValue(vs)
-        self.spin_roi_vend.setValue(vs + sub_h)
-        self._on_apply_roi_and_binning()
-
-    def _on_apply_roi_and_binning(self):
-        if self._syncing_cam_widgets or not self.camera.is_connected:
+        if self._plate_calib_worker is not None and self._plate_calib_worker.isRunning():
             return
-        if self.chk_lock_geometry.isChecked():
-            self._threadsafe_log("Geometry is locked; unlock to modify ROI or hardware binning.")
-            return
-
-        was_live = self._live_running
-        if was_live:
-            self._stop_live_if_running()
-
-        try:
-            binning = int(self.combo_hw_binning.currentData() or 1)
-            hstart = int(self.spin_roi_hstart.value())
-            hend = int(self.spin_roi_hend.value())
-            vstart = int(self.spin_roi_vstart.value())
-            vend = int(self.spin_roi_vend.value())
-
-            applied_roi = self.camera.set_roi(
-                hstart=hstart,
-                hend=hend,
-                vstart=vstart,
-                vend=vend,
-                binning=binning,
+        self._stop_live_if_running()
+        step_um = float(self.spin_bf_calib_step.value())
+        self.btn_bf_auto_calib.setEnabled(False)
+        self._plate_calib_worker = AutoCalibratePlateWorker(
+            brightfield_cam=self.brightfield_cam,
+            stage=self.stage,
+            step_um=step_um,
+            parent=self,
+        )
+        self._plate_calib_worker.sig_log.connect(self._append_log_slot)
+        self._plate_calib_worker.sig_stage_updated.connect(self._update_stage_ui)
+        self._plate_calib_worker.sig_finished_calib.connect(self._on_bf_auto_calib_done)
+        self._plate_calib_worker.sig_error.connect(self._on_worker_error)
+        self._plate_calib_worker.finished.connect(
+            lambda: self.btn_bf_auto_calib.setEnabled(
+                self.brightfield_cam.is_connected and self.stage.is_connected
             )
-            self._syncing_cam_widgets = True
-            self.spin_roi_hstart.setValue(applied_roi[0])
-            self.spin_roi_hend.setValue(applied_roi[1])
-            self.spin_roi_vstart.setValue(applied_roi[2])
-            self.spin_roi_vend.setValue(applied_roi[3])
-            idx_bin = self.combo_hw_binning.findData(applied_roi[4])
-            if idx_bin >= 0:
-                self.combo_hw_binning.setCurrentIndex(idx_bin)
-            self._syncing_cam_widgets = False
-            self._update_camera_ui()
-        except Exception as exc:
-            self._threadsafe_log(f"ROI / Binning error: {exc}")
-            QtWidgets.QMessageBox.warning(self, "ROI / Binning Error", str(exc))
+        )
+        self._plate_calib_worker.start()
 
-        if was_live:
-            self._on_toggle_live_preview()
+    @QtCore.Slot(object)
+    def _on_bf_auto_calib_done(self, calib: Dict[str, Any]):
+        scale = calib.get("um_per_px", calib.get("scale_um_per_px"))
+        if scale is not None:
+            self.lbl_bf_calib_scale.setText(f"{float(scale):.4f} µm/px")
+        else:
+            self.lbl_bf_calib_scale.setText("Calibrated")
+        if hasattr(self, "pipeline_panel") and self.pipeline_panel.session.is_open:
+            try:
+                self.pipeline_panel.session.save_brightfield_stage_calibration(calib)
+            except Exception as exc:
+                self._threadsafe_log(f"Warning saving plate calibration to HDF5: {exc}")
+        self._threadsafe_log(f"Brightfield plate auto-calibration complete: {self.lbl_bf_calib_scale.text()}")
 
-    def _on_geometry_lock_toggled(self, locked: bool):
-        state_msg = "LOCKED" if locked else "UNLOCKED"
-        self._threadsafe_log(f"Camera ROI & Hardware Binning {state_msg}.")
-        self._set_motion_controls_enabled(not (self._worker and self._worker.isRunning() and not self._live_running))
+    def _on_right_tab_changed(self, idx: int):
+        widget = self.tabs_right.widget(idx)
+        if widget is self.pipeline_panel and self.pipeline_panel.is_mapping_ready():
+            self._enter_mapping_dual_brightfield()
+        elif widget is not self.pipeline_panel and self.image_viewer._view_mode == "dual_brightfield":
+            self.image_viewer._build_single_plot()
+
+    def _on_mapping_ready_changed(self, ready: bool):
+        if ready and self.tabs_right.currentWidget() is self.pipeline_panel:
+            self._enter_mapping_dual_brightfield()
+
+    def _enter_mapping_dual_brightfield(self):
+        self.image_viewer.show_dual_brightfield_view()
+        if self.brightfield_cam.is_connected and not (self._live_running and self._active_live_source == "teledyne"):
+            self._start_quick_live("teledyne")
+
+    @QtCore.Slot(object, str)
+    def _on_set_bf_reference(self, img, title: str):
+        self.image_viewer.set_dual_reference_image(img, ref_title=title)
 
     # ==========================================================================
     # Step 2: Stage Motion, Single Snap & Live Preview Actions
@@ -1141,40 +1111,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sync_live_buttons(self):
         src = self._current_preview_source()
         active_style = "background-color: #ef6c00; color: white; font-weight: bold;"
-        if self._live_running:
-            self.btn_live_preview.setText("⏹ Stop Live Preview")
-            self.btn_live_preview.setStyleSheet(active_style)
-        else:
-            self.btn_live_preview.setText("▶ Start Live Preview")
-            self.btn_live_preview.setStyleSheet("")
-
         orca_live = self._live_running and (src == "orca")
         bf_live = self._live_running and (src == "teledyne")
 
-        self.btn_quick_live_orca.setText(
-            "⏹ Stop Spectrometer Live" if orca_live else "▶ Live Spectrometer (Orca)"
-        )
+        self.btn_quick_live_orca.setText("Spectrometer")
         self.btn_quick_live_orca.setStyleSheet(active_style if orca_live else "")
-        self.btn_quick_live_orca.setEnabled(self.camera.is_connected)
+        self.btn_quick_live_orca.setEnabled(self.camera.is_connected and not orca_live)
 
-        self.btn_quick_live_bf.setText(
-            "⏹ Stop Brightfield Live" if bf_live else "▶ Live Brightfield (Teledyne)"
-        )
+        self.btn_quick_live_bf.setText("Brightfield")
         self.btn_quick_live_bf.setStyleSheet(active_style if bf_live else "")
-        self.btn_quick_live_bf.setEnabled(self.brightfield_cam.is_connected)
+        self.btn_quick_live_bf.setEnabled(self.brightfield_cam.is_connected and not bf_live)
+
+        self.btn_stop_live.setEnabled(self._live_running)
 
     def _start_quick_live(self, source: str):
         already_running_this = self._live_running and (self._current_preview_source() == source)
+        if already_running_this:
+            return
         if self._live_running:
             self._stop_live_if_running()
-            if already_running_this:
-                self._set_motion_controls_enabled(True)
-                return
-        idx = self.combo_preview_source.findData(source)
-        if idx >= 0:
-            self.combo_preview_source.blockSignals(True)
-            self.combo_preview_source.setCurrentIndex(idx)
-            self.combo_preview_source.blockSignals(False)
+        self._active_live_source = source
         self._on_toggle_live_preview()
 
     def _stop_live_if_running(self):
@@ -1193,20 +1149,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_live_buttons()
 
     def _current_preview_source(self) -> str:
-        return str(self.combo_preview_source.currentData() or "orca")
+        return self._active_live_source
 
     def _preview_camera_connected(self) -> bool:
         if self._current_preview_source() == "teledyne":
             return self.brightfield_cam.is_connected
         return self.camera.is_connected
-
-    def _on_preview_source_changed(self):
-        was_live = self._live_running
-        if was_live:
-            self._stop_live_if_running()
-        self._set_motion_controls_enabled(not (self._worker and self._worker.isRunning()))
-        if was_live and self._preview_camera_connected():
-            self._on_toggle_live_preview()
 
     def _on_toggle_live_preview(self):
         if self._live_running:
@@ -1245,92 +1193,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_running = False
         self._sync_live_buttons()
         map_running = (
-            (
-                hasattr(self, "pipeline_panel")
-                and self.pipeline_panel._map_worker is not None
-                and self.pipeline_panel._map_worker.isRunning()
-            )
-            or (
-                hasattr(self, "multi_angle_panel")
-                and self.multi_angle_panel._map_worker is not None
-                and self.multi_angle_panel._map_worker.isRunning()
-            )
+            hasattr(self, "pipeline_panel")
+            and self.pipeline_panel._map_worker is not None
+            and self.pipeline_panel._map_worker.isRunning()
         )
         if not map_running:
             self._set_motion_controls_enabled(True)
 
-    def _start_hardware_worker(self, action: str, params: Optional[Dict[str, Any]] = None):
-        if self._live_running:
-            self._stop_live_if_running()
-
-        if self._worker is not None and self._worker.isRunning():
-            self._threadsafe_log("Hardware action already in progress; please wait...")
-            return
-
-        merged_params = dict(params or {})
-        merged_params.setdefault("camera_source", self._current_preview_source())
-
-        self._set_motion_controls_enabled(False)
-        self._worker = HardwareActionWorker(
-            camera=self.camera,
-            brightfield_cam=self.brightfield_cam,
-            stage=self.stage,
-            action=action,
-            params=merged_params,
-            parent=self,
-        )
-        self._worker.sig_log.connect(self._append_log_slot)
-        self._worker.sig_stage_updated.connect(self._update_stage_ui)
-        self._worker.sig_frame_acquired.connect(self._on_frame_acquired)
-        self._worker.sig_error.connect(self._on_worker_error)
-        self._worker.finished.connect(lambda: self._set_motion_controls_enabled(True))
-        self._worker.start()
-
-    def _on_snap_now(self):
-        if not self._preview_camera_connected():
-            cam_label = "Teledyne Brightfield camera" if self._current_preview_source() == "teledyne" else "Orca camera"
-            QtWidgets.QMessageBox.warning(self, "Camera Not Connected", f"Please connect the {cam_label} first.")
-            return
-        self._start_hardware_worker(action="snap")
-
-    def _on_jog(self, dir_x: float, dir_y: float, dir_z: float):
+    def _on_jog_hold_start(self, vx_um_s: float, vy_um_s: float):
         if not self.stage.is_connected:
-            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the ASI MS-2000 stage first.")
-            return
-        step = float(self.spin_jog_step.value())
-        params = {
-            "dx_um": dir_x * step,
-            "dy_um": dir_y * step,
-            "dz_um": dir_z * step,
-            "settling_ms": self.spin_settling_ms.value(),
-            "auto_snap": self.chk_auto_snap.isChecked(),
-        }
-        self._start_hardware_worker(action="move_rel", params=params)
-
-    def _on_move_absolute(self):
-        if not self.stage.is_connected:
-            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the ASI MS-2000 stage first.")
-            return
-        params = {
-            "x_um": float(self.spin_target_x.value()),
-            "y_um": float(self.spin_target_y.value()),
-            "z_um": None,
-            "settling_ms": self.spin_settling_ms.value(),
-            "auto_snap": self.chk_auto_snap.isChecked(),
-        }
-        self._start_hardware_worker(action="move_abs", params=params)
-
-    def _on_copy_current_pos(self):
-        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
             return
         try:
-            pos = self.stage.get_position()
-            if pos.get("X") is not None:
-                self.spin_target_x.setValue(float(pos["X"]))
-            if pos.get("Y") is not None:
-                self.spin_target_y.setValue(float(pos["Y"]))
-        except Exception:
-            pass
+            self.stage.start_continuous_move(vx_um_s=vx_um_s, vy_um_s=vy_um_s)
+        except Exception as exc:
+            self._append_log_slot(f"ERROR (Continuous Jog): {exc}")
+
+    def _on_jog_hold_stop(self):
+        if self.stage.is_connected:
+            self.stage.halt()
+            self._update_stage_ui()
 
     def _on_halt_stage(self):
         if self.stage.is_connected:
@@ -1345,12 +1227,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._threadsafe_log("Cannot zero stage while a move/acquisition action is running.")
             return
         try:
-            pos = self.stage.zero_position(axes=axes)
+            self.stage.zero_position(axes=axes)
             self._update_stage_ui()
-            if "X" in axes and pos.get("X") is not None:
-                self.spin_target_x.setValue(float(pos["X"]))
-            if "Y" in axes and pos.get("Y") is not None:
-                self.spin_target_y.setValue(float(pos["Y"]))
         except Exception as exc:
             self._append_log_slot(f"ERROR (Zero Stage): {exc}")
             QtWidgets.QMessageBox.warning(self, "Zero Stage Error", str(exc))
@@ -1370,6 +1248,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if payload is None:
             return
         frame, pos, exposure_s, n_avg, binning = payload
+        if (
+            self.image_viewer._view_mode == "dual_brightfield"
+            and self._live_running
+            and self._active_live_source == "teledyne"
+        ):
+            self.image_viewer.set_dual_live_image(frame)
+            return
         self.image_viewer.update_image(
             frame,
             stage_pos_um=pos,
@@ -1389,57 +1274,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_motion_controls_enabled(self, enabled: bool):
         cam_ok = self.camera.is_connected and enabled
-        preview_ok = self._preview_camera_connected() and enabled
         stage_ok = self.stage.is_connected and enabled
         has_z = self.stage.has_z_axis and stage_ok
-        geom_unlocked = cam_ok and (not self.chk_lock_geometry.isChecked())
 
-        self.btn_snap_now.setEnabled(preview_ok)
-        self.btn_live_preview.setEnabled(self._preview_camera_connected())
         self._sync_live_buttons()
         self.spin_exposure_ms.setEnabled(cam_ok or self._live_running)
         self.spin_frame_avg.setEnabled(cam_ok)
         self.combo_readout_speed.setEnabled(cam_ok)
         self.chk_defect_correct.setEnabled(cam_ok)
 
-        # Geometry controls (locked when chk_lock_geometry is checked)
-        self.combo_hw_binning.setEnabled(geom_unlocked)
-        self.btn_roi_full.setEnabled(geom_unlocked)
-        self.btn_roi_center.setEnabled(geom_unlocked)
-        self.spin_roi_hstart.setEnabled(geom_unlocked)
-        self.spin_roi_hend.setEnabled(geom_unlocked)
-        self.spin_roi_vstart.setEnabled(geom_unlocked)
-        self.spin_roi_vend.setEnabled(geom_unlocked)
-        self.btn_apply_roi.setEnabled(geom_unlocked)
-
         for b in (
-            self.btn_jog_xp,
-            self.btn_jog_xm,
-            self.btn_jog_yp,
-            self.btn_jog_ym,
-            self.btn_move_abs,
-            self.btn_copy_pos,
+            self.btn_jog_yp_fast,
+            self.btn_jog_yp_slow,
+            self.btn_jog_ym_slow,
+            self.btn_jog_ym_fast,
+            self.btn_jog_xm_fast,
+            self.btn_jog_xm_slow,
+            self.btn_jog_xp_slow,
+            self.btn_jog_xp_fast,
             self.btn_stage_zero_xy,
             self.btn_zero_xy_nav,
         ):
             b.setEnabled(stage_ok)
         self.btn_stage_zero_z.setEnabled(has_z)
-        self.btn_jog_zp.setEnabled(has_z)
-        self.btn_jog_zm.setEnabled(has_z)
+        self.btn_bf_auto_calib.setEnabled(self.brightfield_cam.is_connected and stage_ok)
 
     def _set_badge_style(self, label: QtWidgets.QLabel, connected: bool, simulated: bool):
         if not connected:
-            label.setText("DISCONNECTED")
+            label.setText("Unconnected")
             label.setStyleSheet(
-                "background-color: #424242; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 3px;"
+                "background-color: #c62828; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 3px;"
             )
         elif simulated:
-            label.setText("CONNECTED (SIMULATION)")
+            label.setText("Connected (Simulation)")
             label.setStyleSheet(
-                "background-color: #ef6c00; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 3px;"
+                "background-color: #2e7d32; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 3px;"
             )
         else:
-            label.setText("CONNECTED (HARDWARE)")
+            label.setText("Connected")
             label.setStyleSheet(
                 "background-color: #2e7d32; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 3px;"
             )
@@ -1473,7 +1345,7 @@ class MainWindow(QtWidgets.QMainWindow):
             temp_str = f"{temp:.1f} °C" if temp is not None else "N/A"
             self.lbl_cam_exposure.setText(f"{exp_ms:.2f} ms × {n_avg} avg  |  {st['readout_speed']}  |  {temp_str}")
 
-            # Sync Step 3 controls with actual hardware values
+            # Sync Live Preview controls with actual hardware values
             self._syncing_cam_widgets = True
             self.spin_exposure_ms.setValue(exp_ms)
             self.spin_frame_avg.setValue(int(n_avg))
@@ -1482,13 +1354,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.combo_readout_speed.setCurrentIndex(idx_spd)
             if st["defect_correct"] is not None:
                 self.chk_defect_correct.setChecked(bool(st["defect_correct"]))
-            idx_bin = self.combo_hw_binning.findData(int(roi[4]))
-            if idx_bin >= 0:
-                self.combo_hw_binning.setCurrentIndex(idx_bin)
-            self.spin_roi_hstart.setValue(int(roi[0]))
-            self.spin_roi_hend.setValue(int(roi[1]))
-            self.spin_roi_vstart.setValue(int(roi[2]))
-            self.spin_roi_vend.setValue(int(roi[3]))
             self._syncing_cam_widgets = False
         else:
             self.lbl_cam_model.setText("—")
@@ -1499,8 +1364,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_motion_controls_enabled(not busy)
         if hasattr(self, "pipeline_panel"):
             self.pipeline_panel._update_map_summary()
-        if hasattr(self, "multi_angle_panel"):
-            self.multi_angle_panel._update_sample_summary()
 
     def _update_stage_ui(self):
         try:
@@ -1533,8 +1396,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_motion_controls_enabled(not busy)
         if hasattr(self, "pipeline_panel"):
             self.pipeline_panel._update_map_summary()
-        if hasattr(self, "multi_angle_panel"):
-            self.multi_angle_panel._update_sample_summary()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         """Ensure hardware connections are cleanly closed when exiting the GUI."""

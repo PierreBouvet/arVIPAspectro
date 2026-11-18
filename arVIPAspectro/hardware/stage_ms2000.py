@@ -73,6 +73,8 @@ class MS2000Stage:
 
         # Simulated state (in µm)
         self._sim_pos: Dict[str, float] = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+        self._sim_spin_stop = threading.Event()
+        self._sim_spin_thread: Optional[threading.Thread] = None
 
     def _log(self, message: str):
         if self._log_cb is not None:
@@ -447,10 +449,57 @@ class MS2000Stage:
             self._log(f"Zeroed axes {','.join(norm_axes)} via HERE command -> {pos}.")
             return pos
 
+    def start_continuous_move(self, vx_um_s: float = 0.0, vy_um_s: float = 0.0):
+        """
+        Starts continuous constant-velocity motion along X and/or Y (`SPIN X=... Y=...`
+        in mm/s on hardware, or a background thread in simulation mode).
+        Call `halt()` to stop motion.
+        """
+        with self._lock:
+            if not self._connected:
+                raise MS2000Error("Stage is not connected.")
+            self._stop_sim_spin()
+
+            if self._simulate:
+                self._sim_spin_stop.clear()
+
+                def _spin_loop():
+                    t_prev = time.monotonic()
+                    while not self._sim_spin_stop.is_set():
+                        time.sleep(0.02)
+                        t_now = time.monotonic()
+                        dt = t_now - t_prev
+                        t_prev = t_now
+                        with self._lock:
+                            self._sim_pos["X"] += vx_um_s * dt
+                            self._sim_pos["Y"] += vy_um_s * dt
+
+                self._sim_spin_thread = threading.Thread(target=_spin_loop, daemon=True)
+                self._sim_spin_thread.start()
+                self._log(f"Continuous move started (sim): vx={vx_um_s:.1f} µm/s, vy={vy_um_s:.1f} µm/s.")
+                return
+
+            vx_mm_s = float(vx_um_s) / 1000.0
+            vy_mm_s = float(vy_um_s) / 1000.0
+            cmd = f"SPIN X={vx_mm_s:.5f} Y={vy_mm_s:.5f}"
+            resp = self._serial_command(cmd)
+            if not resp.startswith(":A"):
+                raise MS2000Error(f"Continuous move command ({cmd!r}) rejected: {resp!r}")
+            self._log(f"Continuous move started: vx={vx_um_s:.1f} µm/s, vy={vy_um_s:.1f} µm/s.")
+
+    def _stop_sim_spin(self):
+        self._sim_spin_stop.set()
+        if self._sim_spin_thread is not None and self._sim_spin_thread.is_alive():
+            self._sim_spin_thread.join(timeout=0.2)
+        self._sim_spin_thread = None
+
     def halt(self):
         """Emergency stop of all stage axes (`\\` command)."""
         with self._lock:
+            self._stop_sim_spin()
             if not self._connected or self._simulate:
+                if self._simulate and self._connected:
+                    self._log("Emergency HALT sent to stage (sim).")
                 return
             try:
                 if self._serial is not None and self._serial.is_open:
