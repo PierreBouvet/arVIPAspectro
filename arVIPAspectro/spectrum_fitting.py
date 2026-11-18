@@ -276,17 +276,34 @@ def fit_sample_dho(
     xx_bin = bck.bin_2d_array(xx, bin_val_h, bin_val_w)
     yy_bin = bck.bin_2d_array(yy, bin_val_h, bin_val_w)
 
-    shift_clipped, shift_unwrapped, linewidth_clipped, shift_err, linewidth_err, x_coords, y_coords = bck.fit_dho_batched(
+    (
+        shift_clipped,
+        shift_unwrapped,
+        linewidth_clipped,
+        shift_err,
+        linewidth_err,
+        x_coords,
+        y_coords,
+        amp_out,
+        amp_err,
+        baseline_out,
+        baseline_err,
+    ) = bck.fit_dho_batched(
         freq_bin, data_bin, xx_bin, yy_bin, fsr_val,
         n_orders=n_orders, ds_init=ds_init, shift_tol=shift_tol,
         gamma_init=gamma_init, gamma_bounds=gamma_bounds,
-        hw_px=hw_px, min_amp=min_amp, verbose=verbose
+        hw_px=hw_px, min_amp=min_amp, verbose=verbose,
+        return_intensity=True,
     )
 
     shift_clipped_averaged = 0.5 * (shift_clipped[:, 0::2] + shift_clipped[:, 1::2])
     linewidth_clipped_averaged = 0.5 * (linewidth_clipped[:, 0::2] + linewidth_clipped[:, 1::2])
     shift_err_averaged = bck.compute_order_averaged_variance(shift_err)
     linewidth_err_averaged = bck.compute_order_averaged_variance(linewidth_err)
+    amp_averaged = 0.5 * (amp_out[:, 0::2] + amp_out[:, 1::2])
+    baseline_averaged = 0.5 * (baseline_out[:, 0::2] + baseline_out[:, 1::2])
+    amp_err_averaged = bck.compute_order_averaged_variance(amp_err)
+    baseline_err_averaged = bck.compute_order_averaged_variance(baseline_err)
     x_coords_averaged = 0.5 * (x_coords[:, 0::2] + x_coords[:, 1::2])
     y_coords_averaged = 0.5 * (y_coords[:, 0::2] + y_coords[:, 1::2])
 
@@ -298,12 +315,20 @@ def fit_sample_dho(
         'linewidth_clipped': linewidth_clipped,
         'shift_error': shift_err,
         'linewidth_error': linewidth_err,
+        'amplitude': amp_out,
+        'amplitude_error': amp_err,
+        'baseline': baseline_out,
+        'baseline_error': baseline_err,
         'x_coords': x_coords,
         'y_coords': y_coords,
         'shift_clipped_averaged': shift_clipped_averaged,
         'linewidth_clipped_averaged': linewidth_clipped_averaged,
         'shift_err_averaged': shift_err_averaged,
         'linewidth_err_averaged': linewidth_err_averaged,
+        'amplitude_averaged': amp_averaged,
+        'baseline_averaged': baseline_averaged,
+        'amplitude_err_averaged': amp_err_averaged,
+        'baseline_err_averaged': baseline_err_averaged,
         'x_coords_averaged': x_coords_averaged,
         'y_coords_averaged': y_coords_averaged,
         'stokes_antistokes_rms_mhz': stokes_antistokes_rms_mhz,
@@ -340,10 +365,36 @@ def retrieve_sample_dho_fit(wrapper, path_sample, bin_val_h=4, bin_val_w=2):
         y_coords = wrapper[f'{group_treated}/y_coords'].astype(np.float64)
         print('Y OK')
 
+        treated_children = set(wrapper.get_children_elements(group_treated))
+        amp_out = (
+            wrapper[f'{group_treated}/Amplitude'].astype(np.float64)
+            if 'Amplitude' in treated_children
+            else np.full_like(shift_clipped, np.nan)
+        )
+        amp_err = (
+            wrapper[f'{group_treated}/Amplitude error'].astype(np.float64)
+            if 'Amplitude error' in treated_children
+            else np.full_like(shift_clipped, np.nan)
+        )
+        baseline_out = (
+            wrapper[f'{group_treated}/Baseline'].astype(np.float64)
+            if 'Baseline' in treated_children
+            else np.full_like(shift_clipped, np.nan)
+        )
+        baseline_err = (
+            wrapper[f'{group_treated}/Baseline error'].astype(np.float64)
+            if 'Baseline error' in treated_children
+            else np.full_like(shift_clipped, np.nan)
+        )
+
         shift_clipped_averaged = 0.5 * (shift_clipped[:, 0::2] + shift_clipped[:, 1::2])
         linewidth_clipped_averaged = 0.5 * (linewidth_clipped[:, 0::2] + linewidth_clipped[:, 1::2])
         shift_err_averaged = bck.compute_order_averaged_variance(shift_err)
         linewidth_err_averaged = bck.compute_order_averaged_variance(linewidth_err)
+        amp_averaged = 0.5 * (amp_out[:, 0::2] + amp_out[:, 1::2])
+        baseline_averaged = 0.5 * (baseline_out[:, 0::2] + baseline_out[:, 1::2])
+        amp_err_averaged = bck.compute_order_averaged_variance(amp_err)
+        baseline_err_averaged = bck.compute_order_averaged_variance(baseline_err)
         x_coords_averaged = 0.5 * (x_coords[:, 0::2] + x_coords[:, 1::2])
         y_coords_averaged = 0.5 * (y_coords[:, 0::2] + y_coords[:, 1::2])
         stokes_antistokes_rms_mhz = float(np.nanstd(shift_clipped[:, 1::2] - shift_clipped[:, 0::2]) * 1e3)
@@ -353,12 +404,20 @@ def retrieve_sample_dho_fit(wrapper, path_sample, bin_val_h=4, bin_val_w=2):
             'linewidth_clipped': linewidth_clipped,
             'shift_error': shift_err,
             'linewidth_error': linewidth_err,
+            'amplitude': amp_out,
+            'amplitude_error': amp_err,
+            'baseline': baseline_out,
+            'baseline_error': baseline_err,
             'x_coords': x_coords,
             'y_coords': y_coords,
             'shift_clipped_averaged': shift_clipped_averaged,
             'linewidth_clipped_averaged': linewidth_clipped_averaged,
             'shift_err_averaged': shift_err_averaged,
             'linewidth_err_averaged': linewidth_err_averaged,
+            'amplitude_averaged': amp_averaged,
+            'baseline_averaged': baseline_averaged,
+            'amplitude_err_averaged': amp_err_averaged,
+            'baseline_err_averaged': baseline_err_averaged,
             'x_coords_averaged': x_coords_averaged,
             'y_coords_averaged': y_coords_averaged,
             'stokes_antistokes_rms_mhz': stokes_antistokes_rms_mhz,
@@ -371,10 +430,13 @@ def retrieve_sample_dho_fit(wrapper, path_sample, bin_val_h=4, bin_val_w=2):
 
 
 def save_treated_data(wrapper, path_sample, bin_val_h, bin_val_w,
-                      shift_rel, shift_err, lw_rel, lw_err, x_coords, y_coords):
+                      shift_rel, shift_err, lw_rel, lw_err, x_coords, y_coords,
+                      amplitude=None, amplitude_err=None, baseline=None, baseline_err=None):
     """
-    Saves the treated Brillouin shift, linewidth, uncertainties, and sub-pixel coordinates to HDF5.
+    Saves the treated Brillouin shift, linewidth, amplitude, baseline, uncertainties,
+    and sub-pixel coordinates to HDF5.
     """
+    treated_group = f'{path_sample}/Treated {bin_val_h}x{bin_val_w} bins'
     wrapper.add_treated_data(
         parent_group=path_sample,
         name_group=f'Treated {bin_val_h}x{bin_val_w} bins',
@@ -382,17 +444,21 @@ def save_treated_data(wrapper, path_sample, bin_val_h, bin_val_w,
         shift_err=shift_err,
         linewidth=lw_rel,
         linewidth_err=lw_err,
+        amplitude=amplitude,
+        amplitude_err=amplitude_err,
         overwrite=True,
     )
-    wrapper.add_other(
-        data=x_coords,
-        parent_group=f'{path_sample}/Treated {bin_val_h}x{bin_val_w} bins',
-        name='x_coords',
-        overwrite=True,
-    )
-    wrapper.add_other(
-        data=y_coords,
-        parent_group=f'{path_sample}/Treated {bin_val_h}x{bin_val_w} bins',
-        name='y_coords',
-        overwrite=True,
-    )
+    extra_datasets = [
+        ('x_coords', x_coords),
+        ('y_coords', y_coords),
+        ('Baseline', baseline),
+        ('Baseline error', baseline_err),
+    ]
+    for ds_name, arr in extra_datasets:
+        if arr is not None:
+            wrapper.add_other(
+                data=arr,
+                parent_group=treated_group,
+                name=ds_name,
+                overwrite=True,
+            )

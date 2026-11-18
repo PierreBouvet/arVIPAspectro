@@ -88,6 +88,32 @@ class ImageViewerWidget(QtWidgets.QWidget):
                 "bounds": (-1000.0, 50000.0),
                 "suffix": " m/s",
             },
+            "mean_amp": {
+                "state_key": "map_mean_amp",
+                "title": "Live 2D Map — Mean Amplitude a (ADU)",
+                "cbar_label": "Amplitude (ADU)",
+                "cmap": "inferno",
+                "auto": True,
+                "vmin": 50.0,
+                "vmax": 5000.0,
+                "decimals": 1,
+                "step": 25.0,
+                "bounds": (0.0, 100000.0),
+                "suffix": " ADU",
+            },
+            "mean_baseline": {
+                "state_key": "map_mean_baseline",
+                "title": "Live 2D Map — Mean Baseline b (ADU)",
+                "cbar_label": "Baseline (ADU)",
+                "cmap": "cividis",
+                "auto": True,
+                "vmin": 0.0,
+                "vmax": 2000.0,
+                "decimals": 1,
+                "step": 10.0,
+                "bounds": (-10000.0, 100000.0),
+                "suffix": " ADU",
+            },
         }
 
         self._build_ui()
@@ -132,6 +158,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self.combo_map_metric.addItem("Velocity V_s (m/s)", "v_s")
         self.combo_map_metric.addItem("Mean Linewidth Γ_B (GHz)", "mean_lw")
         self.combo_map_metric.addItem("Normal Shift S(0) (GHz)", "shift_0")
+        self.combo_map_metric.addItem("Mean Amplitude a (ADU)", "mean_amp")
+        self.combo_map_metric.addItem("Mean Baseline b (ADU)", "mean_baseline")
         self.combo_map_metric.currentIndexChanged.connect(self._on_map_metric_changed)
         map_bar.addWidget(self.combo_map_metric)
 
@@ -718,10 +746,20 @@ class ImageViewerWidget(QtWidgets.QWidget):
             if q_res is not None and "V_s" in q_res
             else ""
         )
+        amp_str = (
+            f"  |  Mean A = {float(np.nanmean(dho['amplitude_averaged'])):.1f} ADU"
+            if "amplitude_averaged" in dho and np.any(np.isfinite(dho["amplitude_averaged"]))
+            else ""
+        )
+        base_str = (
+            f"  |  Mean b = {float(np.nanmean(dho['baseline_averaged'])):.1f} ADU"
+            if "baseline_averaged" in dho and np.any(np.isfinite(dho["baseline_averaged"]))
+            else ""
+        )
         self.lbl_stats.setText(
             f"DHO Fit ({dho['bin_val_h']}×{dho['bin_val_w']}): {dho['n_fringes']} orders  |  "
             f"Mean Shift = {float(np.nanmean(dho['shift_clipped_averaged'])):.3f} GHz  |  "
-            f"Mean LW = {float(np.nanmean(dho['linewidth_clipped_averaged'])):.3f} GHz{vs_str}"
+            f"Mean LW = {float(np.nanmean(dho['linewidth_clipped_averaged'])):.3f} GHz{amp_str}{base_str}{vs_str}"
         )
         self.canvas.draw_idle()
 
@@ -743,6 +781,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
         pos_um: Optional[Dict[str, Optional[float]]] = None,
         point_fit: Optional[Dict[str, Any]] = None,
         step_um: Optional[tuple] = None,
+        map_mean_amp: Optional[np.ndarray] = None,
+        map_mean_baseline: Optional[np.ndarray] = None,
     ):
         """
         Renders a side-by-side live view during spatial mapping:
@@ -750,14 +790,27 @@ class ImageViewerWidget(QtWidgets.QWidget):
           - Right subplot: Live 2D spatial heatmap `(X_um, Y_um)` of the selected Brillouin metric
             with proportional physical step aspect ratio (`aspect="equal"`).
         """
+        shift_arr = np.array(map_mean_shift, dtype=np.float64, copy=True)
+        amp_arr = (
+            np.full_like(shift_arr, np.nan)
+            if map_mean_amp is None
+            else np.array(map_mean_amp, dtype=np.float64, copy=True)
+        )
+        base_arr = (
+            np.full_like(shift_arr, np.nan)
+            if map_mean_baseline is None
+            else np.array(map_mean_baseline, dtype=np.float64, copy=True)
+        )
         self._last_live_map_state = {
             "frame": None if frame is None else np.asarray(frame),
             "x_coords_um": np.asarray(x_coords_um, dtype=np.float64),
             "y_coords_um": np.asarray(y_coords_um, dtype=np.float64),
-            "map_mean_shift": np.array(map_mean_shift, dtype=np.float64, copy=True),
+            "map_mean_shift": shift_arr,
             "map_mean_lw": np.array(map_mean_lw, dtype=np.float64, copy=True),
             "map_shift_0": np.array(map_shift_0, dtype=np.float64, copy=True),
             "map_vs": np.array(map_vs, dtype=np.float64, copy=True),
+            "map_mean_amp": amp_arr,
+            "map_mean_baseline": base_arr,
             "iy": int(iy),
             "ix": int(ix),
             "pos_um": pos_um,
@@ -822,7 +875,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             minmax = self._compute_finite_minmax(self._last_live_map_state[cfg["state_key"]])
             if minmax is not None:
                 d_min, d_max = minmax
-                eps = 1.0 if metric_key == "v_s" else 0.001
+                eps = 1.0 if metric_key in ("v_s", "mean_amp", "mean_baseline") else 0.001
                 cfg["vmin"] = d_min
                 cfg["vmax"] = d_max if d_max > d_min else d_min + eps
 
@@ -911,7 +964,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             map_vmin = float(cfg["vmin"])
             map_vmax = float(cfg["vmax"])
             if map_vmax <= map_vmin:
-                eps = 1.0 if metric_key == "v_s" else 1e-3
+                eps = 1.0 if metric_key in ("v_s", "mean_amp", "mean_baseline") else 1e-3
                 map_vmax = map_vmin + eps
 
         # Compute extent in µm using configured step sizes so pixel sizes are proportional
@@ -953,11 +1006,21 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self.ax = ax_img
 
         if point_fit is not None:
+            amp_txt = (
+                f"  |  A = {point_fit['mean_amp_adu']:.1f} ADU"
+                if "mean_amp_adu" in point_fit and np.isfinite(point_fit["mean_amp_adu"])
+                else ""
+            )
+            base_txt = (
+                f"  |  b = {point_fit['mean_baseline_adu']:.1f} ADU"
+                if "mean_baseline_adu" in point_fit and np.isfinite(point_fit["mean_baseline_adu"])
+                else ""
+            )
             self.lbl_stats.setText(
                 f"Map [{iy},{ix}]: ν_B = {point_fit['mean_shift_ghz']:.3f} GHz  |  "
                 f"Γ_B = {point_fit['mean_lw_ghz']:.3f} GHz  |  "
                 f"S(0) = {point_fit['Shift_0_ghz']:.3f} GHz  |  "
-                f"V_s = {point_fit['V_s_ms']:.1f} m/s"
+                f"V_s = {point_fit['V_s_ms']:.1f} m/s{amp_txt}{base_txt}"
             )
         self.canvas.draw_idle()
 

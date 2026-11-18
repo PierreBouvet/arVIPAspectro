@@ -352,8 +352,8 @@ class MapScanWorker(QtCore.QThread):
     sig_stage_updated = QtCore.Signal()
     sig_point_acquired = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
     sig_live_map_updated = QtCore.Signal(
-        object, object, object, object, object, object, object, int, int, object, object, object
-    )  # (frame, x_um_1d, y_um_1d, map_shift, map_lw, map_s0, map_vs, iy, ix, pos, point_fit, step_um)
+        object, object, object, object, object, object, object, int, int, object, object, object, object, object
+    )  # (frame, x_um_1d, y_um_1d, map_shift, map_lw, map_s0, map_vs, iy, ix, pos, point_fit, step_um, map_amp, map_baseline)
     sig_finished_map = QtCore.Signal(str, int)                           # (map_group_path, points_completed)
     sig_error = QtCore.Signal(str, str)
 
@@ -442,6 +442,8 @@ class MapScanWorker(QtCore.QThread):
             map_mean_lw = np.full((ny, nx), np.nan, dtype=np.float64)
             map_shift_0 = np.full((ny, nx), np.nan, dtype=np.float64)
             map_vs = np.full((ny, nx), np.nan, dtype=np.float64)
+            map_mean_amp = np.full((ny, nx), np.nan, dtype=np.float64)
+            map_mean_baseline = np.full((ny, nx), np.nan, dtype=np.float64)
 
             if treated_group_path is not None:
                 init_iy, init_ix, init_y, init_x = trajectory[0]
@@ -458,6 +460,8 @@ class MapScanWorker(QtCore.QThread):
                     {"X": float(init_x), "Y": float(init_y)},
                     None,
                     step_um,
+                    map_mean_amp,
+                    map_mean_baseline,
                 )
 
             self.sig_log.emit(
@@ -498,6 +502,8 @@ class MapScanWorker(QtCore.QThread):
                             map_mean_lw[c_iy, c_ix] = point_fit["mean_lw_ghz"]
                             map_shift_0[c_iy, c_ix] = point_fit["Shift_0_ghz"]
                             map_vs[c_iy, c_ix] = point_fit["V_s_ms"]
+                            map_mean_amp[c_iy, c_ix] = point_fit["mean_amp_adu"]
+                            map_mean_baseline[c_iy, c_ix] = point_fit["mean_baseline_adu"]
 
                         self.session.write_map_point(
                             map_group_path=map_group_path,
@@ -526,6 +532,8 @@ class MapScanWorker(QtCore.QThread):
                                 c_pos,
                                 point_fit,
                                 step_um,
+                                map_mean_amp,
+                                map_mean_baseline,
                             )
                         else:
                             self.sig_point_acquired.emit(c_frame, c_pos, exp_s, n_avg, binning)
@@ -604,7 +612,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     sig_show_rb_diagnostics = QtCore.Signal(object, str)                # (rb_res, view_mode)
     sig_show_sample_diagnostics = QtCore.Signal(object, str)            # (sample_res, view_mode)
     sig_update_live_map = QtCore.Signal(
-        object, object, object, object, object, object, object, int, int, object, object, object
+        object, object, object, object, object, object, object, int, int, object, object, object, object, object
     )
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
@@ -1779,11 +1787,21 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             self.lbl_sample_fit_status.setStyleSheet(
                 "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
             )
+            amp_txt = (
+                f"  |  Mean A = {float(np.nanmean(dho['amplitude_averaged'])):.1f} ADU"
+                if "amplitude_averaged" in dho and np.any(np.isfinite(dho["amplitude_averaged"]))
+                else ""
+            )
+            base_txt = (
+                f"  |  Mean b = {float(np.nanmean(dho['baseline_averaged'])):.1f} ADU"
+                if "baseline_averaged" in dho and np.any(np.isfinite(dho["baseline_averaged"]))
+                else ""
+            )
             line1 = (
                 f"DHO Fit ({dho['bin_val_h']}×{dho['bin_val_w']} bin): {dho['n_fringes']} orders  |  "
                 f"Mean Shift = {float(np.nanmean(dho['shift_clipped_averaged'])):.3f} GHz  |  "
                 f"Mean LW = {float(np.nanmean(dho['linewidth_clipped_averaged'])):.3f} GHz  |  "
-                f"S/AS RMS = {dho['stokes_antistokes_rms_mhz']:.1f} MHz"
+                f"S/AS RMS = {dho['stokes_antistokes_rms_mhz']:.1f} MHz{amp_txt}{base_txt}"
             )
             if q_res is not None:
                 opt = q_res["opt_params"]

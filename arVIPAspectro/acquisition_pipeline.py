@@ -1085,6 +1085,10 @@ class AcquisitionSession:
                 lw_err=dho_results["linewidth_error"],
                 x_coords=dho_results["x_coords"],
                 y_coords=dho_results["y_coords"],
+                amplitude=dho_results["amplitude"],
+                amplitude_err=dho_results["amplitude_error"],
+                baseline=dho_results["baseline"],
+                baseline_err=dho_results["baseline_error"],
             )
 
         # Step 14: Acoustic Wavevector (q-vector) & 2D Concentric Ellipse Extraction
@@ -1261,12 +1265,16 @@ class AcquisitionSession:
 
         sa = dho["shift_clipped_averaged"]
         la = dho["linewidth_clipped_averaged"]
+        aa = dho["amplitude_averaged"]
+        ba = dho["baseline_averaged"]
         xa = dho["x_coords_averaged"]
         ya = dho["y_coords_averaged"]
         va = dho["shift_err_averaged"]
 
         mean_shift = float(np.nanmean(sa)) if np.any(np.isfinite(sa)) else float("nan")
         mean_lw = float(np.nanmean(la)) if np.any(np.isfinite(la)) else float("nan")
+        mean_amp = float(np.nanmean(aa)) if np.any(np.isfinite(aa)) else float("nan")
+        mean_baseline = float(np.nanmean(ba)) if np.any(np.isfinite(ba)) else float("nan")
 
         # Fast locked-geometry S(0) and V_s deduction
         q_ref = (
@@ -1303,6 +1311,8 @@ class AcquisitionSession:
             "df_coarse": float(df_coarse),
             "mean_shift_ghz": mean_shift,
             "mean_lw_ghz": mean_lw,
+            "mean_amp_adu": mean_amp,
+            "mean_baseline_adu": mean_baseline,
             "Shift_0_ghz": shift_0,
             "V_s_ms": v_s,
         }
@@ -1467,6 +1477,10 @@ class AcquisitionSession:
                         ("Shift error", "Shift_err"),
                         ("Linewidth", "Linewidth"),
                         ("Linewidth error", "Linewidth_err"),
+                        ("Amplitude", "Amplitude"),
+                        ("Amplitude error", "Amplitude_err"),
+                        ("Baseline", "Other"),
+                        ("Baseline error", "Other"),
                         ("x_coords", "Other"),
                         ("y_coords", "Other"),
                     ]
@@ -1484,6 +1498,8 @@ class AcquisitionSession:
                     for map_ds_name in (
                         "map_mean_shift_GHz",
                         "map_mean_linewidth_GHz",
+                        "map_mean_amplitude_ADU",
+                        "map_mean_baseline_ADU",
                         "map_Shift_0_GHz",
                         "map_V_s_m_per_s",
                         "map_df_coarse_GHz",
@@ -1536,11 +1552,17 @@ class AcquisitionSession:
                     t_grp["Shift error"][iy, ix, :, :] = dho["shift_error"]
                     t_grp["Linewidth"][iy, ix, :, :] = dho["linewidth_clipped"]
                     t_grp["Linewidth error"][iy, ix, :, :] = dho["linewidth_error"]
+                    t_grp["Amplitude"][iy, ix, :, :] = dho["amplitude"]
+                    t_grp["Amplitude error"][iy, ix, :, :] = dho["amplitude_error"]
+                    t_grp["Baseline"][iy, ix, :, :] = dho["baseline"]
+                    t_grp["Baseline error"][iy, ix, :, :] = dho["baseline_error"]
                     t_grp["x_coords"][iy, ix, :, :] = dho["x_coords"]
                     t_grp["y_coords"][iy, ix, :, :] = dho["y_coords"]
 
                     t_grp["map_mean_shift_GHz"][iy, ix] = float(point_fit["mean_shift_ghz"])
                     t_grp["map_mean_linewidth_GHz"][iy, ix] = float(point_fit["mean_lw_ghz"])
+                    t_grp["map_mean_amplitude_ADU"][iy, ix] = float(point_fit["mean_amp_adu"])
+                    t_grp["map_mean_baseline_ADU"][iy, ix] = float(point_fit["mean_baseline_adu"])
                     t_grp["map_Shift_0_GHz"][iy, ix] = float(point_fit["Shift_0_ghz"])
                     t_grp["map_V_s_m_per_s"][iy, ix] = float(point_fit["V_s_ms"])
                     t_grp["map_df_coarse_GHz"][iy, ix] = float(point_fit["df_coarse"])

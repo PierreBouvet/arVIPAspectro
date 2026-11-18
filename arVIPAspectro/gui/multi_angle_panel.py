@@ -197,7 +197,7 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
     sig_show_plate_calib_images = QtCore.Signal(object, object, object, float, float, float, float)
     sig_show_plate_calib_correlation = QtCore.Signal(object, object, object, float, float, float, float, object)
     sig_update_live_map = QtCore.Signal(
-        object, object, object, object, object, object, object, int, int, object, object, object
+        object, object, object, object, object, object, object, int, int, object, object, object, object, object
     )
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
@@ -945,9 +945,19 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         if has_fit:
             dho = fit_res["dho_results"]
             q_res = fit_res.get("q_results")
+            amp_txt = (
+                f"  |  Mean A = {float(np.nanmean(dho['amplitude_averaged'])):.1f} ADU"
+                if "amplitude_averaged" in dho and np.any(np.isfinite(dho["amplitude_averaged"]))
+                else ""
+            )
+            base_txt = (
+                f"  |  Mean b = {float(np.nanmean(dho['baseline_averaged'])):.1f} ADU"
+                if "baseline_averaged" in dho and np.any(np.isfinite(dho["baseline_averaged"]))
+                else ""
+            )
             txt = (
                 f"[{ang}] DHO Fit ({dho['bin_val_h']}×{dho['bin_val_w']}): {dho['n_fringes']} orders  |  "
-                f"S/AS RMS = {dho['stokes_antistokes_rms_mhz']:.1f} MHz"
+                f"S/AS RMS = {dho['stokes_antistokes_rms_mhz']:.1f} MHz{amp_txt}{base_txt}"
             )
             if q_res is not None:
                 opt = q_res["opt_params"]

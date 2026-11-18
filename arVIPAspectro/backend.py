@@ -589,12 +589,16 @@ def fit_dho_batched(
     hw_px=12,
     min_amp=30.0,
     verbose=True,
+    return_intensity=False,
 ):
     """
     Vectorized Batched Levenberg-Marquardt DHO Fitter with Analytic Jacobian.
     Includes local linear chord baseline levelling across each (2*hw_px + 1)-bin
     window so skewed background tails from adjacent orders do not pull nu_0.
     Dynamically determines n_orders and acoustic parameters if not specified.
+    When `return_intensity=True`, also returns `(amp_out, amp_err_out, baseline_out, baseline_err_out)`,
+    where `amp_out` is the DHO peak amplitude `a` above baseline (ADU) and `baseline_out`
+    is the local baseline height `chord_mid + b` at peak window center (ADU).
     """
     if ds_init is None:
         ds_init = getattr(config, 'EXPECTED_BRILLOUIN_SHIFT', 5.1)
@@ -621,6 +625,7 @@ def fit_dho_batched(
     N_tot = n_rows * 2 * n_orders
     nu_batch = np.zeros((N_tot, M), dtype=np.float64)
     y_batch = np.zeros((N_tot, M), dtype=np.float64)
+    chord_mid_arr = np.zeros(N_tot, dtype=np.float64)
     valid_win = np.zeros(N_tot, dtype=bool)
     row_idx_arr = np.zeros(N_tot, dtype=np.int32)
     col_idx_arr = np.zeros(N_tot, dtype=np.int32)
@@ -646,6 +651,7 @@ def fit_dho_batched(
             tau = np.linspace(0.0, 1.0, M)[None, :]
             chord = y_left + (y_right - y_left) * tau
             y_batch[sl] = y_win - chord
+            chord_mid_arr[sl] = 0.5 * (y_left[:, 0] + y_right[:, 0])
             valid_win[sl] = ok
             row_idx_arr[sl] = rows_arange
             col_idx_arr[sl] = col_out
@@ -717,6 +723,8 @@ def fit_dho_batched(
 
     s2 = cost / max(M - 4, 1)
     cov = np.linalg.inv(JTJ + 1e-9 * np.eye(4)[None, :, :]) * s2[:, None, None]
+    var_b = np.maximum(cov[:, 0, 0], 0.0)
+    var_amp = np.maximum(cov[:, 1, 1], 0.0)
     var_nu0 = np.maximum(cov[:, 2, 2], 0.0)
     var_gamma = np.maximum(cov[:, 3, 3], 0.0)
     perr_nu0 = np.sqrt(var_nu0)
@@ -738,6 +746,10 @@ def fit_dho_batched(
     lw_err_out = np.full((n_rows, 2 * n_orders), np.nan)
     x_coords_out = np.full((n_rows, 2 * n_orders), np.nan)
     y_coords_out = np.full((n_rows, 2 * n_orders), np.nan)
+    amp_out = np.full((n_rows, 2 * n_orders), np.nan)
+    amp_err_out = np.full((n_rows, 2 * n_orders), np.nan)
+    baseline_out = np.full((n_rows, 2 * n_orders), np.nan)
+    baseline_err_out = np.full((n_rows, 2 * n_orders), np.nan)
 
     for j in np.where(good)[0]:
         g_i = v_idx[j]
@@ -753,10 +765,28 @@ def fit_dho_batched(
         lw_err_out[r_i, c_i] = var_gamma[j]
         x_coords_out[r_i, c_i] = np.interp(tf, freq_bin_in[r_i], xx_bin_in[r_i])
         y_coords_out[r_i, c_i] = yy_bin_in[r_i, 0]
+        amp_out[r_i, c_i] = a[j]
+        amp_err_out[r_i, c_i] = var_amp[j]
+        baseline_out[r_i, c_i] = chord_mid_arr[g_i] + b[j]
+        baseline_err_out[r_i, c_i] = var_b[j]
 
     elapsed = time.time() - t_start
     if verbose:
         print(f"Vectorized DHO fitting completed in {elapsed:.3f} s ({np.sum(good)}/{N_tot} valid peaks across {n_orders} orders).")
+    if return_intensity:
+        return (
+            shift_rel,
+            shift_unwrapped,
+            lw_out,
+            shift_err_out,
+            lw_err_out,
+            x_coords_out,
+            y_coords_out,
+            amp_out,
+            amp_err_out,
+            baseline_out,
+            baseline_err_out,
+        )
     return shift_rel, shift_unwrapped, lw_out, shift_err_out, lw_err_out, x_coords_out, y_coords_out
 
 
