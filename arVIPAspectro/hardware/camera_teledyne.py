@@ -7,10 +7,81 @@ hardware control and includes a built-in Simulation / Mock mode (`simulate=True`
 for offline development and UI testing.
 """
 
+import glob
+import os
+import sys
 import time
 import threading
 from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
+
+
+_SPINNAKER_DLL_CONFIGURED = False
+
+
+def _ensure_spinnaker_dll_configured() -> Optional[str]:
+    """
+    On Windows, locates ``SpinnakerC*.dll`` in standard Teledyne / FLIR Spinnaker
+    installation directories (or PATH) and registers it with ``pylablib`` so
+    3-digit Spinnaker 4.x DLL names (e.g. ``SpinnakerC_v440.dll``) and non-PATH
+    installs load cleanly.
+    """
+    global _SPINNAKER_DLL_CONFIGURED
+    if _SPINNAKER_DLL_CONFIGURED or sys.platform != "win32":
+        return None
+
+    try:
+        import pylablib as pll
+    except ImportError:
+        return None
+
+    if ("devices/dlls", "teledyne_spinnaker") in pll.par:
+        _SPINNAKER_DLL_CONFIGURED = True
+        return str(pll.par["devices/dlls/teledyne_spinnaker"])
+
+    search_dirs: List[str] = []
+    for base_env in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        base = os.environ.get(base_env)
+        if not base:
+            continue
+        for vendor in ("Teledyne", "FLIR Systems", "Point Grey Research"):
+            root = os.path.join(base, vendor, "Spinnaker")
+            if os.path.isdir(root):
+                search_dirs.extend(sorted(glob.glob(os.path.join(root, "bin64", "vs*")), reverse=True))
+                search_dirs.append(os.path.join(root, "bin64"))
+                search_dirs.append(os.path.join(root, "bin"))
+
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        if p and os.path.isdir(p):
+            search_dirs.append(p)
+
+    seen = set()
+    for folder in search_dirs:
+        norm = os.path.normcase(os.path.abspath(folder))
+        if norm in seen or not os.path.isdir(folder):
+            continue
+        seen.add(norm)
+        candidates = sorted(glob.glob(os.path.join(folder, "SpinnakerC_v*.dll")), reverse=True)
+        if not candidates:
+            candidates = sorted(glob.glob(os.path.join(folder, "SpinnakerC*.dll")), reverse=True)
+        # Prefer release DLL over debug (*d.dll)
+        release = [c for c in candidates if not os.path.basename(c).lower().endswith("d.dll")]
+        chosen = release[0] if release else (candidates[0] if candidates else None)
+        if chosen:
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(folder)
+                except OSError:
+                    pass
+            cur_path = os.environ.get("PATH", "")
+            if folder not in cur_path.split(os.pathsep):
+                os.environ["PATH"] = folder + os.pathsep + cur_path
+            pll.par["devices/dlls/teledyne_spinnaker"] = chosen
+            _SPINNAKER_DLL_CONFIGURED = True
+            return chosen
+
+    _SPINNAKER_DLL_CONFIGURED = True
+    return None
 
 
 class TeledyneCameraError(Exception):
@@ -24,6 +95,7 @@ def list_teledyne_cameras() -> List[Dict[str, str]]:
     Returns ``[]`` if the Spinnaker SDK is not installed or no cameras are found.
     """
     try:
+        _ensure_spinnaker_dll_configured()
         from pylablib.devices import Teledyne
         infos = Teledyne.list_cameras(desc=True)
     except Exception:
@@ -47,6 +119,7 @@ def count_teledyne_cameras() -> int:
     Returns 0 if the Spinnaker SDK is not installed or no cameras are connected.
     """
     try:
+        _ensure_spinnaker_dll_configured()
         from pylablib.devices import Teledyne
         return int(Teledyne.get_cameras_number())
     except Exception:
@@ -193,6 +266,7 @@ class TeledyneBrightfieldCamera:
                 return self.get_status()
 
             try:
+                _ensure_spinnaker_dll_configured()
                 from pylablib.devices import Teledyne
             except ImportError as exc:
                 raise TeledyneCameraError(
