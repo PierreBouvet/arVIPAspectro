@@ -222,7 +222,7 @@ class MainWindow(QtWidgets.QMainWindow):
         title_font.setBold(True)
         title_lbl.setFont(title_font)
 
-        self.btn_connect_all = QtWidgets.QPushButton("Connect Both (Camera + Stage)")
+        self.btn_connect_all = QtWidgets.QPushButton("Connect All Hardware")
         self.btn_connect_all.setMinimumHeight(30)
         self.btn_connect_all.clicked.connect(self._on_connect_all)
 
@@ -241,9 +241,24 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addWidget(splitter, stretch=1)
 
         # --- LEFT PANEL: 2D Camera Image Viewer ---
-        viewer_box = QtWidgets.QGroupBox("Acquired Camera Frame (Hamamatsu Orca Flash 4.0 v3)")
+        viewer_box = QtWidgets.QGroupBox("Acquired Camera Frame (Spectrometer & Brightfield)")
         viewer_layout = QtWidgets.QVBoxLayout(viewer_box)
         viewer_layout.setContentsMargins(6, 6, 6, 6)
+
+        quick_live_row = QtWidgets.QHBoxLayout()
+        quick_live_row.setSpacing(6)
+        self.btn_quick_live_orca = QtWidgets.QPushButton("▶ Live Spectrometer (Orca)")
+        self.btn_quick_live_orca.setMinimumHeight(28)
+        self.btn_quick_live_orca.clicked.connect(lambda: self._start_quick_live("orca"))
+        quick_live_row.addWidget(self.btn_quick_live_orca)
+
+        self.btn_quick_live_bf = QtWidgets.QPushButton("▶ Live Brightfield (Teledyne)")
+        self.btn_quick_live_bf.setMinimumHeight(28)
+        self.btn_quick_live_bf.clicked.connect(lambda: self._start_quick_live("teledyne"))
+        quick_live_row.addWidget(self.btn_quick_live_bf)
+        quick_live_row.addStretch()
+        viewer_layout.addLayout(quick_live_row)
+
         self.image_viewer = ImageViewerWidget(self)
         viewer_layout.addWidget(self.image_viewer)
         splitter.addWidget(viewer_box)
@@ -966,6 +981,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_connect_all(self):
         if not self.camera.is_connected:
             self._on_toggle_camera()
+        if not self.brightfield_cam.is_connected:
+            self._on_toggle_brightfield()
         if not self.stage.is_connected:
             self._on_toggle_stage()
 
@@ -1113,17 +1130,59 @@ class MainWindow(QtWidgets.QMainWindow):
     # Step 2: Stage Motion, Single Snap & Live Preview Actions
     # ==========================================================================
 
+    def _sync_live_buttons(self):
+        src = self._current_preview_source()
+        active_style = "background-color: #ef6c00; color: white; font-weight: bold;"
+        if self._live_running:
+            self.btn_live_preview.setText("⏹ Stop Live Preview")
+            self.btn_live_preview.setStyleSheet(active_style)
+        else:
+            self.btn_live_preview.setText("▶ Start Live Preview")
+            self.btn_live_preview.setStyleSheet("")
+
+        orca_live = self._live_running and (src == "orca")
+        bf_live = self._live_running and (src == "teledyne")
+
+        self.btn_quick_live_orca.setText(
+            "⏹ Stop Spectrometer Live" if orca_live else "▶ Live Spectrometer (Orca)"
+        )
+        self.btn_quick_live_orca.setStyleSheet(active_style if orca_live else "")
+        self.btn_quick_live_orca.setEnabled(self.camera.is_connected)
+
+        self.btn_quick_live_bf.setText(
+            "⏹ Stop Brightfield Live" if bf_live else "▶ Live Brightfield (Teledyne)"
+        )
+        self.btn_quick_live_bf.setStyleSheet(active_style if bf_live else "")
+        self.btn_quick_live_bf.setEnabled(self.brightfield_cam.is_connected)
+
+    def _start_quick_live(self, source: str):
+        already_running_this = self._live_running and (self._current_preview_source() == source)
+        if self._live_running:
+            self._stop_live_if_running()
+            if already_running_this:
+                self._set_motion_controls_enabled(True)
+                return
+        idx = self.combo_preview_source.findData(source)
+        if idx >= 0:
+            self.combo_preview_source.blockSignals(True)
+            self.combo_preview_source.setCurrentIndex(idx)
+            self.combo_preview_source.blockSignals(False)
+        self._on_toggle_live_preview()
+
     def _stop_live_if_running(self):
         if self._live_running and self._worker is not None and self._worker.isRunning():
             try:
                 self._worker.sig_frame_acquired.disconnect(self._on_frame_acquired)
             except (TypeError, RuntimeError):
                 pass
+            try:
+                self._worker.finished.disconnect(self._on_live_worker_finished)
+            except (TypeError, RuntimeError):
+                pass
             self._worker.request_stop()
             self._worker.wait(10000)
         self._live_running = False
-        self.btn_live_preview.setText("▶ Start Live Preview")
-        self.btn_live_preview.setStyleSheet("")
+        self._sync_live_buttons()
 
     def _current_preview_source(self) -> str:
         return str(self.combo_preview_source.currentData() or "orca")
@@ -1157,8 +1216,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self._live_running = True
-        self.btn_live_preview.setText("⏹ Stop Live Preview")
-        self.btn_live_preview.setStyleSheet("background-color: #ef6c00; color: white; font-weight: bold;")
+        self._sync_live_buttons()
         self._worker = HardwareActionWorker(
             camera=self.camera,
             brightfield_cam=self.brightfield_cam,
@@ -1174,9 +1232,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.start()
 
     def _on_live_worker_finished(self):
+        if self._worker is not None and self.sender() is not None and self.sender() is not self._worker:
+            return
         self._live_running = False
-        self.btn_live_preview.setText("▶ Start Live Preview")
-        self.btn_live_preview.setStyleSheet("")
+        self._sync_live_buttons()
         map_running = (
             (
                 hasattr(self, "pipeline_panel")
@@ -1316,6 +1375,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_snap_now.setEnabled(preview_ok)
         self.btn_live_preview.setEnabled(self._preview_camera_connected())
+        self._sync_live_buttons()
         self.spin_exposure_ms.setEnabled(cam_ok or self._live_running)
         self.spin_frame_avg.setEnabled(cam_ok)
         self.combo_readout_speed.setEnabled(cam_ok)
