@@ -4,9 +4,11 @@ for displaying acquired Hamamatsu Orca Flash 4.0 v3 interferograms and
 step-by-step calibration diagnostics.
 """
 
+import time
 from typing import Optional, Dict, Any
 import numpy as np
 from PySide6 import QtWidgets
+import pyqtgraph as pg
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
@@ -29,6 +31,10 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._in_diagnostic_view: bool = False
         self._last_live_map_state: Optional[Dict[str, Any]] = None
         self._syncing_map_range: bool = False
+        self._last_pg_shape: Optional[tuple] = None
+        self._last_pg_cmap: Optional[str] = None
+        self._pg_cmap_cache: Dict[str, Any] = {}
+        self._last_stats_ts: float = 0.0
         self._map_range_settings: Dict[str, Dict[str, Any]] = {
             "mean_shift": {
                 "state_key": "map_mean_shift",
@@ -155,23 +161,56 @@ class ImageViewerWidget(QtWidgets.QWidget):
         layout.addLayout(map_bar)
         self._sync_map_range_widgets()
 
-        # 2. Matplotlib Figure & Navigation Toolbar
+        # 2. Stacked Display Area: PyQtGraph (live/2D frames) & Matplotlib (diagnostics)
+        self._view_stack = QtWidgets.QStackedWidget()
+
+        # Page 0: PyQtGraph high-FPS 2D image canvas
+        self._pg_widget = pg.GraphicsLayoutWidget()
+        self._pg_widget.setBackground("#1e1e1e")
+        self._pg_plot = self._pg_widget.addPlot(title=self._current_title)
+        self._pg_plot.invertY(True)
+        self._pg_plot.setAspectLocked(True)
+        self._pg_plot.setLabel("bottom", "Detector X (px)")
+        self._pg_plot.setLabel("left", "Detector Y (px)")
+        self._pg_img_item = pg.ImageItem(axisOrder="row-major")
+        self._pg_plot.addItem(self._pg_img_item)
+
+        init_cmap = self._get_pg_colormap(self.combo_cmap.currentText())
+        self._pg_cbar = pg.ColorBarItem(
+            values=(0, 65535),
+            colorMap=init_cmap,
+            label="Counts (ADU)",
+            interactive=True,
+        )
+        self._pg_cbar.setImageItem(self._pg_img_item, insert_in=self._pg_plot)
+        self._last_pg_cmap = self.combo_cmap.currentText()
+        self._view_stack.addWidget(self._pg_widget)
+
+        # Page 1: Matplotlib Figure & Navigation Toolbar (for multi-panel diagnostics)
+        self._mpl_page = QtWidgets.QWidget()
+        mpl_layout = QtWidgets.QVBoxLayout(self._mpl_page)
+        mpl_layout.setContentsMargins(0, 0, 0, 0)
+        mpl_layout.setSpacing(4)
         self.figure = Figure(figsize=(6, 6), tight_layout=True)
         self.canvas = FigureCanvas(self.figure)
         self.ax = self.figure.add_subplot(111)
         self.ax.set_title(self._current_title, fontsize=11)
         self.ax.set_xlabel("Detector X (px)")
         self.ax.set_ylabel("Detector Y (px)")
+        self.toolbar = NavigationToolbar(self.canvas, self._mpl_page)
+        mpl_layout.addWidget(self.toolbar)
+        mpl_layout.addWidget(self.canvas, stretch=1)
+        self._view_stack.addWidget(self._mpl_page)
 
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas, stretch=1)
+        self._view_stack.setCurrentWidget(self._pg_widget)
+        layout.addWidget(self._view_stack, stretch=1)
 
         # 3. Bottom Cursor Readout Bar
         self.lbl_cursor = QtWidgets.QLabel("Cursor: —")
         self.lbl_cursor.setStyleSheet("font-family: monospace; font-size: 11px;")
         layout.addWidget(self.lbl_cursor)
 
+        self._pg_plot.scene().sigMouseMoved.connect(self._on_pg_mouse_move)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
 
     def update_image(
@@ -203,20 +242,32 @@ class ImageViewerWidget(QtWidgets.QWidget):
             parts.append(exp_str)
         self._current_title = "  |  ".join(parts)
 
-        # Compute statistics
-        vmin_raw = int(np.min(self._current_image))
-        vmax_raw = int(np.max(self._current_image))
-        vmean = float(np.mean(self._current_image))
-        n_sat = int(np.sum(self._current_image >= 65000))
-        self.lbl_stats.setText(
-            f"Min: {vmin_raw}  |  Max: {vmax_raw}  |  Mean: {vmean:.1f}  |  Sat(≥65k): {n_sat} px"
-        )
+        # Compute statistics (throttled to ~10 Hz during rapid live streaming)
+        now = time.monotonic()
+        if (now - self._last_stats_ts) >= 0.1 or self._last_pg_shape != (h, w):
+            self._last_stats_ts = now
+            vmin_raw = int(np.min(self._current_image))
+            vmax_raw = int(np.max(self._current_image))
+            vmean = float(np.mean(self._current_image))
+            n_sat = int(np.sum(self._current_image >= 65000))
+            self.lbl_stats.setText(
+                f"Min: {vmin_raw}  |  Max: {vmax_raw}  |  Mean: {vmean:.1f}  |  Sat(≥65k): {n_sat} px"
+            )
 
-        if self._in_diagnostic_view:
-            self._im_artist = None
-            self._in_diagnostic_view = False
+        self._in_diagnostic_view = False
         self._last_live_map_state = None
         self._render_image()
+
+    def _get_pg_colormap(self, cmap_name: str):
+        if cmap_name not in self._pg_cmap_cache:
+            self._pg_cmap_cache[cmap_name] = pg.colormap.getFromMatplotlib(cmap_name)
+        return self._pg_cmap_cache[cmap_name]
+
+    def _enter_diagnostic_mode(self):
+        self._in_diagnostic_view = True
+        self._im_artist = None
+        self.figure.clear()
+        self._view_stack.setCurrentWidget(self._mpl_page)
 
     def _compute_clim(self, img: np.ndarray):
         mode = self.combo_contrast.currentData()
@@ -238,37 +289,23 @@ class ImageViewerWidget(QtWidgets.QWidget):
         if self._current_image is None:
             return
 
-        cmap = self.combo_cmap.currentText()
+        self._view_stack.setCurrentWidget(self._pg_widget)
+
+        cmap_name = self.combo_cmap.currentText()
         vmin, vmax = self._compute_clim(self._current_image)
         h, w = self._current_image.shape[:2]
 
-        if (
-            not self._in_diagnostic_view
-            and self._im_artist is not None
-            and self._im_artist.get_array().shape == (h, w)
-        ):
-            self._im_artist.set_data(self._current_image)
-            self._im_artist.set_cmap(cmap)
-            self._im_artist.set_clim(vmin, vmax)
-            self.ax.set_title(self._current_title, fontsize=10)
-        else:
-            self.figure.clear()
-            self.ax = self.figure.add_subplot(111)
-            self._im_artist = self.ax.imshow(
-                self._current_image,
-                cmap=cmap,
-                vmin=vmin,
-                vmax=vmax,
-                origin="upper",
-                aspect="equal",
-            )
-            self._cbar = self.figure.colorbar(self._im_artist, ax=self.ax, fraction=0.046, pad=0.04)
-            self._cbar.set_label("Counts (ADU)")
-            self.ax.set_title(self._current_title, fontsize=10)
-            self.ax.set_xlabel("Detector X (px)")
-            self.ax.set_ylabel("Detector Y (px)")
+        if cmap_name != self._last_pg_cmap:
+            self._pg_cbar.setColorMap(self._get_pg_colormap(cmap_name))
+            self._last_pg_cmap = cmap_name
 
-        self.canvas.draw_idle()
+        self._pg_img_item.setImage(self._current_image, autoLevels=False, levels=(vmin, vmax))
+        self._pg_cbar.setLevels((vmin, vmax))
+        self._pg_plot.setTitle(self._current_title, size="10pt")
+
+        if self._last_pg_shape != (h, w):
+            self._last_pg_shape = (h, w)
+            self._pg_plot.autoRange()
 
     def _on_display_settings_changed(self):
         if self._in_diagnostic_view:
@@ -292,10 +329,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
           - `'fringes_geom'`: Step 4–5 Traced & refined sub-pixel fringes + gnomonic optical axis.
           - `'anamorphic_res'`: Step 6 2D anamorphic polynomial surface residuals (MHz).
         """
-        self._in_diagnostic_view = True
         self._last_live_map_state = None
-        self._im_artist = None
-        self.figure.clear()
+        self._enter_diagnostic_mode()
 
         cmap = self.combo_cmap.currentText()
         data_sub = calib_res["data_subtracted"]
@@ -409,10 +444,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
           - `'fsr_fit'`: Step 10 Folded multi-order Rb spectrum & hyperfine FSR fit.
           - `'freq_map'`: Step 10B Full 2D calibrated frequency map & intra-order detuning map.
         """
-        self._in_diagnostic_view = True
         self._last_live_map_state = None
-        self._im_artist = None
-        self.figure.clear()
+        self._enter_diagnostic_mode()
 
         cmap = self.combo_cmap.currentText()
         fsr_cal = rb_res["FSR_cal"]
@@ -546,10 +579,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
           - `'dho_maps'`: Step 12–13 2D Fitted Brillouin Shift & Linewidth maps.
           - `'q_dispersion'`: Step 14 2D Coaxial Ellipse Geometry & Acoustic Dispersion V_s.
         """
-        self._in_diagnostic_view = True
         self._last_live_map_state = None
-        self._im_artist = None
-        self.figure.clear()
+        self._enter_diagnostic_mode()
 
         dho = sample_res["dho_results"]
         q_res = sample_res.get("q_results")
@@ -814,9 +845,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         if st is None:
             return
 
-        self._in_diagnostic_view = True
-        self._im_artist = None
-        self.figure.clear()
+        self._enter_diagnostic_mode()
 
         frame = st["frame"]
         xs = st["x_coords_um"]
@@ -949,10 +978,8 @@ class ImageViewerWidget(QtWidgets.QWidget):
         """
         from scipy.ndimage import shift as nd_shift
 
-        self._in_diagnostic_view = True
         self._last_live_map_state = None
-        self._im_artist = None
-        self.figure.clear()
+        self._enter_diagnostic_mode()
 
         def _norm01(a: np.ndarray) -> np.ndarray:
             arr = np.asarray(a, dtype=np.float64)
@@ -1009,6 +1036,22 @@ class ImageViewerWidget(QtWidgets.QWidget):
             f"Stage Δ=({dx_um:+.2f}, {dy_um:+.2f}) µm"
         )
         self.canvas.draw_idle()
+
+    def _on_pg_mouse_move(self, scene_pos):
+        if self._in_diagnostic_view or self._current_image is None:
+            return
+        if not self._pg_plot.sceneBoundingRect().contains(scene_pos):
+            self.lbl_cursor.setText("Cursor: —")
+            return
+        pt = self._pg_plot.vb.mapSceneToView(scene_pos)
+        col = int(round(pt.x()))
+        row = int(round(pt.y()))
+        h, w = self._current_image.shape[:2]
+        if 0 <= row < h and 0 <= col < w:
+            val = int(self._current_image[row, col])
+            self.lbl_cursor.setText(f"Cursor: X = {col:4d} px, Y = {row:4d} px   |   Intensity = {val:5d} ADU")
+        else:
+            self.lbl_cursor.setText("Cursor: —")
 
     def _on_mouse_move(self, event):
         if event.inaxes is None or event.xdata is None or event.ydata is None:

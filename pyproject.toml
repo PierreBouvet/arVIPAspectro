@@ -18,6 +18,7 @@ dependencies = [
     "h5py",
     "opencv-python",
     "PySide6",
+    "pyqtgraph",
     "pyserial",
     "pylablib-lightweight",
 ]

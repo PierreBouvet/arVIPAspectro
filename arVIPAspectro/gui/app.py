@@ -187,6 +187,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_running: bool = False
         self._syncing_cam_widgets: bool = False
         self._syncing_bf_widgets: bool = False
+        self._pending_frame: Optional[tuple] = None
+        self._frame_flush_scheduled: bool = False
 
         # Hardware driver instances
         self.camera = OrcaFlashCamera(logger=self._threadsafe_log)
@@ -1349,6 +1351,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(object, object, float, int, int)
     def _on_frame_acquired(self, frame, pos, exposure_s: float, n_avg: int, binning: int):
+        # Coalesce rapid live frames so only the newest frame is rendered per GUI cycle.
+        self._pending_frame = (frame, pos, exposure_s, n_avg, binning)
+        if not self._frame_flush_scheduled:
+            self._frame_flush_scheduled = True
+            QtCore.QTimer.singleShot(0, self._flush_pending_frame)
+
+    def _flush_pending_frame(self):
+        self._frame_flush_scheduled = False
+        payload = self._pending_frame
+        self._pending_frame = None
+        if payload is None:
+            return
+        frame, pos, exposure_s, n_avg, binning = payload
         self.image_viewer.update_image(
             frame,
             stage_pos_um=pos,
