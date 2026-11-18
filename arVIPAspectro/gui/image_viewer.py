@@ -224,7 +224,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         """
         Displays a newly acquired 2D image and updates statistics and stage coordinates in the title.
         """
-        self._current_image = np.asarray(image)
+        self._current_image = np.array(image, copy=True)
         h, w = self._current_image.shape[:2]
 
         # Build title string

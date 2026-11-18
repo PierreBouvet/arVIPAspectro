@@ -552,8 +552,13 @@ class TeledyneBrightfieldCamera:
                 return np.clip(np.rint(acc / n_frames), 0, 65535).astype(np.uint16)
 
             try:
+                try:
+                    self._cam.clear_acquisition()
+                except Exception:
+                    pass
                 if n_frames == 1:
-                    return np.asarray(self._cam.snap(timeout=timeout_s))
+                    frame = self._cam.snap(timeout=timeout_s)
+                    return np.array(frame, copy=True)
                 frames = self._cam.grab(nframes=n_frames, frame_timeout=timeout_s)
                 if not frames:
                     raise TeledyneCameraError("Camera grab returned 0 frames.")
@@ -561,6 +566,11 @@ class TeledyneBrightfieldCamera:
                 return np.clip(np.rint(acc), 0, 65535).astype(np.uint16)
             except Exception as exc:
                 raise TeledyneCameraError(f"Failed to acquire frame: {exc}") from exc
+            finally:
+                try:
+                    self._cam.clear_acquisition()
+                except Exception:
+                    pass
 
     def start_live(self, buffsize: int = 16):
         """Starts continuous acquisition for live viewing."""
@@ -593,7 +603,7 @@ class TeledyneBrightfieldCamera:
             try:
                 self._cam.wait_for_frame(since="now", timeout=float(timeout_s))
                 frame = self._cam.read_newest_image()
-                return np.asarray(frame) if frame is not None else None
+                return np.array(frame, copy=True) if frame is not None else None
             except self._cam.TimeoutError:
                 return None
             except Exception as exc:
@@ -608,6 +618,8 @@ class TeledyneBrightfieldCamera:
                 try:
                     self._cam.stop_acquisition()
                 finally:
+                    # Brief pause lets any active Spinnaker C callback finish before unregistering buffers
+                    time.sleep(0.05)
                     try:
                         self._cam.clear_acquisition()
                     except Exception:

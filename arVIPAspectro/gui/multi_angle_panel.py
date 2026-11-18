@@ -35,13 +35,11 @@ from .pipeline_panel import (
 
 class _PlateJogCaptureWorker(QtCore.QThread):
     """
-    Step 1 of interactive Brightfield plate calibration:
-    Moves to Base `(x0, y0)`, `+X`, and `+Y`, captures the 3 brightfield frames,
-    and returns to `(x0, y0)`.
+    Executes one stage-move + brightfield-snap step for the interactive 3-point plate calibration.
     """
 
     sig_log = QtCore.Signal(str)
-    sig_captured = QtCore.Signal(object)  # dict with img0, img_x, img_y, x0, y0, dx_um, dy_um
+    sig_captured = QtCore.Signal(object)  # dict: step_tag, frame, pos, exp_s, target_x, target_y
     sig_stage_updated = QtCore.Signal()
     sig_error = QtCore.Signal(str, str)
 
@@ -49,69 +47,59 @@ class _PlateJogCaptureWorker(QtCore.QThread):
         self,
         stage: MS2000Stage,
         brightfield_cam: TeledyneBrightfieldCamera,
-        jog_step_um: float = 20.0,
+        step_tag: str,
+        target_x: Optional[float] = None,
+        target_y: Optional[float] = None,
+        return_pos: Optional[tuple] = None,
         settling_ms: float = 300.0,
         parent=None,
     ):
         super().__init__(parent)
         self.stage = stage
         self.brightfield_cam = brightfield_cam
-        self.jog_step_um = float(jog_step_um)
+        self.step_tag = step_tag
+        self.target_x = target_x
+        self.target_y = target_y
+        self.return_pos = return_pos
         self.settling_ms = max(0.0, float(settling_ms))
 
     def run(self):
-        base_pos = None
         try:
-            base_pos = self.stage.get_position()
-            x0 = float(base_pos["X"])
-            y0 = float(base_pos["Y"])
-            settling_s = self.settling_ms / 1000.0
-            d = self.jog_step_um
+            if self.target_x is not None and self.target_y is not None:
+                pos = self.stage.move_to(x_um=float(self.target_x), y_um=float(self.target_y), wait=True)
+                self.sig_stage_updated.emit()
+                if self.settling_ms > 0:
+                    time.sleep(self.settling_ms / 1000.0)
+            else:
+                pos = self.stage.get_position()
 
+            exp_s = self.brightfield_cam.get_exposure()
+            frame = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=pos)
             self.sig_log.emit(
-                f"Plate Calib Step 1/3 — Capturing 3 jog frames around ({x0:.2f}, {y0:.2f}) µm (step={d:.1f} µm)..."
+                f"Plate Calib [{self.step_tag}] acquired ({frame.shape[1]}x{frame.shape[0]} px) "
+                f"@ ({float(pos['X']):.2f}, {float(pos['Y']):.2f}) µm."
             )
-            img0 = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=base_pos)
 
-            # Move +X
-            px = self.stage.move_to(x_um=x0 + d, y_um=y0, wait=True)
-            self.sig_stage_updated.emit()
-            if settling_s > 0:
-                time.sleep(settling_s)
-            img_x = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=px)
+            if self.return_pos is not None:
+                self.stage.move_to(x_um=float(self.return_pos[0]), y_um=float(self.return_pos[1]), wait=True)
+                self.sig_stage_updated.emit()
 
-            # Move +Y relative to Base
-            py = self.stage.move_to(x_um=x0, y_um=y0 + d, wait=True)
-            self.sig_stage_updated.emit()
-            if settling_s > 0:
-                time.sleep(settling_s)
-            img_y = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=py)
-
-            # Return to Base
-            self.stage.move_to(x_um=x0, y_um=y0, wait=True)
-            self.sig_stage_updated.emit()
-
-            dx_actual = float(px["X"]) - x0
-            dy_actual = float(py["Y"]) - y0
             self.sig_captured.emit(
                 {
-                    "img0": img0,
-                    "img_x": img_x,
-                    "img_y": img_y,
-                    "x0": x0,
-                    "y0": y0,
-                    "dx_um": dx_actual if abs(dx_actual) > 0.1 else d,
-                    "dy_um": dy_actual if abs(dy_actual) > 0.1 else d,
+                    "step_tag": self.step_tag,
+                    "frame": frame,
+                    "pos": pos,
+                    "exp_s": exp_s,
                 }
             )
         except Exception as exc:
-            if base_pos is not None:
+            if self.return_pos is not None:
                 try:
-                    self.stage.move_to(x_um=base_pos.get("X"), y_um=base_pos.get("Y"), wait=True)
+                    self.stage.move_to(x_um=float(self.return_pos[0]), y_um=float(self.return_pos[1]), wait=True)
                     self.sig_stage_updated.emit()
                 except Exception:
                     pass
-            self.sig_error.emit("Plate Calibration Capture Error", str(exc))
+            self.sig_error.emit(f"Plate Calibration Error ({self.step_tag})", str(exc))
 
 
 class _PlateCorrWorker(QtCore.QThread):
@@ -1314,6 +1302,49 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self.btn_auto_calib_plate.setEnabled(ready_hw)
         self.btn_apply_bf_manual.setEnabled(not self._is_busy())
 
+    def _ask_calib_continue(self, title: str, text: str) -> bool:
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setIcon(QtWidgets.QMessageBox.Information)
+        msg.setText(text)
+        btn_cont = msg.addButton("Continue", QtWidgets.QMessageBox.AcceptRole)
+        msg.addButton(QtWidgets.QMessageBox.Cancel)
+        msg.exec()
+        return msg.clickedButton() == btn_cont
+
+    def _cancel_plate_calib(self, reason: str, return_to_base: bool = False):
+        pending = self._plate_calib_pending
+        self._plate_calib_pending = None
+        if return_to_base and pending is not None and self.stage.is_connected:
+            try:
+                self.stage.move_to(x_um=float(pending["x0"]), y_um=float(pending["y0"]), wait=True)
+                self.sig_stage_updated.emit()
+            except Exception:
+                pass
+        self.sig_log.emit(reason)
+        self._on_worker_done()
+
+    def _launch_plate_jog_step(self, step_tag: str, target_x=None, target_y=None, return_pos=None):
+        if self._plate_calib_worker is not None and self._plate_calib_worker.isRunning():
+            self._plate_calib_worker.wait(2000)
+        self._set_controls_busy(True)
+        self._plate_calib_worker = _PlateJogCaptureWorker(
+            stage=self.stage,
+            brightfield_cam=self.brightfield_cam,
+            step_tag=step_tag,
+            target_x=target_x,
+            target_y=target_y,
+            return_pos=return_pos,
+            settling_ms=300.0,
+            parent=self,
+        )
+        self._plate_calib_worker.sig_log.connect(self.sig_log.emit)
+        self._plate_calib_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
+        self._plate_calib_worker.sig_captured.connect(self._on_plate_jog_step_done)
+        self._plate_calib_worker.sig_error.connect(self._on_worker_error)
+        self._plate_calib_worker.finished.connect(self._on_worker_done)
+        self._plate_calib_worker.start()
+
     def _on_auto_calibrate_plate(self):
         if self.brightfield_cam is None or not self.brightfield_cam.is_connected:
             QtWidgets.QMessageBox.warning(
@@ -1329,65 +1360,124 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
             return
 
         self._stop_live_cb()
-        self._plate_calib_pending = None
-        self._set_controls_busy(True)
-        self._plate_calib_worker = _PlateJogCaptureWorker(
-            stage=self.stage,
-            brightfield_cam=self.brightfield_cam,
-            jog_step_um=float(self.spin_bf_jog_step.value()),
-            settling_ms=300.0,
-            parent=self,
-        )
-        self._plate_calib_worker.sig_log.connect(self.sig_log.emit)
-        self._plate_calib_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
-        self._plate_calib_worker.sig_captured.connect(self._on_plate_jog_captured)
-        self._plate_calib_worker.sig_error.connect(self._on_worker_error)
-        self._plate_calib_worker.finished.connect(self._on_worker_done)
-        self._plate_calib_worker.start()
-
-    @QtCore.Slot(object)
-    def _on_plate_jog_captured(self, step1_data: dict):
-        self._plate_calib_pending = dict(step1_data)
-        self.sig_show_plate_calib_images.emit(
-            step1_data["img0"],
-            step1_data["img_x"],
-            step1_data["img_y"],
-            float(step1_data["x0"]),
-            float(step1_data["y0"]),
-            float(step1_data["dx_um"]),
-            float(step1_data["dy_um"]),
-        )
-
-        msg = QtWidgets.QMessageBox(self)
-        msg.setWindowTitle("Plate Calibration — Step 1/3")
-        msg.setIcon(QtWidgets.QMessageBox.Information)
-        msg.setText(
-            f"Captured 3 Brightfield frames at Base ({step1_data['x0']:.1f}, {step1_data['y0']:.1f}) µm, "
-            f"+X ({step1_data['dx_um']:+.1f} µm), and +Y ({step1_data['dy_um']:+.1f} µm).\n\n"
-            "Verify on the left panel that the sample visibly shifted between frames 1, 2, and 3.\n"
-            "Click 'Continue' to compute autocorrelation & cross-correlation."
-        )
-        btn_cont = msg.addButton("Continue", QtWidgets.QMessageBox.AcceptRole)
-        msg.addButton(QtWidgets.QMessageBox.Cancel)
-        msg.exec()
-        if msg.clickedButton() != btn_cont:
-            self._plate_calib_pending = None
-            self.sig_log.emit("Plate calibration canceled after Step 1 image inspection.")
-            self._on_worker_done()
+        try:
+            base_pos = self.stage.get_position()
+            x0 = float(base_pos["X"])
+            y0 = float(base_pos["Y"])
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Stage Position Error", str(exc))
             return
 
-        self._set_controls_busy(True)
-        self._plate_corr_worker = _PlateCorrWorker(
-            img0=step1_data["img0"],
-            img_x=step1_data["img_x"],
-            img_y=step1_data["img_y"],
-            parent=self,
-        )
-        self._plate_corr_worker.sig_log.connect(self.sig_log.emit)
-        self._plate_corr_worker.sig_correlated.connect(self._on_plate_corr_ready)
-        self._plate_corr_worker.sig_error.connect(self._on_worker_error)
-        self._plate_corr_worker.finished.connect(self._on_worker_done)
-        self._plate_corr_worker.start()
+        step = float(self.spin_bf_jog_step.value())
+        self._plate_calib_pending = {
+            "x0": x0,
+            "y0": y0,
+            "step": step,
+            "dx_um": step,
+            "dy_um": step,
+        }
+        self._launch_plate_jog_step("img0")
+
+    @QtCore.Slot(object)
+    def _on_plate_jog_step_done(self, res: dict):
+        data = self._plate_calib_pending
+        if data is None:
+            return
+
+        tag = res["step_tag"]
+        frame = res["frame"]
+        pos = res["pos"]
+        exp_s = float(res["exp_s"])
+        data[tag] = frame
+        self.sig_display_frame.emit(frame, pos, exp_s, 1, 1)
+
+        px_act = float(pos.get("X", data["x0"]))
+        py_act = float(pos.get("Y", data["y0"]))
+        x0, y0, step = float(data["x0"]), float(data["y0"]), float(data["step"])
+
+        if tag == "img0":
+            ok = self._ask_calib_continue(
+                "Plate Calibration — Image 1/3 (Base)",
+                f"Image 1/3 captured at Base ({px_act:.2f}, {py_act:.2f}) µm.\n"
+                f"Check the frame on the left (Min={int(np.min(frame))}, Max={int(np.max(frame))}).\n\n"
+                f"Is this image OK? Click 'Continue' to move +X ({step:+.1f} µm) and acquire Image 2.",
+            )
+            if not ok:
+                self._cancel_plate_calib("Plate calibration canceled after Image 1 (Base).")
+                return
+            self._launch_plate_jog_step("img_x", target_x=x0 + step, target_y=y0)
+            return
+
+        if tag == "img_x":
+            dx_act = px_act - x0
+            data["dx_um"] = dx_act if abs(dx_act) > 0.1 else step
+            diff_x = float(np.mean(np.abs(frame.astype(np.float64) - data["img0"].astype(np.float64))))
+            ok = self._ask_calib_continue(
+                "Plate Calibration — Image 2/3 (+X)",
+                f"Image 2/3 captured at +X ({px_act:.2f}, {py_act:.2f}) µm [ΔX={data['dx_um']:+.2f} µm].\n"
+                f"Mean abs pixel difference vs Base: {diff_x:.1f} ADU.\n\n"
+                f"Is this image OK? Click 'Continue' to move +Y ({step:+.1f} µm) and acquire Image 3.",
+            )
+            if not ok:
+                self._cancel_plate_calib("Plate calibration canceled after Image 2 (+X).", return_to_base=True)
+                return
+            self._launch_plate_jog_step(
+                "img_y",
+                target_x=x0,
+                target_y=y0 + step,
+                return_pos=(x0, y0),
+            )
+            return
+
+        if tag == "img_y":
+            dy_act = py_act - y0
+            data["dy_um"] = dy_act if abs(dy_act) > 0.1 else step
+            diff_y = float(np.mean(np.abs(frame.astype(np.float64) - data["img0"].astype(np.float64))))
+            ok = self._ask_calib_continue(
+                "Plate Calibration — Image 3/3 (+Y)",
+                f"Image 3/3 captured at +Y ({px_act:.2f}, {py_act:.2f}) µm [ΔY={data['dy_um']:+.2f} µm].\n"
+                f"Stage returned to Base ({x0:.2f}, {y0:.2f}) µm.\n"
+                f"Mean abs pixel difference vs Base: {diff_y:.1f} ADU.\n\n"
+                "Is this image OK? Click 'Continue' to review all 3 images together before correlation.",
+            )
+            if not ok:
+                self._cancel_plate_calib("Plate calibration canceled after Image 3 (+Y).")
+                return
+
+            # Pre-correlation 3-image validation view
+            self.sig_show_plate_calib_images.emit(
+                data["img0"],
+                data["img_x"],
+                data["img_y"],
+                x0,
+                y0,
+                float(data["dx_um"]),
+                float(data["dy_um"]),
+            )
+            diff_x = float(np.mean(np.abs(data["img_x"].astype(np.float64) - data["img0"].astype(np.float64))))
+            ok_corr = self._ask_calib_continue(
+                "Plate Calibration — Pre-Correlation Validation",
+                f"All 3 Brightfield images displayed together on the left frame.\n"
+                f"• +X vs Base mean diff: {diff_x:.1f} ADU\n"
+                f"• +Y vs Base mean diff: {diff_y:.1f} ADU\n\n"
+                "Click 'Continue' to run autocorrelation & 2D cross-correlation.",
+            )
+            if not ok_corr:
+                self._cancel_plate_calib("Plate calibration canceled before correlation.")
+                return
+
+            self._set_controls_busy(True)
+            self._plate_corr_worker = _PlateCorrWorker(
+                img0=data["img0"],
+                img_x=data["img_x"],
+                img_y=data["img_y"],
+                parent=self,
+            )
+            self._plate_corr_worker.sig_log.connect(self.sig_log.emit)
+            self._plate_corr_worker.sig_correlated.connect(self._on_plate_corr_ready)
+            self._plate_corr_worker.sig_error.connect(self._on_worker_error)
+            self._plate_corr_worker.finished.connect(self._on_worker_done)
+            self._plate_corr_worker.start()
 
     @QtCore.Slot(object)
     def _on_plate_corr_ready(self, corr_res: dict):
@@ -1407,22 +1497,31 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
 
         dc_x, dr_x = corr_res["dp_x"]
         dc_y, dr_y = corr_res["dp_y"]
-        msg = QtWidgets.QMessageBox(self)
-        msg.setWindowTitle("Plate Calibration — Step 2/3")
-        msg.setIcon(QtWidgets.QMessageBox.Information)
-        msg.setText(
+        try:
+            calib_preview = build_plate_calibration_from_jogs(
+                dx_um=float(data["dx_um"]),
+                dy_um=float(data["dy_um"]),
+                dp_from_x_px=(dc_x, dr_x),
+                dp_from_y_px=(dc_y, dr_y),
+            )
+            preview_str = (
+                f"Deduced scale: {calib_preview['um_per_px']:.4f} µm/px "
+                f"(X={calib_preview['um_per_px_x']:.4f}, Y={calib_preview['um_per_px_y']:.4f}, "
+                f"rot={calib_preview['rotation_deg']:+.2f}°)"
+            )
+        except Exception as exc:
+            preview_str = f"Deduction error: {exc}"
+
+        ok = self._ask_calib_continue(
+            "Plate Calibration — Final Check",
             f"Autocorrelation & 2D Cross-Correlation RGB map displayed on panel 4 (R=+X, G=+Y, B=Auto).\n\n"
             f"• +X jog ({data['dx_um']:+.1f} µm): ΔX = {dc_x:+.2f} px, ΔY = {dr_x:+.2f} px (peak = {corr_res['peak_x']:.3f})\n"
-            f"• +Y jog ({data['dy_um']:+.1f} µm): ΔX = {dc_y:+.2f} px, ΔY = {dr_y:+.2f} px (peak = {corr_res['peak_y']:.3f})\n\n"
-            "Click 'Continue' to deduce the pixel/µm relation and update fields."
+            f"• +Y jog ({data['dy_um']:+.1f} µm): ΔX = {dc_y:+.2f} px, ΔY = {dr_y:+.2f} px (peak = {corr_res['peak_y']:.3f})\n"
+            f"• {preview_str}\n\n"
+            "Click 'Continue' to apply calibration and update fields.",
         )
-        btn_cont = msg.addButton("Continue", QtWidgets.QMessageBox.AcceptRole)
-        msg.addButton(QtWidgets.QMessageBox.Cancel)
-        msg.exec()
-        if msg.clickedButton() != btn_cont:
-            self._plate_calib_pending = None
-            self.sig_log.emit("Plate calibration canceled after Step 2 correlation inspection.")
-            self._on_worker_done()
+        if not ok:
+            self._cancel_plate_calib("Plate calibration canceled at final check.")
             return
 
         self._finalize_plate_calibration(data, corr_res)
