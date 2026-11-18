@@ -571,7 +571,7 @@ class TeledyneBrightfieldCamera:
                 self._log("Live acquisition started (sim).")
                 return
             try:
-                self._cam.start_acquisition(buffsize=int(buffsize))
+                self._cam.start_acquisition(mode="sequence", nframes=int(buffsize))
                 self._live_active = True
                 self._log("Live acquisition started.")
             except Exception as exc:
