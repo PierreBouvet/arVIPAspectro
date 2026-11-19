@@ -17,7 +17,7 @@ from ..hardware import (
     OrcaCameraError,
     TeledyneCameraError,
 )
-from ..brightfield_align import build_plate_calibration_from_jogs
+from ..brightfield_align import build_plate_calibration_from_jogs, compute_jog_correlations
 from .state import RigState
 
 
@@ -362,12 +362,12 @@ class PlateAutoCalibrateWorker(QtCore.QThread):
             self.stage.move_to(x_um=x0, y_um=y0, wait=True)
             self.sig_stage_updated.emit()
 
+            corr = compute_jog_correlations(img0=img0, img_x=img_x, img_y=img_y)
             calib = build_plate_calibration_from_jogs(
-                img0=img0,
-                img_x=img_x,
-                img_y=img_y,
                 dx_um=self.step_um,
                 dy_um=self.step_um,
+                dp_from_x_px=corr["dp_x"],
+                dp_from_y_px=corr["dp_y"],
             )
             self.sig_finished_calib.emit(calib)
         except Exception as exc:
