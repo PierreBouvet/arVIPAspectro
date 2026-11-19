@@ -25,6 +25,8 @@ figures/
 *.png
 *.pdf
 
-# Local processing scripts
+# Local AI agent folder
 .agent
 
+# Local configuration files
+*.json

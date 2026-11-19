@@ -103,9 +103,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(
-            "arVIPAspectro — Step 4: Acquisition Pipeline & Spatial Mapping (Orca Flash 4.0 v3 & ASI MS-2000)"
-        )
+        self.setWindowTitle("Angle-Resolved VIPA Spectrometer Wizard")
         self.resize(1460, 900)
 
         self._worker: Optional[StageActionWorker] = None
@@ -159,9 +157,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Top Header Bar
         top_bar = QtWidgets.QHBoxLayout()
-        title_lbl = QtWidgets.QLabel(
-            "Step 4 — Hardware Control, Calibration Spectra & Spatial Map Acquisition"
-        )
+        title_lbl = QtWidgets.QLabel("Angle-Resolved VIPA Spectrometer Wizard")
         title_font = title_lbl.font()
         title_font.setPointSize(13)
         title_font.setBold(True)
