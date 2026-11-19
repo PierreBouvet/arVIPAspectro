@@ -60,7 +60,11 @@ class MS2000Stage:
 
     def __init__(self, logger: Optional[Callable[[str], None]] = None):
         self._log_cb = logger
-        self._lock = threading.RLock()
+        # _io_lock guards single serial I/O transactions and connection state only;
+        # wait_for_stop() never holds it across sleep intervals so halt() is never blocked.
+        self._io_lock = threading.RLock()
+        self._lock = self._io_lock
+        self._halt_event = threading.Event()
         self._connected: bool = False
         self._simulate: bool = False
         self._backend: str = "none"  # 'pyserial' or 'simulation'
@@ -332,7 +336,8 @@ class MS2000Stage:
         """
         Moves the stage to the specified absolute coordinates in micrometers (µm).
         """
-        with self._lock:
+        self._halt_event.clear()
+        with self._io_lock:
             if not self._connected:
                 raise MS2000Error("Stage is not connected.")
 
@@ -343,7 +348,6 @@ class MS2000Stage:
                     self._sim_pos["Y"] = float(y_um)
                 if z_um is not None and self._has_z:
                     self._sim_pos["Z"] = float(z_um)
-                time.sleep(0.02)
                 pos = self.get_position()
                 self._log(f"Moved (sim) to X={pos['X']:.2f} µm, Y={pos['Y']:.2f} µm.")
                 return pos
@@ -356,13 +360,17 @@ class MS2000Stage:
             if z_um is not None and self._has_z:
                 tokens.append(f"Z={z_um * self.ASI_UNITS_PER_UM:.1f}")
 
+            should_wait = False
             if len(tokens) > 1:
                 resp = self._serial_command(" ".join(tokens))
                 if not resp.startswith(":A"):
                     raise MS2000Error(f"Move command rejected: {resp!r}")
-                if wait:
-                    self.wait_for_stop(timeout_s=timeout_s)
-            return self.get_position()
+                should_wait = wait
+
+        # Release _io_lock before polling so emergency halt() can preempt immediately
+        if should_wait:
+            self.wait_for_stop(timeout_s=timeout_s)
+        return self.get_position()
 
     def move_relative(
         self,
@@ -373,7 +381,8 @@ class MS2000Stage:
         timeout_s: float = 30.0,
     ) -> Dict[str, Optional[float]]:
         """Moves the stage by a relative displacement in micrometers (µm)."""
-        with self._lock:
+        self._halt_event.clear()
+        with self._io_lock:
             if not self._connected:
                 raise MS2000Error("Stage is not connected.")
 
@@ -382,7 +391,6 @@ class MS2000Stage:
                 self._sim_pos["Y"] += float(dy_um)
                 if self._has_z:
                     self._sim_pos["Z"] += float(dz_um)
-                time.sleep(0.02)
                 pos = self.get_position()
                 self._log(f"Relative move (sim) -> X={pos['X']:.2f} µm, Y={pos['Y']:.2f} µm.")
                 return pos
@@ -395,20 +403,23 @@ class MS2000Stage:
             if dz_um != 0.0 and self._has_z:
                 tokens.append(f"Z={dz_um * self.ASI_UNITS_PER_UM:.1f}")
 
+            should_wait = False
             if len(tokens) > 1:
                 resp = self._serial_command(" ".join(tokens))
                 if not resp.startswith(":A"):
                     raise MS2000Error(f"Relative move rejected: {resp!r}")
-                if wait:
-                    self.wait_for_stop(timeout_s=timeout_s)
-            return self.get_position()
+                should_wait = wait
+
+        if should_wait:
+            self.wait_for_stop(timeout_s=timeout_s)
+        return self.get_position()
 
     def wait_for_stop(self, timeout_s: float = 30.0, poll_interval_s: float = 0.02):
-        """Blocks until all stage axes have finished moving."""
+        """Blocks until all stage axes have finished moving or `halt()` is signaled."""
         if not self._connected or self._simulate:
             return
         t0 = time.time()
-        while self.is_busy():
+        while not self._halt_event.is_set() and self.is_busy():
             if time.time() - t0 > timeout_s:
                 raise MS2000Error("Timeout waiting for ASI MS-2000 stage movement to complete.")
             time.sleep(poll_interval_s)
@@ -495,7 +506,8 @@ class MS2000Stage:
 
     def halt(self):
         """Emergency stop of all stage axes (`\\` command)."""
-        with self._lock:
+        self._halt_event.set()
+        with self._io_lock:
             self._stop_sim_spin()
             if not self._connected or self._simulate:
                 if self._simulate and self._connected:

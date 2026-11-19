@@ -11,6 +11,9 @@ import threading
 from typing import Dict, List, Optional, Tuple, Callable
 import numpy as np
 
+from .protocols import average_frames
+from .sim import generate_vipa_frame
+
 
 class OrcaCameraError(Exception):
     """Exception raised for Hamamatsu Orca Flash 4.0 v3 communication or DCAM errors."""
@@ -475,25 +478,13 @@ class OrcaFlashCamera:
 
             if self._simulate:
                 t0 = time.time()
-                time.sleep(min(exp_s * n_frames, 0.25))
-                if n_frames == 1:
-                    frame = self._generate_simulated_frame(
+                frame = average_frames(
+                    lambda: self._generate_simulated_frame(
                         stage_pos_um=stage_pos_um,
                         spectrum_type=sim_spectrum_type,
-                    )
-                else:
-                    first = self._generate_simulated_frame(
-                        stage_pos_um=stage_pos_um,
-                        spectrum_type=sim_spectrum_type,
-                    )
-                    acc = first.astype(np.float64)
-                    for _ in range(n_frames - 1):
-                        acc += self._generate_simulated_frame(
-                            stage_pos_um=stage_pos_um,
-                            spectrum_type=sim_spectrum_type,
-                        )
-                    frame = np.clip(np.rint(acc / n_frames), 0, 65535).astype(np.uint16)
-
+                    ),
+                    n_frames,
+                )
                 elapsed_ms = (time.time() - t0) * 1e3
                 self._log(
                     f"Acquired simulated [{sim_spectrum_type}] frame ({frame.shape[1]}x{frame.shape[0]} px, "
@@ -527,102 +518,18 @@ class OrcaFlashCamera:
         stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
         spectrum_type: str = "sample",
     ) -> np.ndarray:
-        """
-        Generates a realistic synthetic 2D ar-VIPA Brillouin interferogram (`uint16`)
-        whose dimensions match the active ROI & hardware binning, and whose fringes
-        vary smoothly with `(X, Y)` stage coordinates and exposure time.
-        """
+        """Delegates synthetic VIPA interferogram generation to `hardware.sim.generate_vipa_frame`."""
         self._sim_frame_counter += 1
-        det_w, det_h = self._detector_size
-        hstart, hend, vstart, vend, hbin, vbin = self._sim_roi
-        w = max(1, (hend - hstart) // max(1, hbin))
-        h = max(1, (vend - vstart) // max(1, vbin))
-
-        if self._sim_grid_cache is None or self._sim_grid_cache[0] != h or self._sim_grid_cache[1] != w:
-            # Map binned ROI pixel indices back to full-sensor pixel coordinates
-            y_sensor = vstart + (np.arange(h, dtype=np.float32) + 0.5) * vbin
-            x_sensor = hstart + (np.arange(w, dtype=np.float32) + 0.5) * hbin
-            yy, xx = np.meshgrid(y_sensor, x_sensor, indexing="ij")
-            self._sim_grid_cache = (h, w, xx, yy)
-        else:
-            _, _, xx, yy = self._sim_grid_cache
-
-        x_um = float((stage_pos_um or {}).get("X") or 0.0)
-        y_um = float((stage_pos_um or {}).get("Y") or 0.0)
-
-        # Normalize detector coordinates to [-1, 1] relative to full sensor center
-        xn = (xx - 0.5 * det_w) / (0.5 * det_w)
-        yn = (yy - 0.5 * det_h) / (0.5 * det_h)
-
-        # Exact 2D gnomonic VIPA order dispersion using arVIPAspectro backend physics (FSR = 30.0 GHz)
-        try:
-            from .. import config, backend as bck
-            g_2d = bck.g_from_xy(
-                xx,
-                yy,
-                x0=1800.0,
-                y0=1150.0,
-                f=config.F_PX_DEFAULT,
-                phi=config.VIPA_TILT_ANGLE,
-                n_r=config.N_FUSED_SILICA_780,
-            )
-            dg_order = 1.45265 * (30.0 / (config.nu_0 * 1e-9))
-            order_phase = (float(g_2d[min(1150, h - 1), 0]) - g_2d) / dg_order + 0.42
-        except Exception:
-            order_phase = 6.0 * (xn + 1.05) - 0.45 * (xn + 1.05) ** 2 + 0.18 * (yn ** 2)
-
-        frac = order_phase - np.floor(order_phase)
-        # Signed fractional order in [-0.5, +0.5) centered on each integer elastic order
-        frac_signed = (order_phase + 0.5) - np.floor(order_phase + 0.5) - 0.5
-        f_rel_ghz = frac_signed * 30.0
-
-        mode = str(spectrum_type).lower().strip()
-        if mode == "laser":
-            # Pure monochromatic laser reference fringes (sharp elastic peaks at frac_signed = 0)
-            spectral_profile = 1.4 * np.exp(-0.5 * (frac_signed / 0.016) ** 2)
-            env_x0, env_y0 = 0.0, 0.0
-        elif mode == "rb":
-            # Broadband continuum modulated by Rubidium D2 hyperfine absorption dips around each order
-            # Laser locked to 85Rb F=2 line (delta_nu = -1.323 GHz)
-            f_rb = f_rel_ghz + 1.323
-            continuum = 0.85 * np.exp(-0.5 * (frac_signed / 0.28) ** 2) + 0.15
-            dip_87_a = 0.32 * np.exp(-0.5 * ((f_rb - (-2.56)) / 0.32) ** 2)
-            dip_85_a = 0.62 * np.exp(-0.5 * ((f_rb - (-1.22)) / 0.35) ** 2)
-            dip_85_b = 0.48 * np.exp(-0.5 * ((f_rb - (+1.70)) / 0.35) ** 2)
-            dip_87_b = 0.22 * np.exp(-0.5 * ((f_rb - (+4.15)) / 0.32) ** 2)
-            trans_rb = np.clip(1.0 - (dip_87_a + dip_85_a + dip_85_b + dip_87_b), 0.08, 1.0)
-            spectral_profile = continuum * trans_rb
-            env_x0, env_y0 = 0.0, 0.0
-        else:
-            # Sample spectrum: Elastic Rayleigh peak + true DHO Stokes & Anti-Stokes Brillouin doublets
-            # with 2D coaxial elliptical angular dispersion (Shift_0 ~ 5.10 GHz, M_theta ~ 3200 px, gamma ~ 1.25)
-            dx_c = xx - 0.5 * det_w
-            dy_c = yy - 1150.0
-            r_sph = np.sqrt(dy_c ** 2 + (dx_c / 1.25) ** 2)
-            u_ang = np.clip(r_sph / 3200.0, 0.0, 0.98)
-
-            s0_ghz = 5.10 + 0.15 * np.sin(x_um / 60.0) * np.cos(y_um / 60.0)
-            nu_b = s0_ghz * np.cos(0.5 * np.arcsin(u_ang))
-            gamma_b = 0.78 + 0.06 * (u_ang ** 2)
-
-            elastic = np.exp(-0.5 * (f_rel_ghz / 0.42) ** 2)
-            nu_abs = np.abs(f_rel_ghz)
-            dho_num = (gamma_b * nu_b) ** 2
-            dho_den = (nu_abs ** 2 - nu_b ** 2) ** 2 + (gamma_b * nu_abs) ** 2 + 1e-9
-            brillouin_dho = 0.38 * (dho_num / dho_den)
-            spectral_profile = elastic + brillouin_dho
-            env_x0 = 0.04 * np.sin(x_um / 120.0)
-            env_y0 = 0.04 * np.cos(y_um / 120.0)
-
-        envelope = np.exp(-0.95 * ((xn - env_x0) ** 2) - 0.55 * ((yn - env_y0) ** 2))
-
-        exp_scale = np.clip(self._sim_exposure_s / 0.050, 0.02, 20.0) * (hbin * vbin)
-        signal = (120.0 + 18000.0 * exp_scale * envelope * spectral_profile).astype(np.float32)
-
-        noise_std = 12.0 if self._sim_readout_speed == "slow" else 25.0
-        rng = np.random.default_rng(seed=1000 + self._sim_frame_counter)
-        noise = rng.normal(loc=0.0, scale=noise_std, size=(h, w)).astype(np.float32)
-        frame = np.clip(signal + noise, 0, 65535).astype(np.uint16)
+        frame, self._sim_grid_cache = generate_vipa_frame(
+            detector_size=self._detector_size,
+            roi=self._sim_roi,
+            exposure_s=self._sim_exposure_s,
+            readout_speed=self._sim_readout_speed,
+            frame_counter=self._sim_frame_counter,
+            grid_cache=self._sim_grid_cache,
+            stage_pos_um=stage_pos_um,
+            spectrum_type=spectrum_type,
+        )
         return frame
 
     def get_status(self) -> Dict[str, object]:

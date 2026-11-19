@@ -18,6 +18,8 @@ import numpy as np
 from PySide6 import QtWidgets, QtCore
 
 from ..hardware import MS2000Stage, OrcaFlashCamera, TeledyneBrightfieldCamera
+from ..control import StageActionWorker
+from ..control.rig_controller import move_and_settle
 from ..acquisition_pipeline import AcquisitionSession, MapGridConfig
 from .. import config
 
@@ -564,12 +566,14 @@ class MapScanWorker(QtCore.QThread):
                         self.sig_log.emit(f"Map scan aborted by user at point {idx}/{total_pts}.")
                     break
 
-                # 1. Move stage to (target_x_um, target_y_um)
-                pos = self.stage.move_to(x_um=target_x_um, y_um=target_y_um, wait=True)
+                # 1. Move stage to (target_x_um, target_y_um) + mechanical settling
+                pos = move_and_settle(
+                    self.stage,
+                    x_um=target_x_um,
+                    y_um=target_y_um,
+                    settling_ms=settling_s * 1000.0,
+                )
                 self.sig_stage_updated.emit()
-
-                if settling_s > 0:
-                    time.sleep(settling_s)
 
                 if self._abort_requested or consumer_error:
                     if self._abort_requested:
@@ -2015,13 +2019,24 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         if not ok or not choice:
             return
         _, tx, ty = positions[labels.index(choice)]
-        try:
-            self._stop_live_cb()
-            self.stage.move_to(x_um=tx, y_um=ty, wait=True)
-            self.sig_stage_updated.emit()
-            self.sig_log.emit(f"Moved stage to saved position: X={tx:.2f} µm, Y={ty:.2f} µm.")
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Stage Move Error", str(exc))
+        self._stop_live_cb()
+        self._goto_worker = StageActionWorker(
+            camera=self.camera,
+            stage=self.stage,
+            action="move_abs",
+            params={
+                "x_um": float(tx),
+                "y_um": float(ty),
+                "settling_ms": 0.0,
+                "auto_snap": False,
+                "label": "Saved Position",
+            },
+            parent=self,
+        )
+        self._goto_worker.sig_log.connect(self.sig_log.emit)
+        self._goto_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
+        self._goto_worker.sig_error.connect(lambda title, msg: QtWidgets.QMessageBox.critical(self, title, msg))
+        self._goto_worker.start()
 
     def _on_view_map_brightfield(self):
         role = self._current_map_brightfield_role()

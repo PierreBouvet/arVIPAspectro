@@ -8,13 +8,13 @@ Reference Sample (`Brillouin/Calibration/reference_sample_<angle>`) and Sample m
 
 import json
 import re
-import time
 from typing import Optional, Dict, Any, Callable, List
 import h5py
 import numpy as np
 from PySide6 import QtWidgets, QtCore
 
 from ..hardware import MS2000Stage, OrcaFlashCamera, TeledyneBrightfieldCamera
+from ..control import StageActionWorker, PlateJogCaptureWorker
 from ..acquisition_pipeline import AcquisitionSession, MapGridConfig
 from ..brightfield_align import (
     measure_image_shift_px,
@@ -31,75 +31,6 @@ from .pipeline_panel import (
     _format_bytes,
     _format_duration,
 )
-
-
-class _PlateJogCaptureWorker(QtCore.QThread):
-    """
-    Executes one stage-move + brightfield-snap step for the interactive 3-point plate calibration.
-    """
-
-    sig_log = QtCore.Signal(str)
-    sig_captured = QtCore.Signal(object)  # dict: step_tag, frame, pos, exp_s, target_x, target_y
-    sig_stage_updated = QtCore.Signal()
-    sig_error = QtCore.Signal(str, str)
-
-    def __init__(
-        self,
-        stage: MS2000Stage,
-        brightfield_cam: TeledyneBrightfieldCamera,
-        step_tag: str,
-        target_x: Optional[float] = None,
-        target_y: Optional[float] = None,
-        return_pos: Optional[tuple] = None,
-        settling_ms: float = 300.0,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.stage = stage
-        self.brightfield_cam = brightfield_cam
-        self.step_tag = step_tag
-        self.target_x = target_x
-        self.target_y = target_y
-        self.return_pos = return_pos
-        self.settling_ms = max(0.0, float(settling_ms))
-
-    def run(self):
-        try:
-            if self.target_x is not None and self.target_y is not None:
-                pos = self.stage.move_to(x_um=float(self.target_x), y_um=float(self.target_y), wait=True)
-                self.sig_stage_updated.emit()
-                if self.settling_ms > 0:
-                    time.sleep(self.settling_ms / 1000.0)
-            else:
-                pos = self.stage.get_position()
-
-            exp_s = self.brightfield_cam.get_exposure()
-            frame = self.brightfield_cam.snap_frame(n_frames=1, stage_pos_um=pos)
-            self.sig_log.emit(
-                f"Plate Calib [{self.step_tag}] acquired ({frame.shape[1]}x{frame.shape[0]} px) "
-                f"@ ({float(pos['X']):.2f}, {float(pos['Y']):.2f}) µm."
-            )
-
-            if self.return_pos is not None:
-                self.stage.move_to(x_um=float(self.return_pos[0]), y_um=float(self.return_pos[1]), wait=True)
-                self.sig_stage_updated.emit()
-
-            self.sig_captured.emit(
-                {
-                    "step_tag": self.step_tag,
-                    "frame": frame,
-                    "pos": pos,
-                    "exp_s": exp_s,
-                }
-            )
-        except Exception as exc:
-            if self.return_pos is not None:
-                try:
-                    self.stage.move_to(x_um=float(self.return_pos[0]), y_um=float(self.return_pos[1]), wait=True)
-                    self.sig_stage_updated.emit()
-                except Exception:
-                    pass
-            self.sig_error.emit(f"Plate Calibration Error ({self.step_tag})", str(exc))
 
 
 class _PlateCorrWorker(QtCore.QThread):
@@ -131,53 +62,6 @@ class _PlateCorrWorker(QtCore.QThread):
             self.sig_correlated.emit(res)
         except Exception as exc:
             self.sig_error.emit("Plate Calibration Correlation Error", str(exc))
-
-
-class _StageMoveWorker(QtCore.QThread):
-    """Background worker to move the ASI MS-2000 to a saved Reference or Sample (X, Y, Z) position."""
-
-    sig_log = QtCore.Signal(str)
-    sig_moved = QtCore.Signal(object, object)  # (pos_dict, optional_snap_frame_tuple)
-    sig_error = QtCore.Signal(str, str)
-
-    def __init__(
-        self,
-        stage: MS2000Stage,
-        camera: OrcaFlashCamera,
-        target_pos: Dict[str, float],
-        label: str,
-        snap_preview: bool = True,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.stage = stage
-        self.camera = camera
-        self.target_pos = target_pos
-        self.label = label
-        self.snap_preview = snap_preview
-
-    def run(self):
-        try:
-            pos = self.stage.move_to(
-                x_um=self.target_pos.get("X"),
-                y_um=self.target_pos.get("Y"),
-                z_um=self.target_pos.get("Z"),
-                wait=True,
-            )
-            self.sig_log.emit(
-                f"Moved stage to {self.label}: "
-                f"X={pos.get('X', 0.0):.2f}, Y={pos.get('Y', 0.0):.2f}, Z={pos.get('Z', 0.0):.2f} µm."
-            )
-            snap_info = None
-            if self.snap_preview and self.camera.is_connected:
-                exp_s = self.camera.get_exposure()
-                n_avg = self.camera.get_frame_averaging()
-                binning = self.camera.get_binning()
-                frame = self.camera.snap_frame(n_frames=1, stage_pos_um=pos)
-                snap_info = (frame, pos, exp_s, 1, binning)
-            self.sig_moved.emit(pos, snap_info)
-        except Exception as exc:
-            self.sig_error.emit(f"Stage Move Error ({self.label})", str(exc))
 
 
 class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
@@ -224,8 +108,8 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         self._angle_measures: Dict[str, List[str]] = {}
         self._map_paused: bool = False
 
-        self._move_worker: Optional[_StageMoveWorker] = None
-        self._plate_calib_worker: Optional[_PlateJogCaptureWorker] = None
+        self._move_worker: Optional[StageActionWorker] = None
+        self._plate_calib_worker: Optional[PlateJogCaptureWorker] = None
         self._plate_corr_worker: Optional[_PlateCorrWorker] = None
         self._plate_calib_pending: Optional[Dict[str, Any]] = None
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
@@ -1117,12 +1001,19 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
             label = "Sample Position"
 
         self._set_controls_busy(True)
-        self._move_worker = _StageMoveWorker(
-            stage=self.stage,
+        self._move_worker = StageActionWorker(
             camera=self.camera,
-            target_pos=target,
-            label=label,
-            snap_preview=True,
+            stage=self.stage,
+            action="move_abs",
+            params={
+                "x_um": target.get("X"),
+                "y_um": target.get("Y"),
+                "z_um": target.get("Z"),
+                "settling_ms": 0.0,
+                "auto_snap": True,
+                "snap_n_frames": 1,
+                "label": label,
+            },
             parent=self,
         )
         self._move_worker.sig_log.connect(self.sig_log.emit)
@@ -1325,20 +1216,32 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
     def _cancel_plate_calib(self, reason: str, return_to_base: bool = False):
         pending = self._plate_calib_pending
         self._plate_calib_pending = None
-        if return_to_base and pending is not None and self.stage.is_connected:
-            try:
-                self.stage.move_to(x_um=float(pending["x0"]), y_um=float(pending["y0"]), wait=True)
-                self.sig_stage_updated.emit()
-            except Exception:
-                pass
         self.sig_log.emit(reason)
+        if return_to_base and pending is not None and self.stage.is_connected:
+            self._move_worker = StageActionWorker(
+                camera=self.camera,
+                stage=self.stage,
+                action="move_abs",
+                params={
+                    "x_um": float(pending["x0"]),
+                    "y_um": float(pending["y0"]),
+                    "settling_ms": 0.0,
+                    "auto_snap": False,
+                    "label": "Plate Calibration Base",
+                },
+                parent=self,
+            )
+            self._move_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
+            self._move_worker.finished.connect(self._on_worker_done)
+            self._move_worker.start()
+            return
         self._on_worker_done()
 
     def _launch_plate_jog_step(self, step_tag: str, target_x=None, target_y=None, return_pos=None):
         if self._plate_calib_worker is not None and self._plate_calib_worker.isRunning():
             self._plate_calib_worker.wait(2000)
         self._set_controls_busy(True)
-        self._plate_calib_worker = _PlateJogCaptureWorker(
+        self._plate_calib_worker = PlateJogCaptureWorker(
             stage=self.stage,
             brightfield_cam=self.brightfield_cam,
             step_tag=step_tag,
@@ -1693,12 +1596,17 @@ class MultiAngleAcquisitionWidget(QtWidgets.QWidget):
         if move_stage and self.stage.is_connected and not self._is_busy():
             self._stop_live_cb()
             self._set_controls_busy(True)
-            self._move_worker = _StageMoveWorker(
-                stage=self.stage,
+            self._move_worker = StageActionWorker(
                 camera=self.camera,
-                target_pos={"X": float(target_x_um), "Y": float(target_y_um), "Z": None},
-                label="Aligned Map Center",
-                snap_preview=False,
+                stage=self.stage,
+                action="move_abs",
+                params={
+                    "x_um": float(target_x_um),
+                    "y_um": float(target_y_um),
+                    "settling_ms": 0.0,
+                    "auto_snap": False,
+                    "label": "Aligned Map Center",
+                },
                 parent=self,
             )
             self._move_worker.sig_log.connect(self.sig_log.emit)

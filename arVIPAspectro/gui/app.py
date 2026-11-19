@@ -6,7 +6,6 @@ Step 1, Step 2 & Step 3 GUI:
             Sensor ROI, Readout Speed, Defect Pixel Correction, Geometry Lock, and Live Preview)
 """
 
-import time
 import datetime
 from typing import Optional, Dict, Any
 from PySide6 import QtWidgets, QtCore, QtGui
@@ -22,9 +21,9 @@ from ..hardware import (
     TeledyneCameraError,
     count_teledyne_cameras,
 )
+from ..control import RigController, StageActionWorker, PlateAutoCalibrateWorker
 from .image_viewer import ImageViewerWidget
 from .pipeline_panel import PipelineAcquisitionWidget
-from ..brightfield_align import build_plate_calibration_from_jogs
 
 
 class CollapsibleSection(QtWidgets.QWidget):
@@ -67,207 +66,6 @@ class CollapsibleSection(QtWidgets.QWidget):
         self.content_area.setVisible(checked)
 
 
-class AutoCalibratePlateWorker(QtCore.QThread):
-    """Runs a 3-point stage jog (base, +X, +Y) with Brightfield capture to calibrate µm/px."""
-
-    sig_log = QtCore.Signal(str)
-    sig_stage_updated = QtCore.Signal()
-    sig_finished_calib = QtCore.Signal(object)
-    sig_error = QtCore.Signal(str, str)
-
-    def __init__(self, brightfield_cam: TeledyneBrightfieldCamera, stage: MS2000Stage, step_um: float, parent=None):
-        super().__init__(parent)
-        self.brightfield_cam = brightfield_cam
-        self.stage = stage
-        self.step_um = float(step_um)
-
-    def run(self):
-        try:
-            if not self.brightfield_cam.is_connected:
-                raise TeledyneCameraError("Brightfield camera is not connected.")
-            if not self.stage.is_connected:
-                raise MS2000Error("Stage is not connected.")
-
-            pos0 = self.stage.get_position()
-            x0, y0 = float(pos0["X"]), float(pos0["Y"])
-            n_avg = self.brightfield_cam.get_frame_averaging()
-
-            self.sig_log.emit(f"Plate auto-calibrate: capturing base frame at ({x0:.1f}, {y0:.1f}) µm...")
-            img0 = self.brightfield_cam.snap_frame(n_frames=n_avg, stage_pos_um=pos0)
-
-            self.sig_log.emit(f"Plate auto-calibrate: moving +{self.step_um:.1f} µm in X...")
-            pos_x = self.stage.move_to(x_um=x0 + self.step_um, y_um=y0, wait=True)
-            self.sig_stage_updated.emit()
-            time.sleep(0.08)
-            img_x = self.brightfield_cam.snap_frame(n_frames=n_avg, stage_pos_um=pos_x)
-
-            self.sig_log.emit(f"Plate auto-calibrate: moving +{self.step_um:.1f} µm in Y...")
-            pos_y = self.stage.move_to(x_um=x0, y_um=y0 + self.step_um, wait=True)
-            self.sig_stage_updated.emit()
-            time.sleep(0.08)
-            img_y = self.brightfield_cam.snap_frame(n_frames=n_avg, stage_pos_um=pos_y)
-
-            self.stage.move_to(x_um=x0, y_um=y0, wait=True)
-            self.sig_stage_updated.emit()
-
-            calib = build_plate_calibration_from_jogs(
-                img0=img0,
-                img_x=img_x,
-                img_y=img_y,
-                dx_um=self.step_um,
-                dy_um=self.step_um,
-            )
-            self.sig_finished_calib.emit(calib)
-        except Exception as exc:
-            self.sig_error.emit("Plate Auto-Calibrate Error", str(exc))
-
-
-class HardwareActionWorker(QtCore.QThread):
-    """
-    Background worker thread that executes stage movement, single/averaged frame capture,
-    or continuous Live Preview streaming without blocking the GUI event loop.
-    """
-
-    sig_log = QtCore.Signal(str)
-    sig_stage_updated = QtCore.Signal()
-    sig_frame_acquired = QtCore.Signal(object, object, float, int, int)  # (frame, pos, exp_s, n_avg, binning)
-    sig_error = QtCore.Signal(str, str)                                  # (title, message)
-
-    def __init__(
-        self,
-        camera: OrcaFlashCamera,
-        stage: MS2000Stage,
-        action: str,
-        params: Optional[Dict[str, Any]] = None,
-        brightfield_cam: Optional[TeledyneBrightfieldCamera] = None,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.camera = camera
-        self.brightfield_cam = brightfield_cam
-        self.stage = stage
-        self.action = action  # 'snap', 'move_rel', 'move_abs', 'live'
-        self.params = params or {}
-        self._stop_requested = False
-
-    def request_stop(self):
-        self._stop_requested = True
-
-    def _active_source(self) -> str:
-        return str(self.params.get("camera_source", "orca"))
-
-    def run(self):
-        try:
-            if self.action == "live":
-                self._run_live_loop()
-                return
-
-            pos = None
-            # 1. Execute stage movement if requested
-            if self.action == "move_rel":
-                dx = float(self.params.get("dx_um", 0.0))
-                dy = float(self.params.get("dy_um", 0.0))
-                dz = float(self.params.get("dz_um", 0.0))
-                pos = self.stage.move_relative(dx_um=dx, dy_um=dy, dz_um=dz, wait=True)
-                self.sig_stage_updated.emit()
-
-                settling_s = float(self.params.get("settling_ms", 50.0)) / 1000.0
-                if settling_s > 0:
-                    time.sleep(settling_s)
-
-            elif self.action == "move_abs":
-                x_um = self.params.get("x_um")
-                y_um = self.params.get("y_um")
-                z_um = self.params.get("z_um")
-                pos = self.stage.move_to(x_um=x_um, y_um=y_um, z_um=z_um, wait=True)
-                self.sig_stage_updated.emit()
-
-                settling_s = float(self.params.get("settling_ms", 50.0)) / 1000.0
-                if settling_s > 0:
-                    time.sleep(settling_s)
-
-            # 2. Acquire image if requested ('snap' or auto_snap after move)
-            should_snap = (self.action == "snap") or bool(self.params.get("auto_snap", True))
-            if should_snap:
-                if pos is None and self.stage.is_connected:
-                    try:
-                        pos = self.stage.get_position()
-                    except Exception:
-                        pos = None
-
-                if self._active_source() == "teledyne":
-                    bf = self.brightfield_cam
-                    if bf is None or not bf.is_connected:
-                        if self.action == "snap":
-                            raise TeledyneCameraError("Teledyne Brightfield camera is not connected.")
-                        self.sig_log.emit("Stage move finished (brightfield camera not connected -> skipped auto-snap).")
-                        return
-                    exp_s = bf.get_exposure()
-                    n_avg = bf.get_frame_averaging()
-                    frame = bf.snap_frame(n_frames=n_avg, stage_pos_um=pos)
-                    self.sig_frame_acquired.emit(frame, pos, exp_s, n_avg, 1)
-                    return
-
-                if not self.camera.is_connected:
-                    if self.action == "snap":
-                        raise OrcaCameraError("Camera is not connected.")
-                    self.sig_log.emit("Stage move finished (camera not connected -> skipped auto-snap).")
-                    return
-
-                exp_s = self.camera.get_exposure()
-                n_avg = self.camera.get_frame_averaging()
-                binning = self.camera.get_binning()
-                frame = self.camera.snap_frame(n_frames=n_avg, stage_pos_um=pos)
-                self.sig_frame_acquired.emit(frame, pos, exp_s, n_avg, binning)
-
-        except Exception as exc:
-            self.sig_error.emit("Hardware Action Error", str(exc))
-
-    def _run_live_loop(self):
-        pos = None
-        if self.stage.is_connected:
-            try:
-                pos = self.stage.get_position()
-            except Exception:
-                pos = None
-
-        if self._active_source() == "teledyne":
-            bf = self.brightfield_cam
-            if bf is None or not bf.is_connected:
-                return
-            self.sig_log.emit("Live Preview started (Teledyne Brightfield).")
-            bf.start_live()
-            try:
-                while not self._stop_requested and bf.is_connected:
-                    exp_s = bf.get_exposure()
-                    frame = bf.read_live_frame(timeout_s=0.3)
-                    if self._stop_requested:
-                        break
-                    if frame is not None:
-                        self.sig_frame_acquired.emit(frame, pos, exp_s, 1, 1)
-                    time.sleep(0.02)
-            finally:
-                try:
-                    bf.stop_live()
-                except Exception:
-                    pass
-                self.sig_log.emit("Live Preview stopped (Teledyne Brightfield).")
-            return
-
-        self.sig_log.emit("Live Preview started (Orca Flash 4.0 v3).")
-        while not self._stop_requested and self.camera.is_connected:
-            exp_s = self.camera.get_exposure()
-            binning = self.camera.get_binning()
-            # In Live Preview, snap 1 frame per cycle for responsive streaming
-            frame = self.camera.snap_frame(n_frames=1, stage_pos_um=pos)
-            if self._stop_requested:
-                break
-            self.sig_frame_acquired.emit(frame, pos, exp_s, 1, binning)
-            time.sleep(0.02)
-
-        self.sig_log.emit("Live Preview stopped.")
-
-
 class MainWindow(QtWidgets.QMainWindow):
     """Step 1–3 Application Window: Connection, Stage Motion, Image Capture & Acquisition Parameters."""
 
@@ -278,8 +76,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.resize(1460, 900)
 
-        self._worker: Optional[HardwareActionWorker] = None
-        self._plate_calib_worker: Optional[AutoCalibratePlateWorker] = None
+        self._worker: Optional[StageActionWorker] = None
+        self._plate_calib_worker: Optional[PlateAutoCalibrateWorker] = None
         self._live_running: bool = False
         self._active_live_source: str = "orca"
         self._syncing_cam_widgets: bool = False
@@ -287,10 +85,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_frame: Optional[tuple] = None
         self._frame_flush_scheduled: bool = False
 
-        # Hardware driver instances
+        # Hardware driver instances & centralized RigController
         self.camera = OrcaFlashCamera(logger=self._threadsafe_log)
         self.brightfield_cam = TeledyneBrightfieldCamera(logger=self._threadsafe_log)
         self.stage = MS2000Stage(logger=self._threadsafe_log)
+        self.rig = RigController(
+            camera=self.camera,
+            stage=self.stage,
+            brightfield_cam=self.brightfield_cam,
+            parent=self,
+        )
 
         self._build_ui()
         self._refresh_serial_ports()
@@ -1054,7 +858,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_live_if_running()
         step_um = float(self.spin_bf_calib_step.value())
         self.btn_bf_auto_calib.setEnabled(False)
-        self._plate_calib_worker = AutoCalibratePlateWorker(
+        self._plate_calib_worker = PlateAutoCalibrateWorker(
             brightfield_cam=self.brightfield_cam,
             stage=self.stage,
             step_um=step_um,
@@ -1174,7 +978,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._live_running = True
         self._sync_live_buttons()
-        self._worker = HardwareActionWorker(
+        self._worker = StageActionWorker(
             camera=self.camera,
             brightfield_cam=self.brightfield_cam,
             stage=self.stage,
@@ -1211,14 +1015,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log_slot(f"ERROR (Continuous Jog): {exc}")
 
     def _on_jog_hold_stop(self):
-        if self.stage.is_connected:
-            self.stage.halt()
-            self._update_stage_ui()
+        self.rig.emergency_halt()
+        self._update_stage_ui()
 
     def _on_halt_stage(self):
-        if self.stage.is_connected:
-            self.stage.halt()
-            self._update_stage_ui()
+        self.rig.emergency_halt()
+        self._update_stage_ui()
 
     def _on_zero_stage(self, axes=("X", "Y")):
         if not self.stage.is_connected:

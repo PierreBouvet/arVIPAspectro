@@ -26,4 +26,5 @@ figures/
 *.pdf
 
 # Local processing scripts
+.agent
 

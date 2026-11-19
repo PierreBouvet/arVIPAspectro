@@ -5,6 +5,7 @@ Hardware drivers package for arVIPAspectro:
   - `TeledyneBrightfieldCamera`: Teledyne FLIR CM3-U3-31S4M-CS brightfield camera (via Spinnaker / `pylablib`).
 """
 
+from .protocols import StageProtocol, CameraProtocol, LiveCameraProtocol, average_frames
 from .stage_ms2000 import MS2000Stage, MS2000Error, list_serial_ports
 from .camera_orca import OrcaFlashCamera, OrcaCameraError, count_dcam_cameras
 from .camera_teledyne import (
@@ -16,6 +17,10 @@ from .camera_teledyne import (
 )
 
 __all__ = [
+    "StageProtocol",
+    "CameraProtocol",
+    "LiveCameraProtocol",
+    "average_frames",
     "MS2000Stage",
     "MS2000Error",
     "list_serial_ports",

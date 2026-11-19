@@ -12,6 +12,7 @@ This directory contains the mathematical derivations and Fourier-optics models u
 | [`refractive_index_magnification_derivation.md`](refractive_index_magnification_derivation.md) | Relation between fitted angular magnification $M_\theta$ and sample refractive index $n$ | Exact arcsine law $M_\theta = n M_0$; legacy arctan correction $\mathcal{K}(\xi) \approx 1 - \frac{1}{3}(\mathrm{NA}/n)^2$ |
 | [`confocal_angular_spectrum_mixing_outline.md`](confocal_angular_spectrum_mixing_outline.md) | 5-phase theoretical roadmap for angular spectrum mixing through a defocused thick confocal pinhole | Linear mixing kernel $\tilde{E}_{\mathrm{out}}(\mathbf{k}'_\perp) = \iint \mathcal{K}(\mathbf{k}'_\perp, \mathbf{k}_\perp)\, \tilde{E}_{\mathrm{pupil}}(\mathbf{k}_\perp)\, d^2\mathbf{k}_\perp$ |
 | [`non_telecentric_angular_spectrum_invariance.md`](non_telecentric_angular_spectrum_invariance.md) | Effect of a non-telecentric tube lens distance ($d_1 \neq f_1$) on the field and angular spectrum at the pinhole | Spatial and angular intensity profiles $I_{\mathrm{im}}(\mathbf{r}_i)$ and $|\tilde{E}_{\mathrm{im}}(\mathbf{k}_\perp)|^2$ are invariant to $d_1$ |
+| [`structured_illumination_angular_resolution_and_dispersion.md`](structured_illumination_angular_resolution_and_dispersion.md) | Pupil-plane intensity-only SLM illumination for angular resolution & minimal-frame dispersion recovery | Stationary-point broadening theorem, iso-$q$ / annular rings, radial S-matrices, and confocal kernel coupling |
 
 ---
 
