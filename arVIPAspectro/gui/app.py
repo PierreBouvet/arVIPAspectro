@@ -130,6 +130,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._user_config = _load_user_config()
         self._build_ui()
+        saved_bf_scale = self._user_config.get("brightfield_um_per_px")
+        if saved_bf_scale is not None:
+            try:
+                scale_val = float(saved_bf_scale)
+                if scale_val > 0:
+                    self.image_viewer.set_brightfield_scale(scale_val)
+                    self.lbl_bf_calib_scale.setText(f"{scale_val:.4f} µm/px")
+            except (TypeError, ValueError):
+                pass
         self._refresh_serial_ports()
         self._scan_dcam_cameras()
         self._scan_bf_cameras()
@@ -940,7 +949,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_bf_auto_calib_done(self, calib: Dict[str, Any]):
         scale = calib.get("um_per_px", calib.get("scale_um_per_px"))
         if scale is not None:
-            self.lbl_bf_calib_scale.setText(f"{float(scale):.4f} µm/px")
+            scale_f = float(scale)
+            self.lbl_bf_calib_scale.setText(f"{scale_f:.4f} µm/px")
+            self.image_viewer.set_brightfield_scale(scale_f)
+            self._user_config["brightfield_um_per_px"] = scale_f
+            self._user_config["brightfield_calib"] = {
+                "method": calib.get("method", "auto_3pt_jog"),
+                "um_per_px": scale_f,
+                "um_per_px_x": float(calib["um_per_px_x"]) if "um_per_px_x" in calib else scale_f,
+                "um_per_px_y": float(calib["um_per_px_y"]) if "um_per_px_y" in calib else scale_f,
+                "rotation_deg": float(calib.get("rotation_deg", 0.0)),
+                "P_px_per_um": calib["P_px_per_um"].tolist() if hasattr(calib.get("P_px_per_um"), "tolist") else None,
+                "M_um_per_px": calib["M_um_per_px"].tolist() if hasattr(calib.get("M_um_per_px"), "tolist") else None,
+            }
+            _save_user_config(self._user_config)
         else:
             self.lbl_bf_calib_scale.setText("Calibrated")
         if hasattr(self, "pipeline_panel") and self.pipeline_panel.session.is_open:
@@ -1141,12 +1163,20 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             self.image_viewer.set_dual_live_image(frame)
             return
+        is_bf = bool(self._live_running and self._active_live_source == "teledyne")
+        if not is_bf and self.brightfield_cam.is_connected and hasattr(frame, "shape"):
+            bf_shape = tuple(self.brightfield_cam.output_shape)
+            cam_shape = tuple(self.camera.output_shape) if self.camera.is_connected else None
+            if tuple(frame.shape[:2]) == bf_shape and tuple(frame.shape[:2]) != cam_shape:
+                is_bf = True
+
         self.image_viewer.update_image(
             frame,
             stage_pos_um=pos,
             exposure_s=exposure_s,
             n_avg=n_avg,
             binning=binning,
+            is_brightfield=is_bf,
         )
 
     @QtCore.Slot(str, str)

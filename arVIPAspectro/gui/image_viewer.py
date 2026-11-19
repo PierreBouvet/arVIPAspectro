@@ -39,6 +39,9 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._last_pg_cmap: Optional[str] = None
         self._last_stats_ts: float = 0.0
         self._hover_plots: List[Dict[str, Any]] = []
+        self._bf_um_per_px: Optional[float] = None
+        self._current_is_brightfield: bool = False
+        self._single_scalebar_items: List[Any] = []
         self._map_range_settings: Dict[str, Dict[str, Any]] = {
             "mean_shift": {
                 "state_key": "map_mean_shift",
@@ -246,9 +249,78 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._hover_plots = []
         self._live_map_widgets = None
         self._dual_bf_widgets = None
+        self._single_scalebar_items = []
         self._pg_plot = None
         self._pg_img_item = None
         self._pg_cbar = None
+
+    def set_brightfield_scale(self, um_per_px: Optional[float]):
+        """Sets the calibrated Brightfield pixel scale (µm/px) and refreshes any visible scalebar."""
+        self._bf_um_per_px = float(um_per_px) if um_per_px and um_per_px > 0 else None
+        if self._view_mode == "single" and self._current_is_brightfield:
+            self._render_image()
+        elif self._view_mode == "dual_brightfield":
+            self._refresh_dual_brightfield_images()
+
+    @staticmethod
+    def _choose_scalebar_length_um(width_px: int, um_per_px: float) -> Tuple[float, float]:
+        target_um = 0.18 * float(width_px) * float(um_per_px)
+        candidates = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0]
+        best_um = min(candidates, key=lambda c: abs(c - target_um))
+        return best_um, best_um / float(um_per_px)
+
+    def _update_plot_scalebar(
+        self,
+        plot_item: Optional[pg.PlotItem],
+        img_shape: Optional[tuple],
+        items_holder: List[Any],
+        show: bool,
+    ):
+        if plot_item is not None:
+            for it in items_holder:
+                try:
+                    plot_item.removeItem(it)
+                except Exception:
+                    pass
+        items_holder.clear()
+
+        if not show or plot_item is None or img_shape is None or not self._bf_um_per_px:
+            return
+
+        h, w = int(img_shape[0]), int(img_shape[1])
+        if h <= 0 or w <= 0:
+            return
+
+        bar_um, bar_px = self._choose_scalebar_length_um(w, self._bf_um_per_px)
+        margin_x = max(12.0, 0.04 * w)
+        margin_y = max(12.0, 0.04 * h)
+        x2 = float(w) - margin_x
+        x1 = max(margin_x, x2 - bar_px)
+        y_bar = float(h) - margin_y
+
+        outline_item = pg.PlotDataItem(
+            [x1, x2],
+            [y_bar, y_bar],
+            pen=pg.mkPen(color=(0, 0, 0, 200), width=6),
+        )
+        bar_item = pg.PlotDataItem(
+            [x1, x2],
+            [y_bar, y_bar],
+            pen=pg.mkPen(color=(255, 255, 255, 245), width=3),
+        )
+        label_str = f"{bar_um:g} µm"
+        txt_item = pg.TextItem(
+            text=label_str,
+            color="#ffffff",
+            anchor=(0.5, 1.0),
+            fill=pg.mkBrush(0, 0, 0, 150),
+        )
+        txt_item.setPos(0.5 * (x1 + x2), y_bar - max(4.0, 0.01 * h))
+
+        plot_item.addItem(outline_item)
+        plot_item.addItem(bar_item)
+        plot_item.addItem(txt_item)
+        items_holder.extend([outline_item, bar_item, txt_item])
 
     def set_map_bar_visible(self, visible: bool):
         if hasattr(self, "map_bar_widget"):
@@ -444,11 +516,13 @@ class ImageViewerWidget(QtWidgets.QWidget):
         exposure_s: Optional[float] = None,
         n_avg: Optional[int] = None,
         binning: Optional[int] = None,
+        is_brightfield: bool = False,
     ):
         """
         Displays a newly acquired 2D image and updates statistics and stage coordinates in the title.
         """
         self._current_image = np.array(image, copy=True)
+        self._current_is_brightfield = bool(is_brightfield)
         h, w = self._current_image.shape[:2]
 
         bin_str = f" (Bin {binning}×{binning})" if binning else ""
@@ -541,6 +615,13 @@ class ImageViewerWidget(QtWidgets.QWidget):
             self._last_pg_shape = (h, w)
             self._pg_plot.autoRange()
 
+        self._update_plot_scalebar(
+            self._pg_plot,
+            (h, w),
+            self._single_scalebar_items,
+            show=self._current_is_brightfield,
+        )
+
     def _on_display_settings_changed(self):
         if self._view_mode == "live_map" and self._last_live_map_state is not None:
             self._render_live_map_state()
@@ -594,9 +675,11 @@ class ImageViewerWidget(QtWidgets.QWidget):
             "ref_plot": p_ref,
             "ref_img_item": im_ref,
             "ref_shape": None,
+            "ref_sb_items": [],
             "live_plot": p_live,
             "live_img_item": im_live,
             "live_shape": None,
+            "live_sb_items": [],
         }
         self._hover_plots = [
             {"plot": p_ref, "data": self._dual_ref_img, "unit": "ADU", "origin": "upper", "extent": None},
@@ -637,9 +720,11 @@ class ImageViewerWidget(QtWidgets.QWidget):
             if w["ref_shape"] != (h, wd):
                 w["ref_shape"] = (h, wd)
                 w["ref_plot"].autoRange()
+            self._update_plot_scalebar(w["ref_plot"], (h, wd), w["ref_sb_items"], show=True)
         else:
             w["ref_img_item"].clear()
             w["ref_shape"] = None
+            self._update_plot_scalebar(w["ref_plot"], None, w["ref_sb_items"], show=False)
 
         if self._dual_live_img is not None:
             arr = self._dual_live_img
@@ -650,9 +735,11 @@ class ImageViewerWidget(QtWidgets.QWidget):
             if w["live_shape"] != (h, wd):
                 w["live_shape"] = (h, wd)
                 w["live_plot"].autoRange()
+            self._update_plot_scalebar(w["live_plot"], (h, wd), w["live_sb_items"], show=True)
         else:
             w["live_img_item"].clear()
             w["live_shape"] = None
+            self._update_plot_scalebar(w["live_plot"], None, w["live_sb_items"], show=False)
 
     # ==========================================================================
     # Step 5.1: Laser Reference Calibration Diagnostic Views
