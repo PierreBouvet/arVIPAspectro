@@ -492,11 +492,24 @@ class MS2000Stage:
 
             vx_mm_s = float(vx_um_s) / 1000.0
             vy_mm_s = float(vy_um_s) / 1000.0
-            cmd = f"SPIN X={vx_mm_s:.5f} Y={vy_mm_s:.5f}"
+            cmd = f"VE X={vx_mm_s:.5f} Y={vy_mm_s:.5f}"
             resp = self._serial_command(cmd)
             if not resp.startswith(":A"):
                 raise MS2000Error(f"Continuous move command ({cmd!r}) rejected: {resp!r}")
             self._log(f"Continuous move started: vx={vx_um_s:.1f} µm/s, vy={vy_um_s:.1f} µm/s.")
+
+    def stop_continuous_move(self):
+        """Stops continuous `VECTOR` motion cleanly (`VE X=0 Y=0`) without triggering HALT `:N-21`."""
+        with self._lock:
+            self._stop_sim_spin()
+            if not self._connected or self._simulate:
+                return
+            try:
+                resp = self._serial_command("VE X=0 Y=0")
+                if not resp.startswith(":A"):
+                    self._log(f"VE stop response: {resp!r}")
+            except Exception as exc:
+                self._log(f"Error stopping continuous move: {exc}")
 
     def _stop_sim_spin(self):
         self._sim_spin_stop.set()
@@ -515,8 +528,11 @@ class MS2000Stage:
                 return
             try:
                 if self._serial is not None and self._serial.is_open:
+                    self._serial.reset_input_buffer()
                     self._serial.write(b"\\\r")
                     self._serial.flush()
+                    self._serial.read_until(b"\n")
+                    self._serial.reset_input_buffer()
                 self._log("Emergency HALT sent to stage.")
             except Exception as exc:
                 self._log(f"Error sending halt: {exc}")

@@ -1097,7 +1097,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log_slot(f"ERROR (Continuous Jog): {exc}")
 
     def _on_jog_hold_stop(self):
-        self.rig.emergency_halt()
+        if self.stage.is_connected:
+            self.stage.stop_continuous_move()
         self._update_stage_ui()
 
     def _on_halt_stage(self):
