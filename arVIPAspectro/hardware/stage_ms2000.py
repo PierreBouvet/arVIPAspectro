@@ -75,6 +75,9 @@ class MS2000Stage:
 
         self._serial = None
 
+        # Software zero-reference offset (in µm) so 'Zero' never alters controller registers
+        self._zero_offset: Dict[str, float] = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+
         # Simulated state (in µm)
         self._sim_pos: Dict[str, float] = {"X": 0.0, "Y": 0.0, "Z": 0.0}
         self._sim_spin_stop = threading.Event()
@@ -277,6 +280,7 @@ class MS2000Stage:
             self._simulate = False
             self._backend = "none"
             self._port = None
+            self._zero_offset = {"X": 0.0, "Y": 0.0, "Z": 0.0}
             if port_info:
                 self._log(f"Disconnected from {port_info}.")
 
@@ -294,15 +298,8 @@ class MS2000Stage:
             resp = self._serial_command("/")
             return resp.upper().startswith("B")
 
-    def get_position(self) -> Dict[str, Optional[float]]:
-        """
-        Queries the current stage coordinates in micrometers (µm).
-
-        Returns
-        -------
-        pos : dict
-            `{'X': float, 'Y': float, 'Z': float or None}` in µm.
-        """
+    def _get_raw_position(self) -> Dict[str, Optional[float]]:
+        """Queries raw physical stage coordinates in µm (before software zero offset)."""
         with self._lock:
             if not self._connected:
                 raise MS2000Error("Stage is not connected.")
@@ -325,6 +322,24 @@ class MS2000Stage:
             z_um = vals[2] if (self._has_z and len(vals) > 2) else None
             return {"X": x_um, "Y": y_um, "Z": z_um}
 
+    def get_position(self) -> Dict[str, Optional[float]]:
+        """
+        Queries the current stage coordinates in micrometers (µm), relative to the
+        saved software zero reference.
+
+        Returns
+        -------
+        pos : dict
+            `{'X': float, 'Y': float, 'Z': float or None}` in µm.
+        """
+        with self._lock:
+            raw = self._get_raw_position()
+            return {
+                "X": float(raw["X"]) - self._zero_offset["X"],
+                "Y": float(raw["Y"]) - self._zero_offset["Y"],
+                "Z": (float(raw["Z"]) - self._zero_offset["Z"]) if raw["Z"] is not None else None,
+            }
+
     def move_to(
         self,
         x_um: Optional[float] = None,
@@ -334,31 +349,36 @@ class MS2000Stage:
         timeout_s: float = 30.0,
     ) -> Dict[str, Optional[float]]:
         """
-        Moves the stage to the specified absolute coordinates in micrometers (µm).
+        Moves the stage to the specified absolute coordinates in micrometers (µm)
+        relative to the saved software zero reference.
         """
         self._halt_event.clear()
         with self._io_lock:
             if not self._connected:
                 raise MS2000Error("Stage is not connected.")
 
+            raw_x = (float(x_um) + self._zero_offset["X"]) if x_um is not None else None
+            raw_y = (float(y_um) + self._zero_offset["Y"]) if y_um is not None else None
+            raw_z = (float(z_um) + self._zero_offset["Z"]) if (z_um is not None and self._has_z) else None
+
             if self._simulate:
-                if x_um is not None:
-                    self._sim_pos["X"] = float(x_um)
-                if y_um is not None:
-                    self._sim_pos["Y"] = float(y_um)
-                if z_um is not None and self._has_z:
-                    self._sim_pos["Z"] = float(z_um)
+                if raw_x is not None:
+                    self._sim_pos["X"] = raw_x
+                if raw_y is not None:
+                    self._sim_pos["Y"] = raw_y
+                if raw_z is not None:
+                    self._sim_pos["Z"] = raw_z
                 pos = self.get_position()
                 self._log(f"Moved (sim) to X={pos['X']:.2f} µm, Y={pos['Y']:.2f} µm.")
                 return pos
 
             tokens = ["M"]
-            if x_um is not None:
-                tokens.append(f"X={x_um * self.ASI_UNITS_PER_UM:.1f}")
-            if y_um is not None:
-                tokens.append(f"Y={y_um * self.ASI_UNITS_PER_UM:.1f}")
-            if z_um is not None and self._has_z:
-                tokens.append(f"Z={z_um * self.ASI_UNITS_PER_UM:.1f}")
+            if raw_x is not None:
+                tokens.append(f"X={raw_x * self.ASI_UNITS_PER_UM:.1f}")
+            if raw_y is not None:
+                tokens.append(f"Y={raw_y * self.ASI_UNITS_PER_UM:.1f}")
+            if raw_z is not None:
+                tokens.append(f"Z={raw_z * self.ASI_UNITS_PER_UM:.1f}")
 
             should_wait = False
             if len(tokens) > 1:
@@ -426,8 +446,8 @@ class MS2000Stage:
 
     def zero_position(self, axes: Tuple[str, ...] = ("X", "Y")) -> Dict[str, Optional[float]]:
         """
-        Sets the current physical stage position to zero (`0.0 µm`) for the given axes
-        without moving the motors, using the ASI MS-2000 `HERE` command (`H X=0 Y=0`).
+        Saves the current physical stage position as the zero reference (`0.0 µm`)
+        for the given axes in software without moving or modifying controller registers.
         """
         with self._lock:
             if not self._connected:
@@ -444,20 +464,13 @@ class MS2000Stage:
             if not norm_axes:
                 return self.get_position()
 
-            if self._simulate:
-                for ax_u in norm_axes:
-                    self._sim_pos[ax_u] = 0.0
-                pos = self.get_position()
-                self._log(f"Zeroed axes {','.join(norm_axes)} (sim) -> {pos}.")
-                return pos
-
-            tokens = ["H"] + [f"{ax_u}=0" for ax_u in norm_axes]
-            resp = self._serial_command(" ".join(tokens))
-            if not resp.startswith(":A"):
-                raise MS2000Error(f"Zero command ('{' '.join(tokens)}') rejected: {resp!r}")
+            raw = self._get_raw_position()
+            for ax_u in norm_axes:
+                if raw.get(ax_u) is not None:
+                    self._zero_offset[ax_u] = float(raw[ax_u])
 
             pos = self.get_position()
-            self._log(f"Zeroed axes {','.join(norm_axes)} via HERE command -> {pos}.")
+            self._log(f"Saved zero reference for axes {','.join(norm_axes)} -> {pos}.")
             return pos
 
     def start_continuous_move(self, vx_um_s: float = 0.0, vy_um_s: float = 0.0):
