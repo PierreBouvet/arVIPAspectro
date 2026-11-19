@@ -6,9 +6,41 @@ Step 1, Step 2 & Step 3 GUI:
             Sensor ROI, Readout Speed, Defect Pixel Correction, Geometry Lock, and Live Preview)
 """
 
+import json
+import os
+import time
 import datetime
 from typing import Optional, Dict, Any
 from PySide6 import QtWidgets, QtCore, QtGui
+
+_USER_CONFIG_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "user_config.json")
+)
+_DEFAULT_USER_CONFIG: Dict[str, Any] = {
+    "plate_fast_speed_um_s": 500.0,
+    "plate_slow_speed_um_s": 50.0,
+}
+
+
+def _load_user_config() -> Dict[str, Any]:
+    cfg = dict(_DEFAULT_USER_CONFIG)
+    if os.path.exists(_USER_CONFIG_PATH):
+        try:
+            with open(_USER_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                cfg.update(data)
+        except Exception:
+            pass
+    return cfg
+
+
+def _save_user_config(cfg: Dict[str, Any]):
+    try:
+        with open(_USER_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
 
 from ..hardware import (
     MS2000Stage,
@@ -96,6 +128,7 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self,
         )
 
+        self._user_config = _load_user_config()
         self._build_ui()
         self._refresh_serial_ports()
         self._scan_dcam_cameras()
@@ -377,6 +410,31 @@ class MainWindow(QtWidgets.QMainWindow):
         info_form.addRow("X / Y:", self.lbl_stage_pos_xy)
         info_form.addRow("Z:", self.lbl_stage_pos_z)
         layout.addLayout(info_form)
+
+        speed_row = QtWidgets.QHBoxLayout()
+        speed_row.addWidget(QtWidgets.QLabel("Fast Speed:"))
+        self.spin_plate_fast_speed = QtWidgets.QDoubleSpinBox()
+        self.spin_plate_fast_speed.setRange(1.0, 20000.0)
+        self.spin_plate_fast_speed.setDecimals(1)
+        self.spin_plate_fast_speed.setValue(float(self._user_config.get("plate_fast_speed_um_s", 500.0)))
+        self.spin_plate_fast_speed.setSuffix(" µm/s")
+        self.spin_plate_fast_speed.setKeyboardTracking(False)
+        self.spin_plate_fast_speed.valueChanged.connect(self._on_plate_speeds_changed)
+        speed_row.addWidget(self.spin_plate_fast_speed)
+
+        speed_row.addSpacing(12)
+        speed_row.addWidget(QtWidgets.QLabel("Slow Speed:"))
+        self.spin_plate_slow_speed = QtWidgets.QDoubleSpinBox()
+        self.spin_plate_slow_speed.setRange(0.1, 10000.0)
+        self.spin_plate_slow_speed.setDecimals(1)
+        self.spin_plate_slow_speed.setValue(float(self._user_config.get("plate_slow_speed_um_s", 50.0)))
+        self.spin_plate_slow_speed.setSuffix(" µm/s")
+        self.spin_plate_slow_speed.setKeyboardTracking(False)
+        self.spin_plate_slow_speed.valueChanged.connect(self._on_plate_speeds_changed)
+        speed_row.addWidget(self.spin_plate_slow_speed)
+        speed_row.addStretch()
+        layout.addLayout(speed_row)
+
         return box
 
     def _build_step3_camera_parameters_card(self) -> QtWidgets.QWidget:
@@ -565,21 +623,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_jog_xp_fast = QtWidgets.QPushButton("▶▶ +X")
 
         jog_specs = [
-            (self.btn_jog_yp_fast, 0.0, +100.0, 0, 2, "High speed +Y (100 µm/s)"),
-            (self.btn_jog_yp_slow, 0.0, +10.0, 1, 2, "Low speed +Y (10 µm/s)"),
-            (self.btn_jog_xm_fast, -100.0, 0.0, 2, 0, "High speed -X (100 µm/s)"),
-            (self.btn_jog_xm_slow, -10.0, 0.0, 2, 1, "Low speed -X (10 µm/s)"),
-            (self.btn_jog_xp_slow, +10.0, 0.0, 2, 3, "Low speed +X (10 µm/s)"),
-            (self.btn_jog_xp_fast, +100.0, 0.0, 2, 4, "High speed +X (100 µm/s)"),
-            (self.btn_jog_ym_slow, 0.0, -10.0, 3, 2, "Low speed -Y (10 µm/s)"),
-            (self.btn_jog_ym_fast, 0.0, -100.0, 4, 2, "High speed -Y (100 µm/s)"),
+            (self.btn_jog_yp_fast, 0.0, +1.0, True, 0, 2),
+            (self.btn_jog_yp_slow, 0.0, +1.0, False, 1, 2),
+            (self.btn_jog_xm_fast, -1.0, 0.0, True, 2, 0),
+            (self.btn_jog_xm_slow, -1.0, 0.0, False, 2, 1),
+            (self.btn_jog_xp_slow, +1.0, 0.0, False, 2, 3),
+            (self.btn_jog_xp_fast, +1.0, 0.0, True, 2, 4),
+            (self.btn_jog_ym_slow, 0.0, -1.0, False, 3, 2),
+            (self.btn_jog_ym_fast, 0.0, -1.0, True, 4, 2),
         ]
-        for btn, vx, vy, r, c, tip in jog_specs:
+        for btn, dx_sign, dy_sign, is_fast, r, c in jog_specs:
             btn.setMinimumSize(64, 30)
-            btn.setToolTip(tip)
-            btn.pressed.connect(lambda vx_=vx, vy_=vy: self._on_jog_hold_start(vx_, vy_))
+            btn.pressed.connect(
+                lambda dx=dx_sign, dy=dy_sign, fast=is_fast: self._on_jog_hold_start(dx, dy, fast)
+            )
             btn.released.connect(self._on_jog_hold_stop)
             pad_grid.addWidget(btn, r, c)
+
+        self._update_jog_tooltips()
 
         layout.addLayout(pad_grid)
 
@@ -1005,12 +1066,33 @@ class MainWindow(QtWidgets.QMainWindow):
         if not map_running:
             self._set_motion_controls_enabled(True)
 
-    def _on_jog_hold_start(self, vx_um_s: float, vy_um_s: float):
+    def _on_plate_speeds_changed(self):
+        self._user_config["plate_fast_speed_um_s"] = float(self.spin_plate_fast_speed.value())
+        self._user_config["plate_slow_speed_um_s"] = float(self.spin_plate_slow_speed.value())
+        _save_user_config(self._user_config)
+        self._update_jog_tooltips()
+
+    def _update_jog_tooltips(self):
+        if not hasattr(self, "btn_jog_yp_fast"):
+            return
+        v_fast = float(self.spin_plate_fast_speed.value())
+        v_slow = float(self.spin_plate_slow_speed.value())
+        self.btn_jog_yp_fast.setToolTip(f"Fast +Y ({v_fast:.1f} µm/s)")
+        self.btn_jog_ym_fast.setToolTip(f"Fast -Y ({v_fast:.1f} µm/s)")
+        self.btn_jog_xm_fast.setToolTip(f"Fast -X ({v_fast:.1f} µm/s)")
+        self.btn_jog_xp_fast.setToolTip(f"Fast +X ({v_fast:.1f} µm/s)")
+        self.btn_jog_yp_slow.setToolTip(f"Slow +Y ({v_slow:.1f} µm/s)")
+        self.btn_jog_ym_slow.setToolTip(f"Slow -Y ({v_slow:.1f} µm/s)")
+        self.btn_jog_xm_slow.setToolTip(f"Slow -X ({v_slow:.1f} µm/s)")
+        self.btn_jog_xp_slow.setToolTip(f"Slow +X ({v_slow:.1f} µm/s)")
+
+    def _on_jog_hold_start(self, dx_sign: float, dy_sign: float, is_fast: bool):
         if not self.stage.is_connected:
             QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
             return
+        speed = float(self.spin_plate_fast_speed.value() if is_fast else self.spin_plate_slow_speed.value())
         try:
-            self.stage.start_continuous_move(vx_um_s=vx_um_s, vy_um_s=vy_um_s)
+            self.stage.start_continuous_move(vx_um_s=dx_sign * speed, vy_um_s=dy_sign * speed)
         except Exception as exc:
             self._append_log_slot(f"ERROR (Continuous Jog): {exc}")
 
