@@ -1841,9 +1841,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     def is_mapping_ready(self) -> bool:
         return (
             self.session.is_open
-            and self.session.laser_image is not None
             and self.session.rb_image is not None
-            and self.session.laser_calib_result is not None
             and self.session.rb_calib_result is not None
             and self.session.sample_fit_result is not None
         )
@@ -1851,7 +1849,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
     def _update_section_states(self):
         h5_open = self.session.is_open
         has_spectra = h5_open and (self.session.laser_image is not None) and (self.session.rb_image is not None)
-        has_calibs = has_spectra and (self.session.laser_calib_result is not None) and (self.session.rb_calib_result is not None)
+        has_rb_cal = h5_open and (self.session.rb_image is not None) and (self.session.rb_calib_result is not None)
         mapping_ready = self.is_mapping_ready()
 
         prev_ready = getattr(self, "_prev_mapping_ready", False)
@@ -1860,7 +1858,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.sec_calib.setEnabled(h5_open)
         self.sec_preview_calib.setVisible(has_spectra)
         self.sec_preview_calib.setEnabled(has_spectra)
-        self.sec_mapping_calib.setEnabled(has_calibs)
+        self.sec_mapping_calib.setEnabled(has_rb_cal)
         self.sec_map_params.setEnabled(mapping_ready)
 
         if mapping_ready != prev_ready:

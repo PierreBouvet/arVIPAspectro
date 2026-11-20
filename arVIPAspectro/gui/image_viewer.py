@@ -445,7 +445,17 @@ class ImageViewerWidget(QtWidgets.QWidget):
                     cb.axis.setTextPen(pg.mkPen("#cfd8dc"))
                     cb.setImageItem(im, insert_in=p)
 
-        p.autoRange()
+        if extent is not None:
+            x0, x1, y0, y1 = [float(v) for v in extent]
+            xr = (min(x0, x1), max(x0, x1))
+            yr = (min(y0, y1), max(y0, y1))
+        else:
+            xr = (-0.5, float(w) - 0.5)
+            yr = (-0.5, float(h) - 0.5)
+        p.setRange(xRange=xr, yRange=yr, padding=0.02)
+        QtCore.QTimer.singleShot(
+            0, lambda p_=p, xr_=xr, yr_=yr: p_.setRange(xRange=xr_, yRange=yr_, padding=0.02)
+        )
         self._hover_plots.append(
             {
                 "plot": p,
@@ -613,7 +623,15 @@ class ImageViewerWidget(QtWidgets.QWidget):
 
         if self._last_pg_shape != (h, w):
             self._last_pg_shape = (h, w)
-            self._pg_plot.autoRange()
+            xr = (-0.5, float(w) - 0.5)
+            yr = (-0.5, float(h) - 0.5)
+            self._pg_plot.setRange(xRange=xr, yRange=yr, padding=0.02)
+            QtCore.QTimer.singleShot(
+                0,
+                lambda p_=self._pg_plot, xr_=xr, yr_=yr: p_.setRange(xRange=xr_, yRange=yr_, padding=0.02)
+                if p_ is self._pg_plot
+                else None,
+            )
 
         self._update_plot_scalebar(
             self._pg_plot,
@@ -719,7 +737,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             w["ref_img_item"].setRect(QtCore.QRectF(-0.5, -0.5, float(wd), float(h)))
             if w["ref_shape"] != (h, wd):
                 w["ref_shape"] = (h, wd)
-                w["ref_plot"].autoRange()
+                w["ref_plot"].setRange(xRange=(-0.5, float(wd) - 0.5), yRange=(-0.5, float(h) - 0.5), padding=0.02)
             self._update_plot_scalebar(w["ref_plot"], (h, wd), w["ref_sb_items"], show=True)
         else:
             w["ref_img_item"].clear()
@@ -734,7 +752,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             w["live_img_item"].setRect(QtCore.QRectF(-0.5, -0.5, float(wd), float(h)))
             if w["live_shape"] != (h, wd):
                 w["live_shape"] = (h, wd)
-                w["live_plot"].autoRange()
+                w["live_plot"].setRange(xRange=(-0.5, float(wd) - 0.5), yRange=(-0.5, float(h) - 0.5), padding=0.02)
             self._update_plot_scalebar(w["live_plot"], (h, wd), w["live_sb_items"], show=True)
         else:
             w["live_img_item"].clear()
@@ -1434,7 +1452,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             )
             if w_map["last_frame_shape"] != (fh, fw):
                 w_map["last_frame_shape"] = (fh, fw)
-                p_img.autoRange()
+                p_img.setRange(xRange=(-0.5, float(fw) - 0.5), yRange=(-0.5, float(fh) - 0.5), padding=0.02)
             self._hover_plots[0]["data"] = frame
         else:
             im_frame.setVisible(False)
