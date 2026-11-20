@@ -695,21 +695,13 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(6)
 
-        row = QtWidgets.QHBoxLayout()
-        self.txt_h5_path = QtWidgets.QLineEdit()
-        self.txt_h5_path.setText("")
-        self.txt_h5_path.setReadOnly(True)
-        self.txt_h5_path.setPlaceholderText("No HDF5 file selected...")
-
-        self.btn_open_h5 = QtWidgets.QPushButton("Open HDF5 file")
-        self.btn_open_h5.setStyleSheet("font-weight: bold;")
+        self._selected_h5_path: str = ""
+        self.btn_open_h5 = QtWidgets.QPushButton("Choose a HDF5 file")
+        self.btn_open_h5.setStyleSheet("font-weight: bold; text-align: left; padding: 5px 10px;")
         self.btn_open_h5.clicked.connect(self._on_browse_h5)
+        layout.addWidget(self.btn_open_h5)
 
-        row.addWidget(self.txt_h5_path, stretch=1)
-        row.addWidget(self.btn_open_h5)
-        layout.addLayout(row)
-
-        self.lbl_h5_status = QtWidgets.QLabel("No HDF5 file opened yet. Click 'Open HDF5 file' to begin.")
+        self.lbl_h5_status = QtWidgets.QLabel("No HDF5 file opened yet. Click 'Choose a HDF5 file' to begin.")
         self.lbl_h5_status.setStyleSheet("font-size: 11px; color: #b0bec5;")
         layout.addWidget(self.lbl_h5_status)
         return box
@@ -1386,23 +1378,24 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Select or Create HDF5_BLS Measures File",
-            self.txt_h5_path.text().strip() or "Measures.h5",
+            self._selected_h5_path.strip() or "Measures.h5",
             "HDF5 Files (*.h5 *.hdf5);;All Files (*)",
             options=QtWidgets.QFileDialog.DontConfirmOverwrite,
         )
         if path:
-            self.txt_h5_path.setText(path)
+            self._selected_h5_path = path
             self._on_open_or_create_h5()
 
     def _on_open_or_create_h5(self):
-        path = self.txt_h5_path.text().strip()
+        path = self._selected_h5_path.strip()
         if not path:
-            QtWidgets.QMessageBox.warning(self, "Invalid Path", "Please enter a valid HDF5 file path.")
+            QtWidgets.QMessageBox.warning(self, "Invalid Path", "Please choose a valid HDF5 file.")
             return
         try:
             info = self.session.open_or_create_h5(path)
-            self.txt_h5_path.setText(info["h5_path"])
-            self.btn_open_h5.setText("Change HDF5 file")
+            self._selected_h5_path = info["h5_path"]
+            self.btn_open_h5.setText(info["h5_path"])
+            self.btn_open_h5.setToolTip(info["h5_path"])
             maps_str = ", ".join(info["existing_maps"]) if info["existing_maps"] else "none"
             self.lbl_h5_status.setText(
                 f"Opened: {os.path.basename(info['h5_path'])}  |  "
