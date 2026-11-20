@@ -1836,7 +1836,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             self.session.is_open
             and self.session.rb_image is not None
             and self.session.rb_calib_result is not None
-            and self.session.sample_fit_result is not None
+            and self.session.ref_sample_calib_result is not None
         )
 
     def _update_section_states(self):
