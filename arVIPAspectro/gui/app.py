@@ -1161,10 +1161,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         is_bf = bool(self._live_running and self._active_live_source == "teledyne")
         if not is_bf and self.brightfield_cam.is_connected and hasattr(frame, "shape"):
-            bf_shape = tuple(self.brightfield_cam.output_shape)
-            cam_shape = tuple(self.camera.output_shape) if self.camera.is_connected else None
-            if tuple(frame.shape[:2]) == bf_shape and tuple(frame.shape[:2]) != cam_shape:
-                is_bf = True
+            try:
+                bf_shape = tuple(self.brightfield_cam.get_status()["output_shape"])
+                cam_shape = tuple(self.camera.get_status()["output_shape"]) if self.camera.is_connected else None
+                if tuple(frame.shape[:2]) == bf_shape and tuple(frame.shape[:2]) != cam_shape:
+                    is_bf = True
+            except Exception:
+                pass
 
         self.image_viewer.update_image(
             frame,
