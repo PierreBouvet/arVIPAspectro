@@ -2,6 +2,9 @@
 Configuration parameters, physical constants, and spectrometer specifications for VIPA calibration.
 """
 
+import json
+import os
+from typing import Dict, Any
 import numpy as np
 
 # ==============================================================================
@@ -89,4 +92,75 @@ MIN_NET_AMP = 200.0                         # Minimum net peak amplitude above b
 # LINEWIDTH_BOUNDS = (0.4, 1.3)               # Acceptable linewidth range (min, max) in GHz
 # SHIFT_RANGE_SAMPLE = (4.8, 5.3)             # Filtering range for Brillouin shift (GHz)
 # LINEWIDTH_RANGE_SAMPLE = (0.5, 1.2)         # Filtering range for Brillouin linewidth (GHz)
+
+# ==============================================================================
+# Persistent Calibration Sample Presets (calibration_samples.json)
+# ==============================================================================
+CALIBRATION_SAMPLES_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "calibration_samples.json")
+)
+
+DEFAULT_CALIBRATION_SAMPLES: Dict[str, Dict[str, Any]] = {
+    "Water": {
+        "expected_shift_ghz": 5.1,
+        "shift_tol_ghz": 2.0,
+        "expected_lw_ghz": 0.8,
+        "lw_min_ghz": 0.4,
+        "lw_max_ghz": 1.3,
+        "refractive_index": 1.33,
+        "shift_filter_min_ghz": 4.8,
+        "shift_filter_max_ghz": 5.3,
+        "vs_m_s": 1496.0,
+    },
+    "Plastic (Polystyrene)": {
+        "expected_shift_ghz": 9.7,
+        "shift_tol_ghz": 2.0,
+        "expected_lw_ghz": 0.8,
+        "lw_min_ghz": 0.4,
+        "lw_max_ghz": 1.3,
+        "refractive_index": 1.59,
+        "shift_filter_min_ghz": 9.3,
+        "shift_filter_max_ghz": 9.9,
+        "vs_m_s": 2380.0,
+    },
+    "Glycerol": {
+        "expected_shift_ghz": 7.16,
+        "shift_tol_ghz": 2.0,
+        "expected_lw_ghz": 0.8,
+        "lw_min_ghz": 0.4,
+        "lw_max_ghz": 1.5,
+        "refractive_index": 1.47,
+        "shift_filter_min_ghz": 6.8,
+        "shift_filter_max_ghz": 7.5,
+        "vs_m_s": 1900.0,
+    },
+}
+
+
+def load_calibration_samples() -> Dict[str, Dict[str, Any]]:
+    """Loads reference calibration sample presets from `calibration_samples.json`."""
+    if os.path.exists(CALIBRATION_SAMPLES_PATH):
+        try:
+            with open(CALIBRATION_SAMPLES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                return data
+        except Exception:
+            pass
+    samples = {k: dict(v) for k, v in DEFAULT_CALIBRATION_SAMPLES.items()}
+    try:
+        with open(CALIBRATION_SAMPLES_PATH, "w", encoding="utf-8") as f:
+            json.dump(samples, f, indent=2)
+    except Exception:
+        pass
+    return samples
+
+
+def save_calibration_sample(name: str, entry: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Adds or updates a calibration sample preset in `calibration_samples.json`."""
+    samples = load_calibration_samples()
+    samples[str(name).strip()] = dict(entry)
+    with open(CALIBRATION_SAMPLES_PATH, "w", encoding="utf-8") as f:
+        json.dump(samples, f, indent=2)
+    return samples
 

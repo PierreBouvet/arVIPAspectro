@@ -654,6 +654,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self._corner_b: Optional[Tuple[float, float]] = None
 
         self._build_ui()
+        self._reload_sample_presets()
         self._update_calibration_badges()
         self._update_map_summary()
         self._update_section_states()
@@ -1063,13 +1064,17 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.chk_auto_fit_ref.setChecked(True)
         top_row.addWidget(self.chk_auto_fit_ref)
 
-        btn_water = QtWidgets.QPushButton("Water (5.1 GHz, n=1.33)")
-        btn_water.clicked.connect(lambda: self._apply_sample_preset(5.1, 2.0, 0.8, 0.4, 1.3, 1.33, 4.8, 5.3))
-        top_row.addWidget(btn_water)
+        top_row.addSpacing(8)
+        top_row.addWidget(QtWidgets.QLabel("Sample:"))
+        self.combo_ref_preset = QtWidgets.QComboBox()
+        self.combo_ref_preset.setMinimumWidth(180)
+        self.combo_ref_preset.currentIndexChanged.connect(self._on_sample_preset_selected)
+        top_row.addWidget(self.combo_ref_preset)
 
-        btn_plastic = QtWidgets.QPushButton("Plastic (9.7 GHz, n=1.59)")
-        btn_plastic.clicked.connect(lambda: self._apply_sample_preset(9.7, 2.0, 0.8, 0.4, 1.3, 1.59, 9.3, 9.9))
-        top_row.addWidget(btn_plastic)
+        self.btn_save_ref_preset = QtWidgets.QPushButton("+ Save Preset")
+        self.btn_save_ref_preset.setToolTip("Save current DHO & n parameters to calibration_samples.json")
+        self.btn_save_ref_preset.clicked.connect(self._on_save_sample_preset)
+        top_row.addWidget(self.btn_save_ref_preset)
 
         top_row.addStretch()
         self.lbl_sample_fit_status = QtWidgets.QLabel("NOT FITTED")
@@ -1434,6 +1439,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         """Synchronizes HDF5 button, status banner, and calibration widgets from shared `AcquisitionSession`."""
         self._syncing_from_session = True
         try:
+            self._reload_sample_presets()
             if self.session.is_open and self.session.h5_path:
                 self._selected_h5_path = self.session.h5_path
                 self.btn_open_h5.setText(self.session.h5_path)
@@ -1643,6 +1649,74 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.spin_q_n.setValue(n_idx)
         self.spin_q_smin.setValue(s_min)
         self.spin_q_smax.setValue(s_max)
+
+    def _reload_sample_presets(self, select_name: Optional[str] = None):
+        samples = config.load_calibration_samples()
+        prev_name = select_name or self.combo_ref_preset.currentData()
+        self.combo_ref_preset.blockSignals(True)
+        self.combo_ref_preset.clear()
+        for name, entry in samples.items():
+            sh = float(entry.get("expected_shift_ghz", 5.1))
+            n_val = float(entry.get("refractive_index", 1.33))
+            self.combo_ref_preset.addItem(f"{name} ({sh:.2f} GHz, n={n_val:.2f})", name)
+        if prev_name is not None:
+            idx = self.combo_ref_preset.findData(prev_name)
+            if idx >= 0:
+                self.combo_ref_preset.setCurrentIndex(idx)
+        self.combo_ref_preset.blockSignals(False)
+        self._on_sample_preset_selected()
+
+    def _on_sample_preset_selected(self):
+        name = self.combo_ref_preset.currentData()
+        if not name:
+            return
+        samples = config.load_calibration_samples()
+        entry = samples.get(name)
+        if not isinstance(entry, dict):
+            return
+        self._apply_sample_preset(
+            float(entry.get("expected_shift_ghz", 5.1)),
+            float(entry.get("shift_tol_ghz", 2.0)),
+            float(entry.get("expected_lw_ghz", 0.8)),
+            float(entry.get("lw_min_ghz", 0.4)),
+            float(entry.get("lw_max_ghz", 1.3)),
+            float(entry.get("refractive_index", 1.33)),
+            float(entry.get("shift_filter_min_ghz", 4.8)),
+            float(entry.get("shift_filter_max_ghz", 5.3)),
+        )
+
+    def _on_save_sample_preset(self):
+        default_name = str(self.combo_ref_preset.currentData() or "")
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Save Calibration Sample Preset",
+            "Preset name (saved to calibration_samples.json):",
+            text=default_name,
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        shift_ghz = float(self.spin_dho_shift.value())
+        n_idx = float(self.spin_q_n.value())
+        vs_est = float((config.lambda_0 * (shift_ghz * 1e9)) / (2.0 * max(n_idx, 1e-6)))
+        entry = {
+            "expected_shift_ghz": shift_ghz,
+            "shift_tol_ghz": float(self.spin_dho_tol.value()),
+            "expected_lw_ghz": float(self.spin_dho_lw.value()),
+            "lw_min_ghz": float(self.spin_dho_lw_min.value()),
+            "lw_max_ghz": float(self.spin_dho_lw_max.value()),
+            "refractive_index": n_idx,
+            "shift_filter_min_ghz": float(self.spin_q_smin.value()),
+            "shift_filter_max_ghz": float(self.spin_q_smax.value()),
+            "vs_m_s": round(vs_est, 1),
+        }
+        try:
+            config.save_calibration_sample(name, entry)
+            self._reload_sample_presets(select_name=name)
+            self.sig_log.emit(f"Saved calibration sample preset '{name}' to calibration_samples.json.")
+            self.sig_session_updated.emit()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Save Preset Error", str(exc))
 
     def _current_map_sanitized_label(self) -> str:
         name = self.txt_map_name.text().strip() if hasattr(self, "txt_map_name") else "Map_01"

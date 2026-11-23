@@ -184,6 +184,7 @@ class AcquisitionSession:
     optional `reference_sample`), and incremental spatial map storage.
     """
 
+    BRILLOUIN_GROUP = "Brillouin"
     CALIBRATION_GROUP = "Brillouin/Calibration"
     ROLE_LASER = "laser_reference"
     ROLE_RB = "Rb_absorption"

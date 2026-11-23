@@ -1,0 +1,35 @@
+{
+  "Water": {
+    "expected_shift_ghz": 5.1,
+    "shift_tol_ghz": 2.0,
+    "expected_lw_ghz": 0.8,
+    "lw_min_ghz": 0.4,
+    "lw_max_ghz": 1.3,
+    "refractive_index": 1.33,
+    "shift_filter_min_ghz": 4.8,
+    "shift_filter_max_ghz": 5.3,
+    "vs_m_s": 1496.0
+  },
+  "Plastic (Polystyrene)": {
+    "expected_shift_ghz": 9.7,
+    "shift_tol_ghz": 2.0,
+    "expected_lw_ghz": 0.8,
+    "lw_min_ghz": 0.4,
+    "lw_max_ghz": 1.3,
+    "refractive_index": 1.59,
+    "shift_filter_min_ghz": 9.3,
+    "shift_filter_max_ghz": 9.9,
+    "vs_m_s": 2380.0
+  },
+  "Glycerol": {
+    "expected_shift_ghz": 7.16,
+    "shift_tol_ghz": 2.0,
+    "expected_lw_ghz": 0.8,
+    "lw_min_ghz": 0.4,
+    "lw_max_ghz": 1.5,
+    "refractive_index": 1.47,
+    "shift_filter_min_ghz": 6.8,
+    "shift_filter_max_ghz": 7.5,
+    "vs_m_s": 1900.0
+  }
+}
