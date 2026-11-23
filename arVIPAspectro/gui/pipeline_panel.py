@@ -1430,6 +1430,24 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             self.sig_log.emit(f"ERROR opening HDF5: {exc}")
             QtWidgets.QMessageBox.critical(self, "HDF5 Error", str(exc))
 
+    def refresh_from_session(self):
+        """Synchronizes HDF5 button, status banner, and calibration widgets from shared `AcquisitionSession`."""
+        self._syncing_from_session = True
+        try:
+            if self.session.is_open and self.session.h5_path:
+                self._selected_h5_path = self.session.h5_path
+                self.btn_open_h5.setText(self.session.h5_path)
+                self.btn_open_h5.setToolTip(self.session.h5_path)
+                self._refresh_h5_status_banner()
+            else:
+                self._selected_h5_path = ""
+                self.btn_open_h5.setText("Choose a HDF5 file")
+                self.btn_open_h5.setToolTip("")
+                self.lbl_h5_status.setText("No HDF5 file opened yet. Click 'Choose a HDF5 file' to begin.")
+                self._update_calibration_badges()
+        finally:
+            self._syncing_from_session = False
+
     def _refresh_h5_status_banner(self):
         """Updates the HDF5 status banner cleanly without reloading/overwriting in-memory calibration results."""
         if not self.session.is_open:
@@ -1887,7 +1905,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_diag_s_q.setEnabled(has_sf and (sf_res.get("q_results") is not None))
         self._update_brightfield_ui()
         self._update_section_states()
-        self.sig_session_updated.emit()
+        if not getattr(self, "_syncing_from_session", False):
+            self.sig_session_updated.emit()
 
     def is_mapping_ready(self) -> bool:
         return (

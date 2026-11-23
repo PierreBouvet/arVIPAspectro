@@ -1568,3 +1568,193 @@ class AcquisitionSession:
                     t_grp["map_df_coarse_GHz"][iy, ix] = float(point_fit["df_coarse"])
 
                 f.flush()
+
+    # ==========================================================================
+    # Time Evolution: q-Dependent Shift Profiles & HDF5 Persistence
+    # ==========================================================================
+
+    def compute_q_shift_profile(
+        self,
+        dho_results: Dict[str, Any],
+        q_calib_result: Optional[Dict[str, Any]] = None,
+        refractive_index: float = 1.33,
+        n_q_bins: int = 40,
+        q_edges: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Bins the 2D fitted Brillouin shift map `shift_clipped_averaged` as a function of
+        physical wavevector `q` (in µm⁻¹), returning:
+            `(q_edges, q_centers, mean_shift_q, var_shift_q)`.
+        """
+        sa = np.asarray(dho_results["shift_clipped_averaged"], dtype=np.float64)
+        xa = np.asarray(dho_results["x_coords_averaged"], dtype=np.float64)
+        ya = np.asarray(dho_results["y_coords_averaged"], dtype=np.float64)
+
+        active_ref = q_calib_result if q_calib_result is not None else self.ref_sample_calib_result
+        q_ref = active_ref.get("q_results") if isinstance(active_ref, dict) else None
+        if q_ref is not None:
+            opt = q_ref["opt_params"]
+            xc_e, yc_e, phi_e, gam_e = opt["xc"], opt["yc"], opt["phi_rad"], opt["gamma"]
+            m_theta = float(q_ref["M_theta"])
+        else:
+            h_img = self.rb_calib_result["freq_map"].shape[0] if self.rb_calib_result else 2048
+            w_img = self.rb_calib_result["freq_map"].shape[1] if self.rb_calib_result else 2048
+            y0_fit = float(self.laser_calib_result["y0_fit"]) if self.laser_calib_result else 0.5 * h_img
+            xc_e, yc_e, phi_e, gam_e = 0.5 * w_img, y0_fit, 0.5 * np.pi, 1.25
+            m_theta = 3200.0
+
+        valid = np.isfinite(sa) & np.isfinite(xa) & np.isfinite(ya)
+        if np.any(valid):
+            _, _, r_sph = bck.transform_to_spherical_coordinates(
+                xa[valid], ya[valid], xc_e, yc_e, phi_e, gam_e
+            )
+            u_ang = np.clip(r_sph / max(m_theta, 1.0), -0.999, 0.999)
+            cos_half_theta = np.cos(0.5 * np.arcsin(u_ang))
+            # Physical wavevector magnitude q in µm⁻¹: q = (4π n / λ₀_µm) * cos(θ/2)
+            lambda_um = float(config.lambda_0) * 1e6
+            q_vals = (4.0 * np.pi * float(refractive_index) / lambda_um) * cos_half_theta
+            s_vals = sa[valid]
+        else:
+            q_vals = np.array([], dtype=np.float64)
+            s_vals = np.array([], dtype=np.float64)
+
+        n_bins = max(2, int(n_q_bins))
+        if q_edges is None:
+            if q_vals.size >= 2:
+                q_min = float(np.nanmin(q_vals))
+                q_max = float(np.nanmax(q_vals))
+                if q_max <= q_min:
+                    q_min -= 0.1
+                    q_max += 0.1
+            else:
+                q_min, q_max = 10.0, 22.0
+            q_edges = np.linspace(q_min, q_max, n_bins + 1, dtype=np.float64)
+        else:
+            q_edges = np.asarray(q_edges, dtype=np.float64)
+            n_bins = len(q_edges) - 1
+
+        q_centers = 0.5 * (q_edges[:-1] + q_edges[1:])
+        mean_q = np.full(n_bins, np.nan, dtype=np.float64)
+        var_q = np.full(n_bins, np.nan, dtype=np.float64)
+
+        if q_vals.size > 0:
+            bin_idx = np.digitize(q_vals, q_edges) - 1
+            bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+            for b in range(n_bins):
+                vals_b = s_vals[bin_idx == b]
+                if vals_b.size >= 1:
+                    mean_q[b] = float(np.mean(vals_b))
+                if vals_b.size >= 2:
+                    var_q[b] = float(np.var(vals_b, ddof=1))
+
+        return q_edges, q_centers, mean_q, var_q
+
+    def initialize_time_evolution_group(
+        self,
+        series_name: str,
+        interval_s: float,
+        n_points: Optional[int],
+        exposure_s: float,
+        n_avg: int,
+        n_q_bins: int,
+        save_raw_data: bool,
+        frame_shape: Tuple[int, int],
+        stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
+    ) -> str:
+        """
+        Creates `Brillouin/<series_name>` in the open HDF5 file with resizable datasets
+        for periodic Time Evolution acquisition.
+        """
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+
+        safe_name = series_name.strip().replace("/", "_") or "TimeSeries_01"
+        group_path = f"{self.BRILLOUIN_GROUP}/{safe_name}"
+        h, w = int(frame_shape[0]), int(frame_shape[1])
+        nq = max(2, int(n_q_bins))
+
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "a") as f:
+                if self.BRILLOUIN_GROUP not in f:
+                    f.create_group(self.BRILLOUIN_GROUP)
+                if group_path in f:
+                    del f[group_path]
+                grp = f.create_group(group_path)
+                grp.attrs["Brillouin_type"] = "Time_Evolution"
+                grp.attrs["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+                grp.attrs["interval_s"] = float(interval_s)
+                grp.attrs["target_n_points"] = int(n_points) if n_points is not None else -1
+                grp.attrs["exposure_s"] = float(exposure_s)
+                grp.attrs["frame_averaging"] = int(n_avg)
+                grp.attrs["n_q_bins"] = nq
+                if stage_pos_um:
+                    if stage_pos_um.get("X") is not None:
+                        grp.attrs["stage_x_um"] = float(stage_pos_um["X"])
+                    if stage_pos_um.get("Y") is not None:
+                        grp.attrs["stage_y_um"] = float(stage_pos_um["Y"])
+
+                grp.create_dataset("time_s", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("q_um_inv", shape=(nq,), dtype=np.float64, fillvalue=np.nan)
+                grp.create_dataset("shift_mean_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64)
+                grp.create_dataset("shift_var_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64)
+                grp.create_dataset("mean_shift_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("mean_lw_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("Shift_0_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("V_s_ms", shape=(0,), maxshape=(None,), dtype=np.float64)
+                if save_raw_data:
+                    grp.create_dataset(
+                        "Raw_data",
+                        shape=(0, h, w),
+                        maxshape=(None, h, w),
+                        chunks=(1, h, w),
+                        dtype=np.uint16,
+                    )
+                f.flush()
+        return group_path
+
+    def append_time_evolution_point(
+        self,
+        group_path: str,
+        t_idx: int,
+        elapsed_s: float,
+        q_centers: np.ndarray,
+        mean_q: np.ndarray,
+        var_q: np.ndarray,
+        point_fit: Dict[str, Any],
+        raw_frame: Optional[np.ndarray] = None,
+    ):
+        """Appends one time point `t_idx` to `Brillouin/<series_name>` and flushes."""
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "a") as f:
+                grp = f[group_path]
+                n_new = int(t_idx) + 1
+                if t_idx == 0:
+                    grp["q_um_inv"][:] = np.asarray(q_centers, dtype=np.float64)
+
+                grp["time_s"].resize((n_new,))
+                grp["time_s"][t_idx] = float(elapsed_s)
+
+                grp["shift_mean_q_t"].resize((len(q_centers), n_new))
+                grp["shift_mean_q_t"][:, t_idx] = np.asarray(mean_q, dtype=np.float64)
+
+                grp["shift_var_q_t"].resize((len(q_centers), n_new))
+                grp["shift_var_q_t"][:, t_idx] = np.asarray(var_q, dtype=np.float64)
+
+                for key, field in (
+                    ("mean_shift_ghz", "mean_shift_ghz"),
+                    ("mean_lw_ghz", "mean_lw_ghz"),
+                    ("Shift_0_ghz", "Shift_0_ghz"),
+                    ("V_s_ms", "V_s_ms"),
+                ):
+                    grp[key].resize((n_new,))
+                    grp[key][t_idx] = float(point_fit.get(field, float("nan")))
+
+                if raw_frame is not None and "Raw_data" in grp:
+                    h, w = raw_frame.shape[:2]
+                    grp["Raw_data"].resize((n_new, h, w))
+                    grp["Raw_data"][t_idx, :, :] = np.asarray(raw_frame, dtype=np.uint16)
+
+                f.flush()

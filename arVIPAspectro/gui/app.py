@@ -56,6 +56,7 @@ from ..hardware import (
 from ..control import RigController, StageActionWorker, PlateAutoCalibrateWorker
 from .image_viewer import ImageViewerWidget
 from .pipeline_panel import PipelineAcquisitionWidget
+from .time_evolution_panel import TimeEvolutionWidget
 
 
 class CollapsibleSection(QtWidgets.QWidget):
@@ -286,6 +287,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_panel.sig_mapping_ready_changed.connect(self._on_mapping_ready_changed)
         self.pipeline_panel.sig_set_bf_reference.connect(self._on_set_bf_reference)
         self.tabs_right.addTab(self.pipeline_panel, "Mapping")
+
+        # Tab 4: Time Evolution (shares HDF5 session & calibrations bidirectionally with Mapping)
+        self.time_evolution_panel = TimeEvolutionWidget(
+            camera=self.camera,
+            stage=self.stage,
+            session=self.pipeline_panel.session,
+            stop_live_callback=self._stop_live_if_running,
+            parent=self,
+        )
+        self.time_evolution_panel.sig_log.connect(self._append_log_slot)
+        self.time_evolution_panel.sig_display_frame.connect(self._on_frame_acquired)
+        self.time_evolution_panel.sig_show_laser_diagnostics.connect(
+            self.image_viewer.show_laser_calibration_diagnostics
+        )
+        self.time_evolution_panel.sig_show_rb_diagnostics.connect(
+            self.image_viewer.show_rb_calibration_diagnostics
+        )
+        self.time_evolution_panel.sig_show_sample_diagnostics.connect(
+            self.image_viewer.show_sample_treatment_diagnostics
+        )
+        self.time_evolution_panel.sig_update_time_evolution.connect(
+            self.image_viewer.update_time_evolution_view
+        )
+        self.time_evolution_panel.sig_camera_updated.connect(self._update_camera_ui)
+        self.pipeline_panel.sig_session_updated.connect(self.time_evolution_panel.refresh_from_session)
+        self.time_evolution_panel.sig_session_updated.connect(self.pipeline_panel.refresh_from_session)
+        self.tabs_right.addTab(self.time_evolution_panel, "Time Evolution")
+
         self.tabs_right.currentChanged.connect(self._on_right_tab_changed)
 
         right_layout.addWidget(self.tabs_right)

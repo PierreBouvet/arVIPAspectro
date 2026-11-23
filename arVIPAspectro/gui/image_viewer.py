@@ -30,6 +30,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._last_live_map_state: Optional[Dict[str, Any]] = None
         self._live_map_widgets: Optional[Dict[str, Any]] = None
         self._dual_bf_widgets: Optional[Dict[str, Any]] = None
+        self._te_widgets: Optional[Dict[str, Any]] = None
         self._dual_ref_img: Optional[np.ndarray] = None
         self._dual_ref_title: str = "Reference"
         self._dual_live_img: Optional[np.ndarray] = None
@@ -249,6 +250,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._hover_plots = []
         self._live_map_widgets = None
         self._dual_bf_widgets = None
+        self._te_widgets = None
         self._single_scalebar_items = []
         self._pg_plot = None
         self._pg_img_item = None
@@ -758,6 +760,163 @@ class ImageViewerWidget(QtWidgets.QWidget):
             w["live_img_item"].clear()
             w["live_shape"] = None
             self._update_plot_scalebar(w["live_plot"], None, w["live_sb_items"], show=False)
+
+    # ==========================================================================
+    # Time Evolution Dual-Heatmap View: Mean & Variance of Shift(q, t)
+    # ==========================================================================
+
+    def _build_time_evolution_plots(self):
+        self._clear_pg_grid()
+        self._view_mode = "time_evolution"
+        self._in_diagnostic_view = False
+        self._last_live_map_state = None
+        self.set_map_bar_visible(False)
+
+        sub_top = self._pg_widget.addLayout(row=0, col=0)
+        p_mean = sub_top.addPlot(row=0, col=0)
+        p_mean.invertY(False)
+        self._style_dark_plot(
+            p_mean,
+            title="Mean Shift ν_B(q, t) (GHz)",
+            xlabel="Time (s)",
+            ylabel="Wavevector q (µm⁻¹)",
+        )
+        im_mean = pg.ImageItem(axisOrder="row-major")
+        p_mean.addItem(im_mean)
+        cb_mean = pg.ColorBarItem(
+            values=(4.0, 7.0),
+            colorMap=pg_helpers.get_pg_colormap("viridis"),
+            label="ν_B (GHz)",
+            interactive=False,
+            width=14,
+        )
+        cb_mean.axis.setTextPen(pg.mkPen("#cfd8dc"))
+        sub_top.addItem(cb_mean, row=0, col=1)
+
+        sub_bot = self._pg_widget.addLayout(row=1, col=0)
+        p_var = sub_bot.addPlot(row=0, col=0)
+        p_var.invertY(False)
+        self._style_dark_plot(
+            p_var,
+            title="Shift Variance σ²(q, t) (GHz²)",
+            xlabel="Time (s)",
+            ylabel="Wavevector q (µm⁻¹)",
+        )
+        im_var = pg.ImageItem(axisOrder="row-major")
+        p_var.addItem(im_var)
+        cb_var = pg.ColorBarItem(
+            values=(0.0, 0.1),
+            colorMap=pg_helpers.get_pg_colormap("magma"),
+            label="σ² (GHz²)",
+            interactive=False,
+            width=14,
+        )
+        cb_var.axis.setTextPen(pg.mkPen("#cfd8dc"))
+        sub_bot.addItem(cb_var, row=0, col=1)
+
+        p_var.setXLink(p_mean)
+        p_var.setYLink(p_mean)
+
+        self._te_widgets = {
+            "p_mean": p_mean,
+            "im_mean": im_mean,
+            "cb_mean": cb_mean,
+            "p_var": p_var,
+            "im_var": im_var,
+            "cb_var": cb_var,
+        }
+        self._hover_plots = [
+            {"plot": p_mean, "data": None, "unit": "GHz", "origin": "lower", "extent": None},
+            {"plot": p_var, "data": None, "unit": "GHz²", "origin": "lower", "extent": None},
+        ]
+
+    def update_time_evolution_view(
+        self,
+        time_s: np.ndarray,
+        q_centers: np.ndarray,
+        mean_q_t: np.ndarray,
+        var_q_t: np.ndarray,
+        latest_fit: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Renders the stacked Time Evolution heatmaps:
+          - Top: Mean Shift ν_B(q, t) (GHz)
+          - Bottom: Shift Variance σ²(q, t) (GHz²)
+        with Wavevector q (µm⁻¹) on Y and Elapsed Time (s) on X.
+        """
+        if self._view_mode != "time_evolution" or self._te_widgets is None:
+            self._build_time_evolution_plots()
+
+        w = self._te_widgets
+        t_arr = np.asarray(time_s, dtype=np.float64).ravel()
+        q_arr = np.asarray(q_centers, dtype=np.float64).ravel()
+        m_arr = np.asarray(mean_q_t, dtype=np.float64)
+        v_arr = np.asarray(var_q_t, dtype=np.float64)
+        if t_arr.size == 0 or q_arr.size == 0:
+            return
+
+        dt = float(np.median(np.diff(t_arr))) if t_arr.size >= 2 else 1.0
+        dt = max(dt, 1e-3)
+        dq = float(np.median(np.diff(q_arr))) if q_arr.size >= 2 else 0.1
+        dq = max(abs(dq), 1e-4)
+
+        t_min = float(t_arr[0]) - 0.5 * dt
+        t_max = float(t_arr[-1]) + 0.5 * dt
+        q_min = float(np.min(q_arr)) - 0.5 * dq
+        q_max = float(np.max(q_arr)) + 0.5 * dq
+        rect = QtCore.QRectF(t_min, q_min, t_max - t_min, q_max - q_min)
+        extent = (t_min, t_max, q_min, q_max)
+
+        # Mean Shift heatmap
+        m_fin = m_arr[np.isfinite(m_arr)]
+        if m_fin.size > 0:
+            m_lo, m_hi = float(np.percentile(m_fin, 2.0)), float(np.percentile(m_fin, 98.0))
+            if m_hi <= m_lo:
+                m_lo, m_hi = float(np.min(m_fin)) - 0.05, float(np.max(m_fin)) + 0.05
+        else:
+            m_lo, m_hi = 4.0, 7.0
+        rgba_m, m_lo, m_hi = pg_helpers.array_to_rgba_with_nan(
+            m_arr, "viridis", m_lo, m_hi, nan_rgba=(30, 30, 30, 0)
+        )
+        w["im_mean"].setImage(rgba_m, autoLevels=False)
+        w["im_mean"].setRect(rect)
+        w["cb_mean"].setLevels((m_lo, m_hi))
+
+        # Shift Variance heatmap
+        v_fin = v_arr[np.isfinite(v_arr)]
+        if v_fin.size > 0:
+            v_lo = 0.0
+            v_hi = float(np.percentile(v_fin, 98.0))
+            if v_hi <= v_lo:
+                v_hi = float(np.max(v_fin)) + 1e-3
+        else:
+            v_lo, v_hi = 0.0, 0.1
+        rgba_v, v_lo, v_hi = pg_helpers.array_to_rgba_with_nan(
+            v_arr, "magma", v_lo, v_hi, nan_rgba=(30, 30, 30, 0)
+        )
+        w["im_var"].setImage(rgba_v, autoLevels=False)
+        w["im_var"].setRect(rect)
+        w["cb_var"].setLevels((v_lo, v_hi))
+
+        w["p_mean"].setRange(xRange=(t_min, t_max), yRange=(q_min, q_max), padding=0.02)
+
+        if len(self._hover_plots) >= 2:
+            self._hover_plots[0]["data"] = m_arr
+            self._hover_plots[0]["extent"] = extent
+            self._hover_plots[1]["data"] = v_arr
+            self._hover_plots[1]["extent"] = extent
+
+        fit_str = ""
+        if latest_fit is not None:
+            ms = latest_fit.get("mean_shift_ghz", float("nan"))
+            vs = latest_fit.get("V_s_ms", float("nan"))
+            if np.isfinite(ms):
+                fit_str += f"  |  ν_B = {ms:.3f} GHz"
+            if np.isfinite(vs):
+                fit_str += f"  |  V_s = {vs:.1f} m/s"
+        self.lbl_stats.setText(
+            f"Time Evolution: {t_arr.size} pt(s)  |  t = {t_arr[-1]:.1f} s  |  q ∈ [{q_arr[0]:.2f}, {q_arr[-1]:.2f}] µm⁻¹{fit_str}"
+        )
 
     # ==========================================================================
     # Step 5.1: Laser Reference Calibration Diagnostic Views
