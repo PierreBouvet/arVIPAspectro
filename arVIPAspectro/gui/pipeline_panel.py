@@ -677,14 +677,12 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.sec_h5 = self._build_h5_session_card()
         self.sec_calib = self._build_calibration_prompt_card()
         self.sec_preview_calib = self._build_preview_calibration_card()
-        self.sec_mapping_calib = self._build_step5_3_sample_fit_card()
-        self.sec_map_params = self._build_map_configuration_card()
+        self.sec_mapping = self._build_merged_mapping_card()
 
         layout.addWidget(self.sec_h5)
         layout.addWidget(self.sec_calib)
         layout.addWidget(self.sec_preview_calib)
-        layout.addWidget(self.sec_mapping_calib)
-        layout.addWidget(self.sec_map_params)
+        layout.addWidget(self.sec_mapping)
         layout.addStretch()
 
         scroll.setWidget(content)
@@ -990,12 +988,40 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
         return box
 
-    def _build_step5_3_sample_fit_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("4. Mapping - Calibration")
+    @staticmethod
+    def _make_section_divider(title: str) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(w)
+        row.setContentsMargins(0, 4, 0, 2)
+        lbl = QtWidgets.QLabel(f"<b>{title}</b>")
+        lbl.setStyleSheet("color: #90caf9; font-size: 11px;")
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        row.addWidget(lbl)
+        row.addWidget(line, stretch=1)
+        return w
+
+    def _build_merged_mapping_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("4. Mapping")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(6)
 
-        # Row 0: Acquire Calibration Sample Spectrum
+        # ------------------------------------------------------------------
+        # 4.1 Mapping Name
+        # ------------------------------------------------------------------
+        name_row = QtWidgets.QHBoxLayout()
+        name_row.addWidget(QtWidgets.QLabel("<b>Name of the mapping:</b>"))
+        self.txt_map_name = QtWidgets.QLineEdit("Map_01")
+        self.txt_map_name.textChanged.connect(self._on_map_name_changed)
+        name_row.addWidget(self.txt_map_name, stretch=1)
+        layout.addLayout(name_row)
+
+        # ------------------------------------------------------------------
+        # 4.2 Reference Sample Calibration (Elliptical Shift Profile)
+        # ------------------------------------------------------------------
+        layout.addWidget(self._make_section_divider("Reference Sample — Elliptical Shift Calibration"))
+
         acq_row = QtWidgets.QHBoxLayout()
         acq_row.addWidget(QtWidgets.QLabel("Calibration Sample:"))
         self.spin_ref_exp = QtWidgets.QDoubleSpinBox()
@@ -1014,7 +1040,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_acq_ref = QtWidgets.QPushButton("📷 Acquire Sample")
         self.btn_acq_ref.clicked.connect(
             lambda: self._on_acquire_calibration(
-                AcquisitionSession.ROLE_REF_SAMPLE,
+                self._current_ref_role(),
                 self.spin_ref_exp.value(),
                 self.spin_ref_avg.value(),
             )
@@ -1022,7 +1048,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         acq_row.addWidget(self.btn_acq_ref)
 
         self.btn_view_ref = QtWidgets.QPushButton("👁 View")
-        self.btn_view_ref.clicked.connect(lambda: self._on_view_calibration(AcquisitionSession.ROLE_REF_SAMPLE))
+        self.btn_view_ref.clicked.connect(lambda: self._on_view_calibration(self._current_ref_role()))
         acq_row.addWidget(self.btn_view_ref)
 
         self.lbl_status_ref = QtWidgets.QLabel("MISSING")
@@ -1032,7 +1058,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         acq_row.addStretch()
         layout.addLayout(acq_row)
 
-        # Row 1: Auto-fit toggle + Presets + Status badge
         top_row = QtWidgets.QHBoxLayout()
         self.chk_auto_fit_ref = QtWidgets.QCheckBox("Auto-fit after acquiring Ref Sample")
         self.chk_auto_fit_ref.setChecked(True)
@@ -1053,7 +1078,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         top_row.addWidget(self.lbl_sample_fit_status)
         layout.addLayout(top_row)
 
-        # Row 2: Spatial Binning & DHO Fitting Parameters
         dho_row = QtWidgets.QHBoxLayout()
         dho_row.addWidget(QtWidgets.QLabel("Bin H×W:"))
         self.spin_bin_h = QtWidgets.QSpinBox()
@@ -1107,9 +1131,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         dho_row.addStretch()
         layout.addLayout(dho_row)
 
-        # Row 3: Step 14 Ellipse & Wavevector Parameters
         q_row = QtWidgets.QHBoxLayout()
-        self.chk_run_q_calib = QtWidgets.QCheckBox("Step 14: Fit 2D Coaxial Ellipse & q-Vector (M_θ, V_s)")
+        self.chk_run_q_calib = QtWidgets.QCheckBox("Fit 2D Coaxial Ellipse & q-Vector (M_θ, V_s)")
         self.chk_run_q_calib.setChecked(True)
         q_row.addWidget(self.chk_run_q_calib)
 
@@ -1139,7 +1162,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         q_row.addStretch()
         layout.addLayout(q_row)
 
-        # Row 4: Execute Fit button + 3 Diagnostic Plot Viewers
         btn_row = QtWidgets.QHBoxLayout()
         self.btn_run_sample_fit = QtWidgets.QPushButton("⚙ Fit Ref / Test Sample (Steps 11–14)")
         self.btn_run_sample_fit.setStyleSheet("font-weight: bold; padding: 4px 10px;")
@@ -1159,9 +1181,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         btn_row.addWidget(self.btn_diag_s_q)
         layout.addLayout(btn_row)
 
-        # Row 5: Fitted Summary Banner
         self.lbl_sample_fit_summary = QtWidgets.QLabel(
-            "Complete Step 5.2 (Rb Calibration), acquire a Reference Sample (Row 3 in 4B), then click 'Fit Ref / Test Sample'."
+            "Acquire a Reference Sample for this mapping, then click 'Fit Ref / Test Sample'."
         )
         self.lbl_sample_fit_summary.setStyleSheet(
             "background-color: #1e293b; color: #e2e8f0; font-family: monospace; "
@@ -1170,25 +1191,11 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.lbl_sample_fit_summary.setWordWrap(True)
         layout.addWidget(self.lbl_sample_fit_summary)
 
-        return box
+        # ------------------------------------------------------------------
+        # 4.3 Brightfield & Region Positioning
+        # ------------------------------------------------------------------
+        layout.addWidget(self._make_section_divider("Brightfield & Region Positioning"))
 
-    def _build_map_configuration_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("5. Mapping Parameters")
-        layout = QtWidgets.QVBoxLayout(box)
-        layout.setSpacing(6)
-
-        # 1. Name of the mapping + Go to saved position
-        name_row = QtWidgets.QHBoxLayout()
-        name_row.addWidget(QtWidgets.QLabel("Name of the mapping:"))
-        self.txt_map_name = QtWidgets.QLineEdit("Map_01")
-        self.txt_map_name.textChanged.connect(lambda *_: self._update_brightfield_ui())
-        name_row.addWidget(self.txt_map_name, stretch=1)
-        self.btn_goto_saved_pos = QtWidgets.QPushButton("Go to saved position...")
-        self.btn_goto_saved_pos.clicked.connect(self._on_goto_saved_position)
-        name_row.addWidget(self.btn_goto_saved_pos)
-        layout.addLayout(name_row)
-
-        # 2. Brightfield: Acquire & Load Reference
         bf_row = QtWidgets.QHBoxLayout()
         bf_row.addWidget(QtWidgets.QLabel("Brightfield:"))
         self.btn_acq_bf_map = QtWidgets.QPushButton("Acquire")
@@ -1200,33 +1207,44 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_load_bf_ref.clicked.connect(self._on_load_bf_reference)
         bf_row.addWidget(self.btn_load_bf_ref)
 
+        self.btn_goto_saved_pos = QtWidgets.QPushButton("Go to saved position...")
+        self.btn_goto_saved_pos.clicked.connect(self._on_goto_saved_position)
+        bf_row.addWidget(self.btn_goto_saved_pos)
+
         self.lbl_bf_map_status = QtWidgets.QLabel("NO CENTER")
         self.lbl_bf_map_status.setAlignment(QtCore.Qt.AlignCenter)
         self.lbl_bf_map_status.setMinimumWidth(110)
         bf_row.addWidget(self.lbl_bf_map_status)
+        bf_row.addStretch()
+        layout.addLayout(bf_row)
 
-        bf_row.addSpacing(8)
-        bf_row.addWidget(QtWidgets.QLabel("Center Xc:"))
+        center_row = QtWidgets.QHBoxLayout()
+        center_row.addWidget(QtWidgets.QLabel("Center Xc:"))
         self.spin_x_center = QtWidgets.QDoubleSpinBox()
         self.spin_x_center.setDecimals(2)
         self.spin_x_center.setRange(-100000.0, 100000.0)
         self.spin_x_center.setValue(0.0)
         self.spin_x_center.setSuffix(" µm")
         self.spin_x_center.valueChanged.connect(self._update_map_summary)
-        bf_row.addWidget(self.spin_x_center)
+        center_row.addWidget(self.spin_x_center)
 
-        bf_row.addWidget(QtWidgets.QLabel("Yc:"))
+        center_row.addSpacing(8)
+        center_row.addWidget(QtWidgets.QLabel("Yc:"))
         self.spin_y_center = QtWidgets.QDoubleSpinBox()
         self.spin_y_center.setDecimals(2)
         self.spin_y_center.setRange(-100000.0, 100000.0)
         self.spin_y_center.setValue(0.0)
         self.spin_y_center.setSuffix(" µm")
         self.spin_y_center.valueChanged.connect(self._update_map_summary)
-        bf_row.addWidget(self.spin_y_center)
-        bf_row.addStretch()
-        layout.addLayout(bf_row)
+        center_row.addWidget(self.spin_y_center)
+        center_row.addStretch()
+        layout.addLayout(center_row)
 
-        # 3. Exposure (on its own line)
+        # ------------------------------------------------------------------
+        # 4.4 Acquisition Parameters
+        # ------------------------------------------------------------------
+        layout.addWidget(self._make_section_divider("Acquisition Parameters"))
+
         exp_row = QtWidgets.QHBoxLayout()
         exp_row.addWidget(QtWidgets.QLabel("Exposure:"))
         self.spin_map_exp = QtWidgets.QDoubleSpinBox()
@@ -1239,7 +1257,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         exp_row.addStretch()
         layout.addLayout(exp_row)
 
-        # 4. Frame average (on its own line)
         avg_row = QtWidgets.QHBoxLayout()
         avg_row.addWidget(QtWidgets.QLabel("Frame average:"))
         self.spin_map_avg = QtWidgets.QSpinBox()
@@ -1251,7 +1268,11 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         avg_row.addStretch()
         layout.addLayout(avg_row)
 
-        # 5. Points Nx, Step x (same line)
+        # ------------------------------------------------------------------
+        # 4.5 Mapping Grid Parameters
+        # ------------------------------------------------------------------
+        layout.addWidget(self._make_section_divider("Mapping Grid"))
+
         nx_row = QtWidgets.QHBoxLayout()
         nx_row.addWidget(QtWidgets.QLabel("Points Nx:"))
         self.spin_nx = QtWidgets.QSpinBox()
@@ -1271,7 +1292,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         nx_row.addStretch()
         layout.addLayout(nx_row)
 
-        # 6. Points Ny, Step y (same line)
         ny_row = QtWidgets.QHBoxLayout()
         ny_row.addWidget(QtWidgets.QLabel("Points Ny:"))
         self.spin_ny = QtWidgets.QSpinBox()
@@ -1291,7 +1311,11 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         ny_row.addStretch()
         layout.addLayout(ny_row)
 
-        # 7. Settling (on its own line)
+        # ------------------------------------------------------------------
+        # 4.6 Scan Timing, Pattern, Options & Execution
+        # ------------------------------------------------------------------
+        layout.addWidget(self._make_section_divider("Scan Timing, Pattern & Execution"))
+
         settle_row = QtWidgets.QHBoxLayout()
         settle_row.addWidget(QtWidgets.QLabel("Settling:"))
         self.spin_map_settling = QtWidgets.QSpinBox()
@@ -1303,7 +1327,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         settle_row.addStretch()
         layout.addLayout(settle_row)
 
-        # 8. Pattern (on its own line)
         pat_row = QtWidgets.QHBoxLayout()
         pat_row.addWidget(QtWidgets.QLabel("Pattern:"))
         self.combo_pattern = QtWidgets.QComboBox()
@@ -1314,7 +1337,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         pat_row.addStretch()
         layout.addLayout(pat_row)
 
-        # 9-11. Checkboxes (each on its own line)
         self.chk_treat_on_the_fly = QtWidgets.QCheckBox("Treat on the fly")
         self.chk_treat_on_the_fly.setChecked(True)
         self.chk_treat_on_the_fly.toggled.connect(self._update_map_summary)
@@ -1329,7 +1351,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.chk_save_raw.toggled.connect(self._update_map_summary)
         layout.addWidget(self.chk_save_raw)
 
-        # Live Map Summary Banner
         self.lbl_map_summary = QtWidgets.QLabel("")
         self.lbl_map_summary.setStyleSheet(
             "background-color: #1e293b; color: #e2e8f0; font-family: monospace; "
@@ -1338,7 +1359,6 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.lbl_map_summary.setWordWrap(True)
         layout.addWidget(self.lbl_map_summary)
 
-        # Execution Controls & Progress Bar
         exec_row = QtWidgets.QHBoxLayout()
         self.btn_start_map = QtWidgets.QPushButton("Start Map Acquisition")
         self.btn_start_map.setMinimumHeight(32)
@@ -1477,7 +1497,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(50, self._on_run_rb_calibration)
         # If Ref Sample was just acquired and auto-fit is enabled, trigger Step 5.3
         elif (
-            role == AcquisitionSession.ROLE_REF_SAMPLE
+            (role == AcquisitionSession.ROLE_REF_SAMPLE or role.startswith(f"{AcquisitionSession.ROLE_REF_SAMPLE}_"))
             and self.chk_auto_fit_ref.isChecked()
             and self.session.rb_calib_result is not None
         ):
@@ -1606,21 +1626,54 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.spin_q_smin.setValue(s_min)
         self.spin_q_smax.setValue(s_max)
 
+    def _current_map_sanitized_label(self) -> str:
+        name = self.txt_map_name.text().strip() if hasattr(self, "txt_map_name") else "Map_01"
+        return AcquisitionSession.sanitize_angle_label(name or "Map_01")
+
+    def _current_ref_role(self) -> str:
+        name = self.txt_map_name.text().strip() if hasattr(self, "txt_map_name") else "Map_01"
+        return AcquisitionSession.ref_role_for_angle(name or "Map_01")
+
+    def _current_ref_image_and_meta(self):
+        ang = self._current_map_sanitized_label()
+        if ang in self.session.multi_angle_ref_images:
+            return self.session.multi_angle_ref_images[ang], self.session.multi_angle_ref_meta.get(ang, {}), self._current_ref_role()
+        if self.session.ref_sample_image is not None:
+            return self.session.ref_sample_image, self.session.ref_sample_meta, AcquisitionSession.ROLE_REF_SAMPLE
+        return None, {}, self._current_ref_role()
+
+    def _active_ref_calib(self) -> Optional[Dict[str, Any]]:
+        ang = self._current_map_sanitized_label()
+        if ang in self.session.multi_angle_ref_calibs:
+            return self.session.multi_angle_ref_calibs[ang]
+        last_fit = getattr(self, "_last_fitted_ref_calib", None)
+        if last_fit is not None:
+            return last_fit
+        if self.session.ref_sample_calib_result is not None:
+            return self.session.ref_sample_calib_result
+        if self.session.multi_angle_ref_calibs:
+            return next(reversed(self.session.multi_angle_ref_calibs.values()))
+        return None
+
+    def _on_map_name_changed(self, *_):
+        self._update_calibration_badges()
+
     def _on_run_sample_fit(self):
         if not self._ensure_h5_open():
             return
-        if self.session.laser_calib_result is None or self.session.rb_calib_result is None:
+        if self.session.rb_calib_result is None:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Calibration Required",
-                "Please complete Steps 5.1 (Laser) and 5.2 (Rubidium) before running Step 5.3.",
+                "Please complete Rubidium Frequency Map calibration before fitting a reference sample.",
             )
             return
-        if self.session.ref_sample_image is None:
+        ref_img, _, ref_role = self._current_ref_image_and_meta()
+        if ref_img is None:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Reference Sample Image Missing",
-                "Please click '📷 Acquire Ref' in Section 4B (Row 3) to acquire a Reference/Test Sample image first.",
+                "Please click '📷 Acquire Sample' to acquire a Reference Sample image first.",
             )
             return
         if self._is_busy():
@@ -1636,6 +1689,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             "run_q_calibration": bool(self.chk_run_q_calib.isChecked()),
             "refractive_index": float(self.spin_q_n.value()),
             "shift_filter_bounds": (float(self.spin_q_smin.value()), float(self.spin_q_smax.value())),
+            "ref_role": ref_role,
         }
         self._set_controls_busy(True)
         self._sample_fit_worker = SampleTreatmentWorker(
@@ -1651,12 +1705,13 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def _on_sample_fitted(self, res: dict):
+        self._last_fitted_ref_calib = res
         self._update_calibration_badges()
         default_view = "q_dispersion" if res.get("q_results") is not None else "dho_maps"
         self.sig_show_sample_diagnostics.emit(res, default_view)
 
     def _on_show_sample_diag(self, view_mode: str):
-        res = self.session.ref_sample_calib_result
+        res = self._active_ref_calib()
         if res is None:
             QtWidgets.QMessageBox.information(
                 self,
@@ -1673,8 +1728,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             img, meta = self.session.laser_image, self.session.laser_meta
         elif role == AcquisitionSession.ROLE_RB:
             img, meta = self.session.rb_image, self.session.rb_meta
-        elif role == AcquisitionSession.ROLE_REF_SAMPLE:
-            img, meta = self.session.ref_sample_image, self.session.ref_sample_meta
+        elif role == AcquisitionSession.ROLE_REF_SAMPLE or role.startswith(f"{AcquisitionSession.ROLE_REF_SAMPLE}_"):
+            img, meta, _ = self._current_ref_image_and_meta()
 
         if img is None:
             QtWidgets.QMessageBox.information(self, "Not Available", f"No '{role}' image has been acquired or loaded yet.")
@@ -1709,7 +1764,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
 
         has_laser = self.session.laser_image is not None
         has_rb = self.session.rb_image is not None
-        has_ref = self.session.ref_sample_image is not None
+        ref_img, _, _ = self._current_ref_image_and_meta()
+        has_ref = ref_img is not None
 
         _style_badge(self.lbl_status_laser, has_laser, optional=False)
         _style_badge(self.lbl_status_rb, has_rb, optional=False)
@@ -1777,13 +1833,15 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.btn_diag_rb_fsr.setEnabled(has_rb_cal)
         self.btn_diag_rb_fmap.setEnabled(has_rb_cal)
 
-        # Update Step 5.3 Sample Fit & Reference Geometry badge & summary
-        sf_res = self.session.ref_sample_calib_result
+        # Update Reference Sample Fit & Elliptical Calibration badge & summary
+        sf_res = self._active_ref_calib()
         has_sf = sf_res is not None
         if has_sf:
             dho = sf_res["dho_results"]
             q_res = sf_res.get("q_results")
-            self.lbl_sample_fit_status.setText("✓ FITTED & CALIBRATED")
+            ang = self._current_map_sanitized_label()
+            is_reused = (ang not in self.session.multi_angle_ref_calibs)
+            self.lbl_sample_fit_status.setText("✓ REUSING CALIB" if is_reused else "✓ FITTED & CALIBRATED")
             self.lbl_sample_fit_status.setStyleSheet(
                 "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
             )
@@ -1820,7 +1878,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
                 "background-color: #455a64; color: #cfd8dc; font-weight: bold; border-radius: 3px; padding: 2px 6px;"
             )
             self.lbl_sample_fit_summary.setText(
-                "Complete Step 5.2 (Rb Calibration), acquire a Reference Sample (Row 3 in 4B), then click 'Fit Ref / Test Sample'."
+                "Acquire a Reference Sample for this mapping, then click 'Fit Ref / Test Sample'."
             )
 
         self.btn_run_sample_fit.setEnabled(has_rb_cal and has_ref)
@@ -1836,7 +1894,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             self.session.is_open
             and self.session.rb_image is not None
             and self.session.rb_calib_result is not None
-            and self.session.ref_sample_calib_result is not None
+            and self._active_ref_calib() is not None
         )
 
     def _update_section_states(self):
@@ -1851,8 +1909,8 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
         self.sec_calib.setEnabled(h5_open)
         self.sec_preview_calib.setVisible(has_spectra)
         self.sec_preview_calib.setEnabled(has_spectra)
-        self.sec_mapping_calib.setEnabled(has_rb_cal)
-        self.sec_map_params.setEnabled(mapping_ready)
+        self.sec_mapping.setEnabled(has_rb_cal)
+        self.btn_start_map.setEnabled(mapping_ready and not self._is_busy())
 
         if mapping_ready != prev_ready:
             self.sig_mapping_ready_changed.emit(mapping_ready)
@@ -2250,6 +2308,7 @@ class PipelineAcquisitionWidget(QtWidgets.QWidget):
             save_raw_data=self.chk_save_raw.isChecked(),
             on_the_fly_treatment=self.chk_treat_on_the_fly.isChecked(),
             fit_params=fit_params,
+            q_calib_result=self._active_ref_calib(),
             parent=self,
         )
         self._map_worker.sig_log.connect(self.sig_log.emit)
