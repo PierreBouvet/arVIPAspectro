@@ -440,6 +440,7 @@ class OrcaFlashCamera:
         timeout_s: Optional[float] = None,
         stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
         sim_spectrum_type: str = "sample",
+        log_acquisition: bool = True,
     ) -> np.ndarray:
         """
         Acquires a 2D image frame (`uint16`) from the camera.
@@ -485,11 +486,12 @@ class OrcaFlashCamera:
                     ),
                     n_frames,
                 )
-                elapsed_ms = (time.time() - t0) * 1e3
-                self._log(
-                    f"Acquired simulated [{sim_spectrum_type}] frame ({frame.shape[1]}x{frame.shape[0]} px, "
-                    f"avg={n_frames}, {elapsed_ms:.1f} ms) [min={frame.min()}, max={frame.max()}]."
-                )
+                if log_acquisition:
+                    elapsed_ms = (time.time() - t0) * 1e3
+                    self._log(
+                        f"Acquired simulated [{sim_spectrum_type}] frame ({frame.shape[1]}x{frame.shape[0]} px, "
+                        f"avg={n_frames}, {elapsed_ms:.1f} ms) [min={frame.min()}, max={frame.max()}]."
+                    )
                 return frame
 
             try:
@@ -504,11 +506,12 @@ class OrcaFlashCamera:
                     acc = np.mean(np.asarray(frames, dtype=np.float64), axis=0)
                     frame = np.clip(np.rint(acc), 0, 65535).astype(np.uint16)
 
-                elapsed_ms = (time.time() - t0) * 1e3
-                self._log(
-                    f"Acquired frame ({frame.shape[1]}x{frame.shape[0]} px, uint16, avg={n_frames}) "
-                    f"in {elapsed_ms:.1f} ms [min={frame.min()}, max={frame.max()}]."
-                )
+                if log_acquisition:
+                    elapsed_ms = (time.time() - t0) * 1e3
+                    self._log(
+                        f"Acquired frame ({frame.shape[1]}x{frame.shape[0]} px, uint16, avg={n_frames}) "
+                        f"in {elapsed_ms:.1f} ms [min={frame.min()}, max={frame.max()}]."
+                    )
                 return frame
             except Exception as exc:
                 raise OrcaCameraError(f"Failed to acquire frame from camera: {exc}") from exc

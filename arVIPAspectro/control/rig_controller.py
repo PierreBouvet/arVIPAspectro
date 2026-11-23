@@ -300,17 +300,17 @@ class StageActionWorker(QtCore.QThread):
                 self.sig_log.emit("Live Preview stopped (Teledyne Brightfield).")
             return
 
-        self.sig_log.emit("Live Preview started (Orca Flash 4.0 v3).")
+        self.sig_log.emit("[Orca Flash 4.0 v3] Live view started")
         while not self._stop_requested and self.camera.is_connected:
             exp_s = self.camera.get_exposure()
             binning = self.camera.get_binning() if hasattr(self.camera, "get_binning") else 1
-            frame = self.camera.snap_frame(n_frames=1, stage_pos_um=pos)
+            frame = self.camera.snap_frame(n_frames=1, stage_pos_um=pos, log_acquisition=False)
             if self._stop_requested:
                 break
             self.sig_frame_acquired.emit(frame, pos, exp_s, 1, binning)
             if self.camera.is_simulated:
                 time.sleep(min(max(exp_s, 0.015), 0.1))
-        self.sig_log.emit("Live Preview stopped.")
+        self.sig_log.emit("[Orca Flash 4.0 v3] Live view stopped")
 
 
 class PlateAutoCalibrateWorker(QtCore.QThread):
