@@ -30,3 +30,4 @@ figures/
 
 # Local configuration files
 user_config.json
+calibration_samples.json

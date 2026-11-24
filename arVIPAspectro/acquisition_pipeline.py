@@ -192,6 +192,13 @@ class AcquisitionSession:
     ROLE_BF_PREFIX = "brightfield_"
     ROLE_BF_STAGE_CALIB = "brightfield_stage_calibration"
 
+    # Lossless HDF5 compression (gzip level 4 + byte-shuffle filter) for array datasets
+    H5_COMPRESSION_KWARGS: Dict[str, Any] = {
+        "compression": "gzip",
+        "compression_opts": 4,
+        "shuffle": True,
+    }
+
     def __init__(self):
         self._h5_lock = threading.RLock()
         self.h5_path: Optional[str] = None
@@ -1456,6 +1463,7 @@ class AcquisitionSession:
                         shape=(ny, nx, h, w),
                         dtype=np.uint16,
                         chunks=(1, 1, h, w),
+                        **self.H5_COMPRESSION_KWARGS,
                     )
                     ds_raw.attrs["Brillouin_type"] = "Raw_data"
 
@@ -1492,6 +1500,7 @@ class AcquisitionSession:
                             dtype=np.float64,
                             chunks=(1, 1, n_rows, n_cols_dho),
                             fillvalue=np.nan,
+                            **self.H5_COMPRESSION_KWARGS,
                         )
                         ds.attrs["Brillouin_type"] = b_type
 
@@ -1696,8 +1705,8 @@ class AcquisitionSession:
 
                 grp.create_dataset("time_s", shape=(0,), maxshape=(None,), dtype=np.float64)
                 grp.create_dataset("q_um_inv", shape=(nq,), dtype=np.float64, fillvalue=np.nan)
-                grp.create_dataset("shift_mean_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64)
-                grp.create_dataset("shift_var_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64)
+                grp.create_dataset("shift_mean_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64, **self.H5_COMPRESSION_KWARGS)
+                grp.create_dataset("shift_var_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64, **self.H5_COMPRESSION_KWARGS)
                 grp.create_dataset("mean_shift_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
                 grp.create_dataset("mean_lw_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
                 grp.create_dataset("Shift_0_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
@@ -1709,6 +1718,7 @@ class AcquisitionSession:
                         maxshape=(None, h, w),
                         chunks=(1, h, w),
                         dtype=np.uint16,
+                        **self.H5_COMPRESSION_KWARGS,
                     )
                 f.flush()
         return group_path
@@ -1926,8 +1936,8 @@ class AcquisitionSession:
                 grp.create_dataset("M_theta_err_px", shape=(0,), maxshape=(None,), dtype=np.float64)
                 grp.create_dataset("S0_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
                 grp.create_dataset("S0_err_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
-                grp.create_dataset("resid_mean_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64)
-                grp.create_dataset("resid_var_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64)
+                grp.create_dataset("resid_mean_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64, **self.H5_COMPRESSION_KWARGS)
+                grp.create_dataset("resid_var_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64, **self.H5_COMPRESSION_KWARGS)
                 if save_raw_data:
                     grp.create_dataset(
                         "Raw_data",
@@ -1935,6 +1945,7 @@ class AcquisitionSession:
                         maxshape=(None, h, w),
                         chunks=(1, h, w),
                         dtype=np.uint16,
+                        **self.H5_COMPRESSION_KWARGS,
                     )
                 f.flush()
         return group_path
@@ -2064,20 +2075,20 @@ class AcquisitionSession:
         study_name: str,
         tilt_label: str,
         tilt_angle_deg: float,
-        laser_img: np.ndarray,
-        rb_img: np.ndarray,
-        laser_res: Dict[str, Any],
-        rb_res: Dict[str, Any],
-        calib_img: np.ndarray,
-        calib_fit: Dict[str, Any],
-        sample_results: Dict[str, Dict[str, Any]],
+        laser_img: Optional[np.ndarray] = None,
+        rb_img: Optional[np.ndarray] = None,
+        laser_res: Optional[Dict[str, Any]] = None,
+        rb_res: Optional[Dict[str, Any]] = None,
+        calib_img: Optional[np.ndarray] = None,
+        calib_fit: Optional[Dict[str, Any]] = None,
+        sample_results: Optional[Dict[str, Dict[str, Any]]] = None,
         calib_pos_um: Optional[Dict[str, Optional[float]]] = None,
         sample_points: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
-        Saves one complete VIPA tilt step (`Laser`, `Rb_absorption`, `Calibration_sample`,
-        and `Samples/<point_name>` for all measured sample points) under
-        `Brillouin/<study_name>/<tilt_label>/`.
+        Incrementally saves any available parts of a VIPA configuration step (`Laser`,
+        `Rb_absorption`, `Calibration_sample`, and `Samples/<point_name>`) under
+        `Brillouin/<study_name>/<tilt_label>/` and flushes immediately to disk.
         """
         import json as _json
 
@@ -2092,7 +2103,11 @@ class AcquisitionSession:
         def _write_ds(grp, name, arr):
             if name in grp:
                 del grp[name]
-            grp.create_dataset(name, data=np.asarray(arr))
+            data = np.asarray(arr)
+            if data.ndim > 0 and data.size > 0:
+                grp.create_dataset(name, data=data, **self.H5_COMPRESSION_KWARGS)
+            else:
+                grp.create_dataset(name, data=data)
 
         def _write_dho_group(parent_grp, sub_name, raw_img, fit_dict, pos_um):
             if sub_name in parent_grp:
@@ -2149,48 +2164,54 @@ class AcquisitionSession:
                     ]
                     study_grp.attrs["sample_points_json"] = _json.dumps(clean_pts)
 
-                if safe_tilt in study_grp:
-                    del study_grp[safe_tilt]
-                tgrp = study_grp.create_group(safe_tilt)
+                tgrp = study_grp.require_group(safe_tilt)
                 tgrp.attrs["tilt_angle_deg"] = float(tilt_angle_deg)
                 tgrp.attrs["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
 
                 # Laser
-                g_las = tgrp.create_group("Laser")
-                _write_ds(g_las, "image", np.asarray(laser_img, dtype=np.uint16))
-                g_las.attrs["x0_fit"] = float(laser_res["x0_fit"])
-                g_las.attrs["y0_fit"] = float(laser_res["y0_fit"])
-                g_las.attrs["xc_gnom"] = float(laser_res["xc_gnom"])
-                g_las.attrs["rms_raw_mhz"] = float(laser_res["rms_raw_mhz"])
-                g_las.attrs["rms_smooth_mhz"] = float(laser_res["rms_smooth_mhz"])
+                if laser_img is not None or laser_res is not None:
+                    g_las = tgrp.require_group("Laser")
+                    if laser_img is not None:
+                        _write_ds(g_las, "image", np.asarray(laser_img, dtype=np.uint16))
+                    if laser_res is not None:
+                        g_las.attrs["x0_fit"] = float(laser_res["x0_fit"])
+                        g_las.attrs["y0_fit"] = float(laser_res["y0_fit"])
+                        g_las.attrs["xc_gnom"] = float(laser_res["xc_gnom"])
+                        g_las.attrs["rms_raw_mhz"] = float(laser_res["rms_raw_mhz"])
+                        g_las.attrs["rms_smooth_mhz"] = float(laser_res["rms_smooth_mhz"])
 
                 # Rb & Frequency Map
-                g_rb = tgrp.create_group("Rb_absorption")
-                _write_ds(g_rb, "image", np.asarray(rb_img, dtype=np.uint16))
-                _write_ds(g_rb, "Frequency", rb_res["freq_map"])
-                g_rb.attrs["FSR_cal"] = float(rb_res["FSR_cal"])
-                g_rb.attrs["delta_nu_opt"] = float(rb_res["delta_nu_opt"])
-                g_rb.attrs["xi_elastic"] = float(rb_res["xi_elastic"])
+                if rb_img is not None or rb_res is not None:
+                    g_rb = tgrp.require_group("Rb_absorption")
+                    if rb_img is not None:
+                        _write_ds(g_rb, "image", np.asarray(rb_img, dtype=np.uint16))
+                    if rb_res is not None:
+                        _write_ds(g_rb, "Frequency", rb_res["freq_map"])
+                        g_rb.attrs["FSR_cal"] = float(rb_res["FSR_cal"])
+                        g_rb.attrs["delta_nu_opt"] = float(rb_res["delta_nu_opt"])
+                        g_rb.attrs["xi_elastic"] = float(rb_res["xi_elastic"])
 
                 # Calibration Sample
-                _write_dho_group(tgrp, "Calibration_sample", calib_img, calib_fit, calib_pos_um)
+                if calib_img is not None and calib_fit is not None:
+                    _write_dho_group(tgrp, "Calibration_sample", calib_img, calib_fit, calib_pos_um)
 
                 # Measured Sample Points
-                g_samples = tgrp.create_group("Samples")
-                for pt_name, pt_data in sample_results.items():
-                    safe_pt = str(pt_name).strip().replace("/", "_") or "Point_01"
-                    _write_dho_group(
-                        g_samples,
-                        safe_pt,
-                        pt_data["img"],
-                        pt_data["fit"],
-                        pt_data.get("pos_um"),
-                    )
-                    if pt_data.get("bf_img") is not None:
-                        _write_ds(
-                            g_samples[safe_pt],
-                            "brightfield_image",
-                            np.asarray(pt_data["bf_img"], dtype=np.uint16),
+                if sample_results:
+                    g_samples = tgrp.require_group("Samples")
+                    for pt_name, pt_data in sample_results.items():
+                        safe_pt = str(pt_name).strip().replace("/", "_") or "Point_01"
+                        _write_dho_group(
+                            g_samples,
+                            safe_pt,
+                            pt_data["img"],
+                            pt_data["fit"],
+                            pt_data.get("pos_um"),
                         )
+                        if pt_data.get("bf_img") is not None:
+                            _write_ds(
+                                g_samples[safe_pt],
+                                "brightfield_image",
+                                np.asarray(pt_data["bf_img"], dtype=np.uint16),
+                            )
                 f.flush()
         return tilt_path

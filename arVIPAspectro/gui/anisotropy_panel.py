@@ -257,6 +257,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         study_row = QtWidgets.QHBoxLayout()
         study_row.addWidget(QtWidgets.QLabel("<b>Study Name:</b>"))
         self.txt_study_name = QtWidgets.QLineEdit("Anisotropy_01")
+        self.txt_study_name.textChanged.connect(self._refresh_ui_states)
         study_row.addWidget(self.txt_study_name, stretch=1)
         layout.addLayout(study_row)
 
@@ -303,7 +304,9 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.tbl_tilts.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.tbl_tilts.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.tbl_tilts.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.tbl_tilts.setMaximumHeight(120)
+        self.tbl_tilts.verticalHeader().setDefaultSectionSize(26)
+        self.tbl_tilts.setMinimumHeight(130)
+        self.tbl_tilts.setMaximumHeight(180)
         self.tbl_tilts.itemSelectionChanged.connect(self._on_tilt_selection_changed)
         layout.addWidget(self.tbl_tilts)
         return box
@@ -446,6 +449,14 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         cal_lw_row.addStretch()
         layout.addLayout(cal_lw_row)
 
+        self.lbl_calib_target = QtWidgets.QLabel("Target: Calibration_sample")
+        self.lbl_calib_target.setWordWrap(True)
+        self.lbl_calib_target.setStyleSheet(
+            "background-color: #e3f2fd; color: #0d47a1; border: 1px solid #90caf9; "
+            "border-radius: 4px; padding: 4px 8px; font-size: 11px; font-weight: bold;"
+        )
+        layout.addWidget(self.lbl_calib_target)
+
         cal_acq_row = QtWidgets.QHBoxLayout()
         cal_acq_row.addWidget(QtWidgets.QLabel("Exp:"))
         self.spin_calib_exp = QtWidgets.QDoubleSpinBox()
@@ -479,6 +490,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         pt_bar.addWidget(QtWidgets.QLabel("Point Name:"))
         self.txt_pt_name = QtWidgets.QLineEdit("Point_01")
         self.txt_pt_name.setMaximumWidth(120)
+        self.txt_pt_name.textChanged.connect(self._refresh_ui_states)
         pt_bar.addWidget(self.txt_pt_name)
 
         self.btn_add_sample_pt = QtWidgets.QPushButton("Add new position")
@@ -505,7 +517,9 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.tbl_sample_pts.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.tbl_sample_pts.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.tbl_sample_pts.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.tbl_sample_pts.setMaximumHeight(120)
+        self.tbl_sample_pts.verticalHeader().setDefaultSectionSize(26)
+        self.tbl_sample_pts.setMinimumHeight(130)
+        self.tbl_sample_pts.setMaximumHeight(180)
         self.tbl_sample_pts.itemSelectionChanged.connect(self._on_sample_point_selection_changed)
         layout.addWidget(self.tbl_sample_pts)
 
@@ -522,6 +536,15 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         bf_row.addWidget(self.btn_load_bf_ref)
         bf_row.addStretch()
         layout.addLayout(bf_row)
+
+        # Clear visual indicator of which sample point & HDF5 path will be acquired next
+        self.lbl_sample_target = QtWidgets.QLabel("Next Acquisition Target: —")
+        self.lbl_sample_target.setWordWrap(True)
+        self.lbl_sample_target.setStyleSheet(
+            "background-color: #e3f2fd; color: #0d47a1; border: 1px solid #90caf9; "
+            "border-radius: 4px; padding: 5px 8px; font-size: 11px; font-weight: bold;"
+        )
+        layout.addWidget(self.lbl_sample_target)
 
         # Acquire Current Pos row
         samp_row = QtWidgets.QHBoxLayout()
@@ -582,8 +605,8 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.chk_fast_drift.setChecked(True)
         layout.addWidget(self.chk_fast_drift)
 
-        # C. Save Configuration & Combined 4-Map View
-        layout.addWidget(self._make_divider("C. Save Configuration & Combined 4-Map View"))
+        # C. Combined 4-Map View & HDF5 Auto-Save Status
+        layout.addWidget(self._make_divider("C. Combined 4-Map View & HDF5 Auto-Save Status"))
 
         disp_row = QtWidgets.QHBoxLayout()
         disp_row.addWidget(QtWidgets.QLabel("Display Point:"))
@@ -598,11 +621,15 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         disp_row.addStretch()
         layout.addLayout(disp_row)
 
-        self.btn_save_tilt = QtWidgets.QPushButton("💾 Save Configuration to HDF5")
-        self.btn_save_tilt.setMinimumHeight(32)
-        self.btn_save_tilt.setStyleSheet("background-color: #1565c0; color: white; font-weight: bold; padding: 4px 10px;")
-        self.btn_save_tilt.clicked.connect(self._on_save_tilt_step)
-        layout.addWidget(self.btn_save_tilt)
+        self.lbl_autosave_status = QtWidgets.QLabel(
+            "HDF5 Auto-Save: Active — every acquisition is automatically saved to the HDF5 file."
+        )
+        self.lbl_autosave_status.setWordWrap(True)
+        self.lbl_autosave_status.setStyleSheet(
+            "background-color: #eceff1; color: #37474f; border: 1px solid #cfd8dc; "
+            "border-radius: 4px; padding: 6px 8px; font-size: 11px; font-weight: bold;"
+        )
+        layout.addWidget(self.lbl_autosave_status)
 
         return box
 
@@ -671,6 +698,8 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.spin_calib_lw_max.setValue(self._dho_lw_max)
         self._q_smin = float(entry.get("shift_filter_min_ghz", 4.8))
         self._q_smax = float(entry.get("shift_filter_max_ghz", 5.3))
+        if hasattr(self, "lbl_calib_target"):
+            self._refresh_ui_states()
 
     def _on_save_sample_preset(self):
         default_name = str(self.combo_ref_preset.currentData() or "")
@@ -786,7 +815,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
                 "✓" if st["rb_res"] is not None else ("img" if st["rb_img"] is not None else "—"),
                 "✓" if st["calib_fit"] is not None else "—",
                 pt_txt,
-                "✓" if st["saved"] else "—",
+                "✓ Saved" if st["saved"] else "—",
             ]
             for c, txt in enumerate(vals):
                 item = QtWidgets.QTableWidgetItem(txt)
@@ -830,11 +859,11 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
                 step["laser_img"] = np.array(frame, copy=True)
                 step["laser_res"] = None
                 step["rb_res"] = None
-                step["saved"] = False
+                self._auto_save_active_step("Laser")
             elif role == AcquisitionSession.ROLE_RB:
                 step["rb_img"] = np.array(frame, copy=True)
                 step["rb_res"] = None
-                step["saved"] = False
+                self._auto_save_active_step("Rb_absorption")
         self.sig_camera_updated.emit()
         self.sig_display_frame.emit(frame, pos, exp_s, n_avg, binning)
         self._rebuild_tilt_table()
@@ -865,7 +894,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         step = self._active_step()
         if step is not None:
             step["laser_res"] = res
-            step["saved"] = False
+            self._auto_save_active_step("Laser")
         self._rebuild_tilt_table()
         self._emit_session_changed()
         self.sig_show_laser_diagnostics.emit(res, "fringes_geom")
@@ -896,7 +925,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         step = self._active_step()
         if step is not None:
             step["rb_res"] = res
-            step["saved"] = False
+            self._auto_save_active_step("Rb_absorption")
         self._rebuild_tilt_table()
         self._emit_session_changed()
         self.sig_show_rb_diagnostics.emit(res, "fsr_fit")
@@ -1022,7 +1051,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
                 restore_row = i
             has_bf = nm in self._point_bf_refs
             has_fit = (step is not None) and (nm in step.get("sample_results", {}))
-            vals = [nm, f"{pt['X']:.2f}", f"{pt['Y']:.2f}", "✓" if has_bf else "—", "✓" if has_fit else "—"]
+            vals = [nm, f"{pt['X']:.2f}", f"{pt['Y']:.2f}", "✓" if has_bf else "—", "✓ Saved" if has_fit else "—"]
             for c, txt in enumerate(vals):
                 item = QtWidgets.QTableWidgetItem(txt)
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
@@ -1089,6 +1118,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
 
             if step is not None and pt_name in step["sample_results"]:
                 step["sample_results"][pt_name]["bf_img"] = np.array(frame, copy=True)
+                self._auto_save_active_step(f"Samples/{pt_name}")
 
             self.sig_open_dual_bf.emit()
             self.sig_set_bf_reference.emit(frame, f"BF Reference: {pt_name}")
@@ -1228,6 +1258,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             if kind == "calib":
                 step["calib_img"] = np.array(frame, copy=True)
                 step["calib_fit"] = fit_res
+                self._auto_save_active_step("Calibration_sample")
             else:
                 step["sample_results"][pt_name] = {
                     "img": np.array(frame, copy=True),
@@ -1235,7 +1266,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
                     "pos_um": pos,
                     "bf_img": self._point_bf_refs.get(pt_name),
                 }
-            step["saved"] = False
+                self._auto_save_active_step(f"Samples/{pt_name}")
 
         self.sig_camera_updated.emit()
         self._rebuild_tilt_table()
@@ -1252,21 +1283,10 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self._refresh_ui_states()
         self._on_show_combined_maps()
 
-    def _on_save_tilt_step(self):
+    def _auto_save_active_step(self, sub_label: str = ""):
+        """Immediately saves the active configuration's data to the HDF5 file and updates the status banner."""
         step = self._active_step()
         if step is None or not self.session.is_open:
-            return
-        if not (
-            step["laser_res"] is not None
-            and step["rb_res"] is not None
-            and step["calib_fit"] is not None
-            and bool(step["sample_results"])
-        ):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Incomplete Configuration",
-                "Complete Laser, Rb, Calibration Sample, and at least one Sample Point before saving.",
-            )
             return
         try:
             path = self.session.save_anisotropy_tilt_step(
@@ -1284,14 +1304,23 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
                 sample_points=self._sample_points,
             )
             step["saved"] = True
-            self.sig_log.emit(
-                f"Saved configuration '{step['label']}' ({len(step['sample_results'])} point(s)) -> {path}"
+            full_path = f"{path}/{sub_label}" if sub_label else path
+            ts = time.strftime("%H:%M:%S")
+            self.lbl_autosave_status.setText(f"✓ Saved to HDF5 at {ts}  →  {full_path}")
+            self.lbl_autosave_status.setStyleSheet(
+                "background-color: #e8f5e9; color: #1b5e20; border: 1px solid #81c784; "
+                "border-radius: 4px; padding: 6px 8px; font-size: 11px; font-weight: bold;"
             )
-            self._rebuild_tilt_table()
-            self._refresh_ui_states()
-            self._on_show_combined_maps()
+            self.sig_log.emit(f"Auto-saved to HDF5: {full_path}")
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "Save Error", str(exc))
+            step["saved"] = False
+            self.lbl_autosave_status.setText(f"⚠ HDF5 Auto-Save Error: {exc}")
+            self.lbl_autosave_status.setStyleSheet(
+                "background-color: #ffebee; color: #b71c1c; border: 1px solid #ef9a9a; "
+                "border-radius: 4px; padding: 6px 8px; font-size: 11px; font-weight: bold;"
+            )
+            self.sig_log.emit(f"ERROR auto-saving to HDF5: {exc}")
+            QtWidgets.QMessageBox.critical(self, "HDF5 Auto-Save Error", str(exc))
 
     def _on_display_point_changed(self):
         any_fit = any(
@@ -1332,10 +1361,60 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.sec_cal_spectra.setEnabled(h5_open and step is not None)
         if step is None:
             self.lbl_active_tilt.setText("Create or select a spectrometer configuration in Step 1.")
+            self.lbl_calib_target.setText("Target: Select or create a configuration in Step 1.")
+            self.lbl_sample_target.setText("Next Acquisition Target: Select or create a configuration in Step 1.")
+            self.btn_acq_current_pt.setText("Acquire Current Pos")
             self.sec_points.setEnabled(False)
             return
 
         self.lbl_active_tilt.setText(f"Active Configuration: {step['label']}  ({step['angle_deg']:.2f} °)")
+
+        safe_study = self.txt_study_name.text().strip().replace("/", "_") or "Anisotropy_01"
+        safe_cfg = step["label"].strip().replace("/", "_") or "Config_01"
+        preset_name = str(self.combo_ref_preset.currentData() or self.combo_ref_preset.currentText() or "Calibration")
+        calib_h5_path = f"{AcquisitionSession.BRILLOUIN_GROUP}/{safe_study}/{safe_cfg}/Calibration_sample"
+        self.lbl_calib_target.setText(
+            f"Target: Calibration Sample ({preset_name})  |  Config: {step['label']} ({step['angle_deg']:.2f} °)\n"
+            f"Auto-save path: {calib_h5_path}"
+        )
+
+        sel_pt = self._selected_sample_point()
+        if sel_pt is not None:
+            pt_name = sel_pt["name"]
+            safe_pt = pt_name.strip().replace("/", "_") or "Point_01"
+            pt_h5_path = f"{AcquisitionSession.BRILLOUIN_GROUP}/{safe_study}/{safe_cfg}/Samples/{safe_pt}"
+            already = pt_name in step.get("sample_results", {})
+            overwrite_note = "  [already saved — re-acquiring will overwrite]" if already else ""
+            self.lbl_sample_target.setText(
+                f"Next Acquisition Target: {pt_name}  (X={sel_pt['X']:.2f}, Y={sel_pt['Y']:.2f} µm)  |  "
+                f"Config: {step['label']} ({step['angle_deg']:.2f} °){overwrite_note}\n"
+                f"Auto-save path: {pt_h5_path}"
+            )
+            if already:
+                self.lbl_sample_target.setStyleSheet(
+                    "background-color: #fff8e1; color: #e65100; border: 1px solid #ffcc80; "
+                    "border-radius: 4px; padding: 5px 8px; font-size: 11px; font-weight: bold;"
+                )
+            else:
+                self.lbl_sample_target.setStyleSheet(
+                    "background-color: #e3f2fd; color: #0d47a1; border: 1px solid #90caf9; "
+                    "border-radius: 4px; padding: 5px 8px; font-size: 11px; font-weight: bold;"
+                )
+            self.btn_acq_current_pt.setText(f"Acquire '{pt_name}'")
+        else:
+            new_nm = self.txt_pt_name.text().strip() or f"Point_{len(self._sample_points) + 1:02d}"
+            safe_pt = new_nm.replace("/", "_")
+            pt_h5_path = f"{AcquisitionSession.BRILLOUIN_GROUP}/{safe_study}/{safe_cfg}/Samples/{safe_pt}"
+            self.lbl_sample_target.setText(
+                f"Next Acquisition Target: [New point '{new_nm}' at current stage position]  |  "
+                f"Config: {step['label']} ({step['angle_deg']:.2f} °)\n"
+                f"Auto-save path: {pt_h5_path}"
+            )
+            self.lbl_sample_target.setStyleSheet(
+                "background-color: #e3f2fd; color: #0d47a1; border: 1px solid #90caf9; "
+                "border-radius: 4px; padding: 5px 8px; font-size: 11px; font-weight: bold;"
+            )
+            self.btn_acq_current_pt.setText(f"Acquire New '{new_nm}'")
 
         def _badge(lbl: QtWidgets.QLabel, ok: bool, ok_txt: str = "✓ DONE", bad_txt: str = "PENDING"):
             lbl.setText(ok_txt if ok else bad_txt)
@@ -1350,16 +1429,15 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         has_rb_img = step["rb_img"] is not None
         has_rb_cal = step["rb_res"] is not None
         has_calib = step["calib_fit"] is not None
-        has_samples = bool(step.get("sample_results"))
 
-        _badge(self.lbl_step_laser, has_l_cal, "✓ CALIB", "IMG ONLY" if has_l_img else "PENDING")
-        _badge(self.lbl_step_rb, has_rb_cal, "✓ CALIB", "IMG ONLY" if has_rb_img else "PENDING")
-        _badge(self.lbl_step_calib, has_calib, "✓ FITTED", "PENDING")
+        _badge(self.lbl_step_laser, has_l_cal, "✓ SAVED", "IMG SAVED" if has_l_img else "PENDING")
+        _badge(self.lbl_step_rb, has_rb_cal, "✓ SAVED", "IMG SAVED" if has_rb_img else "PENDING")
+        _badge(self.lbl_step_calib, has_calib, "✓ SAVED", "PENDING")
 
         self.sec_points.setEnabled(h5_open and has_rb_cal)
 
         busy = self._is_busy()
-        pt_selected = self._selected_sample_point() is not None
+        pt_selected = sel_pt is not None
         bf_conn = self.brightfield_cam is not None and self.brightfield_cam.is_connected
 
         self.btn_cal_laser.setEnabled(has_l_img and not busy)
@@ -1370,7 +1448,6 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.btn_capture_bf.setEnabled(pt_selected and bf_conn and not busy)
         self.btn_load_bf_ref.setEnabled(not busy)
         self.btn_acq_current_pt.setEnabled(has_rb_cal and has_calib and not busy)
-        self.btn_save_tilt.setEnabled(has_l_cal and has_rb_cal and has_calib and has_samples and not busy)
         any_fit = any(
             (s["calib_fit"] is not None or bool(s.get("sample_results")))
             for s in self._tilt_steps
@@ -1405,7 +1482,6 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             self.btn_goto_sample_pt,
             self.btn_capture_bf,
             self.btn_acq_current_pt,
-            self.btn_save_tilt,
         ):
             w.setEnabled(not busy)
         if not busy:
