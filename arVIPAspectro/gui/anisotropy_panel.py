@@ -422,6 +422,30 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         preset_row.addStretch()
         layout.addLayout(preset_row)
 
+        cal_lw_row = QtWidgets.QHBoxLayout()
+        cal_lw_row.addWidget(QtWidgets.QLabel("LW Γ_B:"))
+        self.spin_calib_lw = QtWidgets.QDoubleSpinBox()
+        self.spin_calib_lw.setDecimals(2)
+        self.spin_calib_lw.setRange(0.05, 5.0)
+        self.spin_calib_lw.setValue(0.80)
+        self.spin_calib_lw.setSuffix(" GHz")
+        cal_lw_row.addWidget(self.spin_calib_lw)
+
+        cal_lw_row.addWidget(QtWidgets.QLabel("[min..max]:"))
+        self.spin_calib_lw_min = QtWidgets.QDoubleSpinBox()
+        self.spin_calib_lw_min.setDecimals(2)
+        self.spin_calib_lw_min.setRange(0.05, 5.0)
+        self.spin_calib_lw_min.setValue(0.40)
+        cal_lw_row.addWidget(self.spin_calib_lw_min)
+
+        self.spin_calib_lw_max = QtWidgets.QDoubleSpinBox()
+        self.spin_calib_lw_max.setDecimals(2)
+        self.spin_calib_lw_max.setRange(0.10, 10.0)
+        self.spin_calib_lw_max.setValue(1.30)
+        cal_lw_row.addWidget(self.spin_calib_lw_max)
+        cal_lw_row.addStretch()
+        layout.addLayout(cal_lw_row)
+
         cal_acq_row = QtWidgets.QHBoxLayout()
         cal_acq_row.addWidget(QtWidgets.QLabel("Exp:"))
         self.spin_calib_exp = QtWidgets.QDoubleSpinBox()
@@ -530,6 +554,30 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         samp_row.addStretch()
         layout.addLayout(samp_row)
 
+        samp_lw_row = QtWidgets.QHBoxLayout()
+        samp_lw_row.addWidget(QtWidgets.QLabel("LW Γ_B:"))
+        self.spin_samp_lw = QtWidgets.QDoubleSpinBox()
+        self.spin_samp_lw.setDecimals(2)
+        self.spin_samp_lw.setRange(0.05, 5.0)
+        self.spin_samp_lw.setValue(0.80)
+        self.spin_samp_lw.setSuffix(" GHz")
+        samp_lw_row.addWidget(self.spin_samp_lw)
+
+        samp_lw_row.addWidget(QtWidgets.QLabel("[min..max]:"))
+        self.spin_samp_lw_min = QtWidgets.QDoubleSpinBox()
+        self.spin_samp_lw_min.setDecimals(2)
+        self.spin_samp_lw_min.setRange(0.05, 5.0)
+        self.spin_samp_lw_min.setValue(0.40)
+        samp_lw_row.addWidget(self.spin_samp_lw_min)
+
+        self.spin_samp_lw_max = QtWidgets.QDoubleSpinBox()
+        self.spin_samp_lw_max.setDecimals(2)
+        self.spin_samp_lw_max.setRange(0.10, 10.0)
+        self.spin_samp_lw_max.setValue(1.30)
+        samp_lw_row.addWidget(self.spin_samp_lw_max)
+        samp_lw_row.addStretch()
+        layout.addLayout(samp_lw_row)
+
         self.chk_fast_drift = QtWidgets.QCheckBox("Fast elastic drift tracking")
         self.chk_fast_drift.setChecked(True)
         layout.addWidget(self.chk_fast_drift)
@@ -618,6 +666,9 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self._dho_lw = float(entry.get("expected_lw_ghz", 0.8))
         self._dho_lw_min = float(entry.get("lw_min_ghz", 0.4))
         self._dho_lw_max = float(entry.get("lw_max_ghz", 1.3))
+        self.spin_calib_lw.setValue(self._dho_lw)
+        self.spin_calib_lw_min.setValue(self._dho_lw_min)
+        self.spin_calib_lw_max.setValue(self._dho_lw_max)
         self._q_smin = float(entry.get("shift_filter_min_ghz", 4.8))
         self._q_smax = float(entry.get("shift_filter_max_ghz", 5.3))
 
@@ -638,9 +689,9 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         entry = {
             "expected_shift_ghz": shift_ghz,
             "shift_tol_ghz": float(self._dho_tol),
-            "expected_lw_ghz": float(self._dho_lw),
-            "lw_min_ghz": float(self._dho_lw_min),
-            "lw_max_ghz": float(self._dho_lw_max),
+            "expected_lw_ghz": float(self.spin_calib_lw.value()),
+            "lw_min_ghz": float(self.spin_calib_lw_min.value()),
+            "lw_max_ghz": float(self.spin_calib_lw_max.value()),
             "refractive_index": n_idx,
             "shift_filter_min_ghz": round(max(0.5, shift_ghz - 0.35), 2),
             "shift_filter_max_ghz": round(shift_ghz + 0.35, 2),
@@ -1090,8 +1141,8 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             "bin_val_w": 2,
             "expected_shift_ghz": float(self.spin_calib_shift.value()),
             "shift_tol_ghz": float(self._dho_tol),
-            "expected_lw_ghz": float(self._dho_lw),
-            "lw_bounds_ghz": (float(self._dho_lw_min), float(self._dho_lw_max)),
+            "expected_lw_ghz": float(self.spin_calib_lw.value()),
+            "lw_bounds_ghz": (float(self.spin_calib_lw_min.value()), float(self.spin_calib_lw_max.value())),
             "refractive_index": float(self.spin_calib_n.value()),
             "shift_filter_bounds": (float(self._q_smin), float(self._q_smax)),
         }
@@ -1144,8 +1195,8 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             "bin_val_w": 2,
             "expected_shift_ghz": float(self.spin_samp_shift.value()),
             "shift_tol_ghz": float(self._dho_tol),
-            "expected_lw_ghz": float(self._dho_lw),
-            "lw_bounds_ghz": (float(self._dho_lw_min), float(self._dho_lw_max)),
+            "expected_lw_ghz": float(self.spin_samp_lw.value()),
+            "lw_bounds_ghz": (float(self.spin_samp_lw_min.value()), float(self.spin_samp_lw_max.value())),
             "refractive_index": float(self.spin_calib_n.value()),
             "fast_drift_only": bool(self.chk_fast_drift.isChecked()),
         }
