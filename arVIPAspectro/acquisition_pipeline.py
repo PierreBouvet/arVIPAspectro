@@ -1759,3 +1759,392 @@ class AcquisitionSession:
                     grp["Raw_data"][t_idx, :, :] = np.asarray(raw_frame, dtype=np.uint16)
 
                 f.flush()
+
+    # ==========================================================================
+    # Time Evolution Fit: Per-Frame Cosine Fit (M_theta, S0) & Residual Profiles
+    # ==========================================================================
+
+    def fit_q_cosine_profile(
+        self,
+        dho_results: Dict[str, Any],
+        q_calib_result: Optional[Dict[str, Any]] = None,
+        refractive_index: float = 1.33,
+        n_q_bins: int = 40,
+        q_edges: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """
+        Fits the theoretical cosine law `S(r) = S0 * cos(0.5 * arcsin(r / M_theta))`
+        to the 2D shift map while holding the ellipse center/geometry `(xc, yc, phi, gamma)`
+        fixed from the calibration sample, and computes q-binned mean error & variance
+        of the measured points with respect to the fitted curve.
+        """
+        sa = np.asarray(dho_results["shift_clipped_averaged"], dtype=np.float64)
+        va = np.asarray(dho_results["shift_err_averaged"], dtype=np.float64)
+        xa = np.asarray(dho_results["x_coords_averaged"], dtype=np.float64)
+        ya = np.asarray(dho_results["y_coords_averaged"], dtype=np.float64)
+
+        active_ref = q_calib_result if q_calib_result is not None else self.ref_sample_calib_result
+        q_ref = active_ref.get("q_results") if isinstance(active_ref, dict) else None
+        if q_ref is not None:
+            opt = q_ref["opt_params"]
+            xc_e, yc_e, phi_e, gam_e = opt["xc"], opt["yc"], opt["phi_rad"], opt["gamma"]
+            m_init = float(q_ref["M_theta"])
+        else:
+            h_img = self.rb_calib_result["freq_map"].shape[0] if self.rb_calib_result else 2048
+            w_img = self.rb_calib_result["freq_map"].shape[1] if self.rb_calib_result else 2048
+            y0_fit = float(self.laser_calib_result["y0_fit"]) if self.laser_calib_result else 0.5 * h_img
+            xc_e, yc_e, phi_e, gam_e = 0.5 * w_img, y0_fit, 0.5 * np.pi, 1.25
+            m_init = 3200.0
+
+        valid = np.isfinite(sa) & np.isfinite(xa) & np.isfinite(ya)
+        s0_fit = float("nan")
+        s0_err = float("nan")
+        m_fit = float("nan")
+        m_err = float("nan")
+
+        if np.sum(valid) >= 4:
+            _, _, r_sph = bck.transform_to_spherical_coordinates(
+                xa[valid], ya[valid], xc_e, yc_e, phi_e, gam_e
+            )
+            s_vals = sa[valid]
+            s_err_raw = va[valid]
+            has_err = bool(np.any(np.isfinite(s_err_raw) & (s_err_raw > 1e-10)))
+            s_err = np.sqrt(np.maximum(s_err_raw, 1e-10)) if has_err else None
+
+            try:
+                s0_fit, m_fit, (s0_err, m_err), _ = bck.fit_magnification_factor_M_theta(
+                    r_sph=r_sph,
+                    shift=s_vals,
+                    shift_err=s_err,
+                    initial_M_theta=m_init,
+                    return_covariance=True,
+                )
+                s0_fit, m_fit = float(s0_fit), float(m_fit)
+                s0_err, m_err = float(s0_err), float(m_err)
+            except Exception:
+                s0_fit, m_fit = float("nan"), float("nan")
+                s0_err, m_err = float("nan"), float("nan")
+
+            m_for_q = m_fit if (np.isfinite(m_fit) and m_fit > 1.0) else m_init
+            cos_half = np.cos(0.5 * np.arcsin(np.clip(r_sph / max(m_for_q, 1.0), -0.999, 0.999)))
+            lambda_um = float(config.lambda_0) * 1e6
+            q_vals = (4.0 * np.pi * float(refractive_index) / lambda_um) * cos_half
+
+            if np.isfinite(s0_fit) and np.isfinite(m_fit):
+                s_pred = s0_fit * cos_half
+                resid = s_vals - s_pred
+            else:
+                resid = np.full_like(s_vals, np.nan)
+        else:
+            q_vals = np.array([], dtype=np.float64)
+            resid = np.array([], dtype=np.float64)
+
+        n_bins = max(2, int(n_q_bins))
+        if q_edges is None:
+            if q_vals.size >= 2:
+                q_min = float(np.nanmin(q_vals))
+                q_max = float(np.nanmax(q_vals))
+                if q_max <= q_min:
+                    q_min -= 0.1
+                    q_max += 0.1
+            else:
+                q_min, q_max = 10.0, 22.0
+            q_edges = np.linspace(q_min, q_max, n_bins + 1, dtype=np.float64)
+        else:
+            q_edges = np.asarray(q_edges, dtype=np.float64)
+            n_bins = len(q_edges) - 1
+
+        q_centers = 0.5 * (q_edges[:-1] + q_edges[1:])
+        mean_err_q = np.full(n_bins, np.nan, dtype=np.float64)
+        var_resid_q = np.full(n_bins, np.nan, dtype=np.float64)
+
+        if q_vals.size > 0 and np.any(np.isfinite(resid)):
+            bin_idx = np.digitize(q_vals, q_edges) - 1
+            bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+            for b in range(n_bins):
+                vals_b = resid[(bin_idx == b) & np.isfinite(resid)]
+                if vals_b.size >= 1:
+                    mean_err_q[b] = float(np.mean(vals_b))
+                if vals_b.size >= 2:
+                    var_resid_q[b] = float(np.var(vals_b, ddof=1))
+
+        return {
+            "S0_fit": s0_fit,
+            "S0_err": s0_err,
+            "M_theta_fit": m_fit,
+            "M_theta_err": m_err,
+            "q_edges": q_edges,
+            "q_centers": q_centers,
+            "mean_err_q": mean_err_q,
+            "var_resid_q": var_resid_q,
+        }
+
+    def initialize_time_evolution_fit_group(
+        self,
+        series_name: str,
+        interval_s: float,
+        n_points: Optional[int],
+        exposure_s: float,
+        n_avg: int,
+        n_q_bins: int,
+        save_raw_data: bool,
+        frame_shape: Tuple[int, int],
+        stage_pos_um: Optional[Dict[str, Optional[float]]] = None,
+    ) -> str:
+        """Creates `Brillouin/<series_name>` for periodic cosine-fit Time Evolution."""
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+
+        safe_name = series_name.strip().replace("/", "_") or "TimeFit_01"
+        group_path = f"{self.BRILLOUIN_GROUP}/{safe_name}"
+        h, w = int(frame_shape[0]), int(frame_shape[1])
+        nq = max(2, int(n_q_bins))
+
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "a") as f:
+                if self.BRILLOUIN_GROUP not in f:
+                    f.create_group(self.BRILLOUIN_GROUP)
+                if group_path in f:
+                    del f[group_path]
+                grp = f.create_group(group_path)
+                grp.attrs["Brillouin_type"] = "Time_Evolution_Fit"
+                grp.attrs["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+                grp.attrs["interval_s"] = float(interval_s)
+                grp.attrs["target_n_points"] = int(n_points) if n_points is not None else -1
+                grp.attrs["exposure_s"] = float(exposure_s)
+                grp.attrs["frame_averaging"] = int(n_avg)
+                grp.attrs["n_q_bins"] = nq
+                if stage_pos_um:
+                    if stage_pos_um.get("X") is not None:
+                        grp.attrs["stage_x_um"] = float(stage_pos_um["X"])
+                    if stage_pos_um.get("Y") is not None:
+                        grp.attrs["stage_y_um"] = float(stage_pos_um["Y"])
+
+                grp.create_dataset("time_s", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("q_um_inv", shape=(nq,), dtype=np.float64, fillvalue=np.nan)
+                grp.create_dataset("M_theta_px", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("M_theta_err_px", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("S0_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("S0_err_ghz", shape=(0,), maxshape=(None,), dtype=np.float64)
+                grp.create_dataset("resid_mean_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64)
+                grp.create_dataset("resid_var_q_t", shape=(nq, 0), maxshape=(nq, None), dtype=np.float64)
+                if save_raw_data:
+                    grp.create_dataset(
+                        "Raw_data",
+                        shape=(0, h, w),
+                        maxshape=(None, h, w),
+                        chunks=(1, h, w),
+                        dtype=np.uint16,
+                    )
+                f.flush()
+        return group_path
+
+    def append_time_evolution_fit_point(
+        self,
+        group_path: str,
+        t_idx: int,
+        elapsed_s: float,
+        fit_res: Dict[str, Any],
+        raw_frame: Optional[np.ndarray] = None,
+    ):
+        """Appends one cosine-fit time point `t_idx` to `Brillouin/<series_name>` and flushes."""
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+
+        q_centers = np.asarray(fit_res["q_centers"], dtype=np.float64)
+        mean_err_q = np.asarray(fit_res["mean_err_q"], dtype=np.float64)
+        var_resid_q = np.asarray(fit_res["var_resid_q"], dtype=np.float64)
+
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "a") as f:
+                grp = f[group_path]
+                n_new = int(t_idx) + 1
+                if t_idx == 0:
+                    grp["q_um_inv"][:] = q_centers
+
+                for ds_name, val in (
+                    ("time_s", float(elapsed_s)),
+                    ("M_theta_px", float(fit_res["M_theta_fit"])),
+                    ("M_theta_err_px", float(fit_res["M_theta_err"])),
+                    ("S0_ghz", float(fit_res["S0_fit"])),
+                    ("S0_err_ghz", float(fit_res["S0_err"])),
+                ):
+                    grp[ds_name].resize((n_new,))
+                    grp[ds_name][t_idx] = val
+
+                grp["resid_mean_q_t"].resize((len(q_centers), n_new))
+                grp["resid_mean_q_t"][:, t_idx] = mean_err_q
+
+                grp["resid_var_q_t"].resize((len(q_centers), n_new))
+                grp["resid_var_q_t"][:, t_idx] = var_resid_q
+
+                if raw_frame is not None and "Raw_data" in grp:
+                    h, w = raw_frame.shape[:2]
+                    grp["Raw_data"].resize((n_new, h, w))
+                    grp["Raw_data"][t_idx, :, :] = np.asarray(raw_frame, dtype=np.uint16)
+
+                f.flush()
+
+    # ==========================================================================
+    # Single Point Anisotropy (Multi-VIPA-Tilt) HDF5 Persistence
+    # ==========================================================================
+
+    def save_anisotropy_study_positions(
+        self,
+        study_name: str,
+        calib_pos_um: Optional[Dict[str, Optional[float]]] = None,
+        sample_pos_um: Optional[Dict[str, Optional[float]]] = None,
+    ) -> str:
+        """Persists saved Calibration & Sample stage positions under `Brillouin/<study_name>`."""
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+        safe_study = study_name.strip().replace("/", "_") or "Anisotropy_01"
+        study_path = f"{self.BRILLOUIN_GROUP}/{safe_study}"
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "a") as f:
+                if self.BRILLOUIN_GROUP not in f:
+                    f.create_group(self.BRILLOUIN_GROUP)
+                grp = f.require_group(study_path)
+                grp.attrs["Brillouin_type"] = "Single_Point_Anisotropy"
+                if calib_pos_um and calib_pos_um.get("X") is not None and calib_pos_um.get("Y") is not None:
+                    grp.attrs["calib_pos_x_um"] = float(calib_pos_um["X"])
+                    grp.attrs["calib_pos_y_um"] = float(calib_pos_um["Y"])
+                if sample_pos_um and sample_pos_um.get("X") is not None and sample_pos_um.get("Y") is not None:
+                    grp.attrs["sample_pos_x_um"] = float(sample_pos_um["X"])
+                    grp.attrs["sample_pos_y_um"] = float(sample_pos_um["Y"])
+                f.flush()
+        return study_path
+
+    def load_anisotropy_study_positions(
+        self, study_name: str
+    ) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]]]:
+        """Loads saved Calibration & Sample stage positions from `Brillouin/<study_name>` if present."""
+        if not self.is_open or not self.h5_path or not os.path.exists(self.h5_path):
+            return None, None
+        safe_study = study_name.strip().replace("/", "_") or "Anisotropy_01"
+        study_path = f"{self.BRILLOUIN_GROUP}/{safe_study}"
+        calib_pos = None
+        sample_pos = None
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "r") as f:
+                if study_path in f:
+                    attrs = f[study_path].attrs
+                    if "calib_pos_x_um" in attrs and "calib_pos_y_um" in attrs:
+                        calib_pos = {"X": float(attrs["calib_pos_x_um"]), "Y": float(attrs["calib_pos_y_um"])}
+                    if "sample_pos_x_um" in attrs and "sample_pos_y_um" in attrs:
+                        sample_pos = {"X": float(attrs["sample_pos_x_um"]), "Y": float(attrs["sample_pos_y_um"])}
+        return calib_pos, sample_pos
+
+    def save_anisotropy_tilt_step(
+        self,
+        study_name: str,
+        tilt_label: str,
+        tilt_angle_deg: float,
+        laser_img: np.ndarray,
+        rb_img: np.ndarray,
+        laser_res: Dict[str, Any],
+        rb_res: Dict[str, Any],
+        calib_img: np.ndarray,
+        calib_fit: Dict[str, Any],
+        sample_img: np.ndarray,
+        sample_fit: Dict[str, Any],
+        calib_pos_um: Optional[Dict[str, Optional[float]]] = None,
+        sample_pos_um: Optional[Dict[str, Optional[float]]] = None,
+    ) -> str:
+        """
+        Saves one complete VIPA tilt step (`Laser`, `Rb_absorption`, `Calibration_sample`,
+        `Sample`, and fitted DHO/frequency maps) under `Brillouin/<study_name>/<tilt_label>/`.
+        """
+        if not self.is_open:
+            raise RuntimeError("No HDF5 session file is open.")
+
+        safe_study = study_name.strip().replace("/", "_") or "Anisotropy_01"
+        safe_tilt = tilt_label.strip().replace("/", "_") or "Tilt_01"
+        study_path = f"{self.BRILLOUIN_GROUP}/{safe_study}"
+        tilt_path = f"{study_path}/{safe_tilt}"
+
+        def _write_ds(grp, name, arr):
+            if name in grp:
+                del grp[name]
+            grp.create_dataset(name, data=np.asarray(arr))
+
+        def _write_dho_group(parent_grp, sub_name, raw_img, fit_dict, pos_um):
+            if sub_name in parent_grp:
+                del parent_grp[sub_name]
+            g = parent_grp.create_group(sub_name)
+            _write_ds(g, "image", np.asarray(raw_img, dtype=np.uint16))
+            dho = fit_dict["dho_results"]
+            for key in (
+                "shift_clipped",
+                "shift_error",
+                "linewidth_clipped",
+                "linewidth_error",
+                "amplitude",
+                "baseline",
+                "x_coords",
+                "y_coords",
+                "shift_clipped_averaged",
+                "shift_err_averaged",
+                "linewidth_clipped_averaged",
+                "x_coords_averaged",
+                "y_coords_averaged",
+            ):
+                if key in dho and dho[key] is not None:
+                    _write_ds(g, key, dho[key])
+            g.attrs["bin_val_h"] = int(dho.get("bin_val_h", 4))
+            g.attrs["bin_val_w"] = int(dho.get("bin_val_w", 2))
+            if pos_um and pos_um.get("X") is not None and pos_um.get("Y") is not None:
+                g.attrs["stage_x_um"] = float(pos_um["X"])
+                g.attrs["stage_y_um"] = float(pos_um["Y"])
+            q_res = fit_dict.get("q_results")
+            if isinstance(q_res, dict) and "opt_params" in q_res:
+                opt = q_res["opt_params"]
+                g.attrs["ellipse_xc"] = float(opt["xc"])
+                g.attrs["ellipse_yc"] = float(opt["yc"])
+                g.attrs["ellipse_phi_rad"] = float(opt["phi_rad"])
+                g.attrs["ellipse_gamma"] = float(opt["gamma"])
+                g.attrs["M_theta"] = float(q_res["M_theta"])
+                g.attrs["Shift_0_ghz"] = float(q_res["Shift_0"])
+                g.attrs["V_s_ms"] = float(q_res["V_s"])
+
+        with self._h5_lock:
+            with h5py.File(self.h5_path, "a") as f:
+                if self.BRILLOUIN_GROUP not in f:
+                    f.create_group(self.BRILLOUIN_GROUP)
+                study_grp = f.require_group(study_path)
+                study_grp.attrs["Brillouin_type"] = "Single_Point_Anisotropy"
+                if calib_pos_um and calib_pos_um.get("X") is not None and calib_pos_um.get("Y") is not None:
+                    study_grp.attrs["calib_pos_x_um"] = float(calib_pos_um["X"])
+                    study_grp.attrs["calib_pos_y_um"] = float(calib_pos_um["Y"])
+                if sample_pos_um and sample_pos_um.get("X") is not None and sample_pos_um.get("Y") is not None:
+                    study_grp.attrs["sample_pos_x_um"] = float(sample_pos_um["X"])
+                    study_grp.attrs["sample_pos_y_um"] = float(sample_pos_um["Y"])
+
+                if safe_tilt in study_grp:
+                    del study_grp[safe_tilt]
+                tgrp = study_grp.create_group(safe_tilt)
+                tgrp.attrs["tilt_angle_deg"] = float(tilt_angle_deg)
+                tgrp.attrs["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+                # Laser
+                g_las = tgrp.create_group("Laser")
+                _write_ds(g_las, "image", np.asarray(laser_img, dtype=np.uint16))
+                g_las.attrs["x0_fit"] = float(laser_res["x0_fit"])
+                g_las.attrs["y0_fit"] = float(laser_res["y0_fit"])
+                g_las.attrs["xc_gnom"] = float(laser_res["xc_gnom"])
+                g_las.attrs["rms_raw_mhz"] = float(laser_res["rms_raw_mhz"])
+                g_las.attrs["rms_smooth_mhz"] = float(laser_res["rms_smooth_mhz"])
+
+                # Rb & Frequency Map
+                g_rb = tgrp.create_group("Rb_absorption")
+                _write_ds(g_rb, "image", np.asarray(rb_img, dtype=np.uint16))
+                _write_ds(g_rb, "Frequency", rb_res["freq_map"])
+                g_rb.attrs["FSR_cal"] = float(rb_res["FSR_cal"])
+                g_rb.attrs["delta_nu_opt"] = float(rb_res["delta_nu_opt"])
+                g_rb.attrs["xi_elastic"] = float(rb_res["xi_elastic"])
+
+                # Calibration Sample & Measured Sample
+                _write_dho_group(tgrp, "Calibration_sample", calib_img, calib_fit, calib_pos_um)
+                _write_dho_group(tgrp, "Sample", sample_img, sample_fit, sample_pos_um)
+                f.flush()
+        return tilt_path

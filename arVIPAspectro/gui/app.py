@@ -57,6 +57,8 @@ from ..control import RigController, StageActionWorker, PlateAutoCalibrateWorker
 from .image_viewer import ImageViewerWidget
 from .pipeline_panel import PipelineAcquisitionWidget
 from .time_evolution_panel import TimeEvolutionWidget
+from .time_evolution_fit_panel import TimeEvolutionFitWidget
+from .anisotropy_panel import SinglePointAnisotropyWidget
 
 
 class CollapsibleSection(QtWidgets.QWidget):
@@ -314,6 +316,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pipeline_panel.sig_session_updated.connect(self.time_evolution_panel.refresh_from_session)
         self.time_evolution_panel.sig_session_updated.connect(self.pipeline_panel.refresh_from_session)
         self.tabs_right.addTab(self.time_evolution_panel, "Time Evolution")
+
+        # Tab 5: Time Evolution Fit (per-frame cosine fit M_theta(t), S0(t), residuals vs q & t)
+        self.time_evolution_fit_panel = TimeEvolutionFitWidget(
+            camera=self.camera,
+            stage=self.stage,
+            session=self.pipeline_panel.session,
+            stop_live_callback=self._stop_live_if_running,
+            parent=self,
+        )
+        self.time_evolution_fit_panel.sig_log.connect(self._append_log_slot)
+        self.time_evolution_fit_panel.sig_display_frame.connect(self._on_frame_acquired)
+        self.time_evolution_fit_panel.sig_show_laser_diagnostics.connect(
+            self.image_viewer.show_laser_calibration_diagnostics
+        )
+        self.time_evolution_fit_panel.sig_show_rb_diagnostics.connect(
+            self.image_viewer.show_rb_calibration_diagnostics
+        )
+        self.time_evolution_fit_panel.sig_show_sample_diagnostics.connect(
+            self.image_viewer.show_sample_treatment_diagnostics
+        )
+        self.time_evolution_fit_panel.sig_update_time_evolution_fit.connect(
+            self.image_viewer.update_time_evolution_fit_view
+        )
+        self.time_evolution_fit_panel.sig_camera_updated.connect(self._update_camera_ui)
+        self.pipeline_panel.sig_session_updated.connect(self.time_evolution_fit_panel.refresh_from_session)
+        self.time_evolution_panel.sig_session_updated.connect(self.time_evolution_fit_panel.refresh_from_session)
+        self.time_evolution_fit_panel.sig_session_updated.connect(self.pipeline_panel.refresh_from_session)
+        self.time_evolution_fit_panel.sig_session_updated.connect(self.time_evolution_panel.refresh_from_session)
+        self.tabs_right.addTab(self.time_evolution_fit_panel, "Time Evolution Fit")
+
+        # Tab 6: Single Point Anisotropy (multi-VIPA-tilt full calibration + Calib/Sample pair)
+        self.anisotropy_panel = SinglePointAnisotropyWidget(
+            camera=self.camera,
+            stage=self.stage,
+            session=self.pipeline_panel.session,
+            stop_live_callback=self._stop_live_if_running,
+            parent=self,
+        )
+        self.anisotropy_panel.sig_log.connect(self._append_log_slot)
+        self.anisotropy_panel.sig_display_frame.connect(self._on_frame_acquired)
+        self.anisotropy_panel.sig_show_laser_diagnostics.connect(
+            self.image_viewer.show_laser_calibration_diagnostics
+        )
+        self.anisotropy_panel.sig_show_rb_diagnostics.connect(
+            self.image_viewer.show_rb_calibration_diagnostics
+        )
+        self.anisotropy_panel.sig_show_anisotropy_maps.connect(
+            self.image_viewer.show_anisotropy_detector_maps
+        )
+        self.anisotropy_panel.sig_stage_updated.connect(self._update_stage_ui)
+        self.anisotropy_panel.sig_camera_updated.connect(self._update_camera_ui)
+        for peer in (self.pipeline_panel, self.time_evolution_panel, self.time_evolution_fit_panel):
+            peer.sig_session_updated.connect(self.anisotropy_panel.refresh_from_session)
+            self.anisotropy_panel.sig_session_updated.connect(peer.refresh_from_session)
+        self.tabs_right.addTab(self.anisotropy_panel, "Single Point Anisotropy")
 
         self.tabs_right.currentChanged.connect(self._on_right_tab_changed)
 

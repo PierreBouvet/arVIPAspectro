@@ -31,6 +31,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._live_map_widgets: Optional[Dict[str, Any]] = None
         self._dual_bf_widgets: Optional[Dict[str, Any]] = None
         self._te_widgets: Optional[Dict[str, Any]] = None
+        self._te_fit_widgets: Optional[Dict[str, Any]] = None
         self._dual_ref_img: Optional[np.ndarray] = None
         self._dual_ref_title: str = "Reference"
         self._dual_live_img: Optional[np.ndarray] = None
@@ -251,6 +252,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self._live_map_widgets = None
         self._dual_bf_widgets = None
         self._te_widgets = None
+        self._te_fit_widgets = None
         self._single_scalebar_items = []
         self._pg_plot = None
         self._pg_img_item = None
@@ -916,6 +918,285 @@ class ImageViewerWidget(QtWidgets.QWidget):
                 fit_str += f"  |  V_s = {vs:.1f} m/s"
         self.lbl_stats.setText(
             f"Time Evolution: {t_arr.size} pt(s)  |  t = {t_arr[-1]:.1f} s  |  q ∈ [{q_arr[0]:.2f}, {q_arr[-1]:.2f}] µm⁻¹{fit_str}"
+        )
+
+    # ==========================================================================
+    # Time Evolution Fit View: 4 Stacked Linked Plots (M_θ, S0, Mean Err, Var)
+    # ==========================================================================
+
+    def _build_time_evolution_fit_plots(self):
+        self._clear_pg_grid()
+        self._view_mode = "time_evolution_fit"
+        self._in_diagnostic_view = False
+        self._last_live_map_state = None
+        self.set_map_bar_visible(False)
+
+        # Row 0: M_theta(t)
+        p_m = self._pg_widget.addPlot(row=0, col=0)
+        self._style_dark_plot(p_m, title="Angular Magnification M_θ(t)", xlabel="", ylabel="M_θ (px)", grid=True)
+        curve_m = p_m.plot(
+            [], [],
+            pen=pg.mkPen("#29b6f6", width=1.8),
+            symbol="o", symbolSize=5,
+            symbolBrush=pg.mkBrush("#29b6f6"), symbolPen=None,
+        )
+
+        # Row 1: S0(t)
+        p_s0 = self._pg_widget.addPlot(row=1, col=0)
+        self._style_dark_plot(p_s0, title="Normal Brillouin Shift S₀(t)", xlabel="", ylabel="S₀ (GHz)", grid=True)
+        curve_s0 = p_s0.plot(
+            [], [],
+            pen=pg.mkPen("#66bb6a", width=1.8),
+            symbol="o", symbolSize=5,
+            symbolBrush=pg.mkBrush("#66bb6a"), symbolPen=None,
+        )
+
+        # Row 2: Mean Error to Fitted Curve(q, t)
+        sub_err = self._pg_widget.addLayout(row=2, col=0)
+        p_err = sub_err.addPlot(row=0, col=0)
+        p_err.invertY(False)
+        self._style_dark_plot(
+            p_err,
+            title="Mean Error to Fitted Curve (S_meas − S_fit)(q, t)",
+            xlabel="",
+            ylabel="q (µm⁻¹)",
+        )
+        im_err = pg.ImageItem(axisOrder="row-major")
+        p_err.addItem(im_err)
+        cb_err = pg.ColorBarItem(
+            values=(-0.1, 0.1),
+            colorMap=pg_helpers.get_pg_colormap("coolwarm"),
+            label="Δν (GHz)",
+            interactive=False,
+            width=14,
+        )
+        cb_err.axis.setTextPen(pg.mkPen("#cfd8dc"))
+        sub_err.addItem(cb_err, row=0, col=1)
+
+        # Row 3: Variance w.r.t. Fitted Curve(q, t)
+        sub_var = self._pg_widget.addLayout(row=3, col=0)
+        p_var = sub_var.addPlot(row=0, col=0)
+        p_var.invertY(False)
+        self._style_dark_plot(
+            p_var,
+            title="Variance w.r.t. Fitted Curve σ²(q, t)",
+            xlabel="Time (s)",
+            ylabel="q (µm⁻¹)",
+        )
+        im_var = pg.ImageItem(axisOrder="row-major")
+        p_var.addItem(im_var)
+        cb_var = pg.ColorBarItem(
+            values=(0.0, 0.05),
+            colorMap=pg_helpers.get_pg_colormap("magma"),
+            label="σ² (GHz²)",
+            interactive=False,
+            width=14,
+        )
+        cb_var.axis.setTextPen(pg.mkPen("#cfd8dc"))
+        sub_var.addItem(cb_var, row=0, col=1)
+
+        # Link Time (X) across all 4 plots, and Wavevector q (Y) between the two heatmaps
+        p_s0.setXLink(p_m)
+        p_err.setXLink(p_m)
+        p_var.setXLink(p_m)
+        p_var.setYLink(p_err)
+
+        self._te_fit_widgets = {
+            "p_m": p_m,
+            "curve_m": curve_m,
+            "p_s0": p_s0,
+            "curve_s0": curve_s0,
+            "p_err": p_err,
+            "im_err": im_err,
+            "cb_err": cb_err,
+            "p_var": p_var,
+            "im_var": im_var,
+            "cb_var": cb_var,
+        }
+        self._hover_plots = [
+            {"plot": p_m, "data": None, "unit": "px", "origin": "lower", "extent": None},
+            {"plot": p_s0, "data": None, "unit": "GHz", "origin": "lower", "extent": None},
+            {"plot": p_err, "data": None, "unit": "GHz", "origin": "lower", "extent": None},
+            {"plot": p_var, "data": None, "unit": "GHz²", "origin": "lower", "extent": None},
+        ]
+
+    def update_time_evolution_fit_view(
+        self,
+        time_s: np.ndarray,
+        m_arr: np.ndarray,
+        s0_arr: np.ndarray,
+        q_centers: np.ndarray,
+        mean_err_q_t: np.ndarray,
+        var_resid_q_t: np.ndarray,
+    ):
+        """Updates all 4 stacked Time Evolution Fit plots in place."""
+        if self._view_mode != "time_evolution_fit" or self._te_fit_widgets is None:
+            self._build_time_evolution_fit_plots()
+
+        w = self._te_fit_widgets
+        t_arr = np.asarray(time_s, dtype=np.float64).ravel()
+        m_vals = np.asarray(m_arr, dtype=np.float64).ravel()
+        s0_vals = np.asarray(s0_arr, dtype=np.float64).ravel()
+        q_arr = np.asarray(q_centers, dtype=np.float64).ravel()
+        e_arr = np.asarray(mean_err_q_t, dtype=np.float64)
+        v_arr = np.asarray(var_resid_q_t, dtype=np.float64)
+        if t_arr.size == 0 or q_arr.size == 0:
+            return
+
+        # 1. Update 1D curves M_theta(t) and S0(t)
+        valid_m = np.isfinite(m_vals)
+        w["curve_m"].setData(t_arr[valid_m], m_vals[valid_m])
+        valid_s0 = np.isfinite(s0_vals)
+        w["curve_s0"].setData(t_arr[valid_s0], s0_vals[valid_s0])
+
+        dt = float(np.median(np.diff(t_arr))) if t_arr.size >= 2 else 1.0
+        dt = max(dt, 1e-3)
+        dq = float(np.median(np.diff(q_arr))) if q_arr.size >= 2 else 0.1
+        dq = max(abs(dq), 1e-4)
+
+        t_min = float(t_arr[0]) - 0.5 * dt
+        t_max = float(t_arr[-1]) + 0.5 * dt
+        q_min = float(np.min(q_arr)) - 0.5 * dq
+        q_max = float(np.max(q_arr)) + 0.5 * dq
+        rect = QtCore.QRectF(t_min, q_min, t_max - t_min, q_max - q_min)
+        extent = (t_min, t_max, q_min, q_max)
+
+        # 2. Mean Error heatmap (symmetric around 0)
+        e_fin = e_arr[np.isfinite(e_arr)]
+        if e_fin.size > 0:
+            lim_e = max(1e-3, float(np.percentile(np.abs(e_fin), 98.0)))
+        else:
+            lim_e = 0.1
+        rgba_e, e_lo, e_hi = pg_helpers.array_to_rgba_with_nan(
+            e_arr, "coolwarm", -lim_e, lim_e, nan_rgba=(30, 30, 30, 0)
+        )
+        w["im_err"].setImage(rgba_e, autoLevels=False)
+        w["im_err"].setRect(rect)
+        w["cb_err"].setLevels((e_lo, e_hi))
+
+        # 3. Residual Variance heatmap
+        v_fin = v_arr[np.isfinite(v_arr)]
+        if v_fin.size > 0:
+            v_hi = max(1e-4, float(np.percentile(v_fin, 98.0)))
+        else:
+            v_hi = 0.05
+        rgba_v, v_lo, v_hi = pg_helpers.array_to_rgba_with_nan(
+            v_arr, "magma", 0.0, v_hi, nan_rgba=(30, 30, 30, 0)
+        )
+        w["im_var"].setImage(rgba_v, autoLevels=False)
+        w["im_var"].setRect(rect)
+        w["cb_var"].setLevels((v_lo, v_hi))
+
+        w["p_m"].setXRange(t_min, t_max, padding=0.02)
+        w["p_err"].setYRange(q_min, q_max, padding=0.02)
+
+        if len(self._hover_plots) >= 4:
+            self._hover_plots[2]["data"] = e_arr
+            self._hover_plots[2]["extent"] = extent
+            self._hover_plots[3]["data"] = v_arr
+            self._hover_plots[3]["extent"] = extent
+
+        m_last = m_vals[-1] if m_vals.size > 0 else float("nan")
+        s0_last = s0_vals[-1] if s0_vals.size > 0 else float("nan")
+        m_str = f"M_θ = {m_last:.1f} px" if np.isfinite(m_last) else "M_θ = NaN"
+        s0_str = f"S₀ = {s0_last:.4f} GHz" if np.isfinite(s0_last) else "S₀ = NaN"
+        self.lbl_stats.setText(
+            f"Time Evolution Fit: {t_arr.size} pt(s)  |  t = {t_arr[-1]:.1f} s  |  {m_str}  |  {s0_str}"
+        )
+
+    # ==========================================================================
+    # Single Point Anisotropy View: 2x2 Detector-Sensor Maps (Calib & Sample)
+    # ==========================================================================
+
+    def show_anisotropy_detector_maps(
+        self,
+        tilt_steps_data: List[Dict[str, Any]],
+        detector_shape: Tuple[int, int] = (2048, 2048),
+    ):
+        """
+        Renders 4 linked detector-sensor maps combining all acquired VIPA tilt steps:
+          - Top-Left:  Calibration Sample — Shift ν_B (GHz)
+          - Top-Right: Measured Sample — Shift ν_B (GHz)
+          - Bot-Left:  Calibration Sample — Linewidth Γ_B (GHz)
+          - Bot-Right: Measured Sample — Linewidth Γ_B (GHz)
+        """
+        self._last_live_map_state = None
+        self._enter_diagnostic_mode()
+
+        det_h, det_w = int(detector_shape[0]), int(detector_shape[1])
+
+        def _collect(field_key: str, metric_key: str):
+            xs, ys, vs = [], [], []
+            for step in tilt_steps_data:
+                fit = step.get(field_key)
+                if not isinstance(fit, dict) or "dho_results" not in fit:
+                    continue
+                dho = fit["dho_results"]
+                x = np.asarray(dho["x_coords_averaged"], dtype=np.float64).ravel()
+                y = np.asarray(dho["y_coords_averaged"], dtype=np.float64).ravel()
+                v = np.asarray(dho[metric_key], dtype=np.float64).ravel()
+                m = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
+                if np.any(m):
+                    xs.append(x[m])
+                    ys.append(y[m])
+                    vs.append(v[m])
+            if not xs:
+                return np.array([]), np.array([]), np.array([])
+            return np.concatenate(xs), np.concatenate(ys), np.concatenate(vs)
+
+        cx_s, cy_s, cv_s = _collect("calib_fit", "shift_clipped_averaged")
+        sx_s, sy_s, sv_s = _collect("sample_fit", "shift_clipped_averaged")
+        cx_l, cy_l, cv_l = _collect("calib_fit", "linewidth_clipped_averaged")
+        sx_l, sy_l, sv_l = _collect("sample_fit", "linewidth_clipped_averaged")
+
+        n_steps = len(tilt_steps_data)
+        xr = (-0.5, float(det_w) - 0.5)
+        yr = (-0.5, float(det_h) - 0.5)
+
+        def _plot_sensor_scatter(row, col, x, y, v, cmap_name, title, cbar_lbl):
+            if v.size > 0:
+                vmin = float(np.percentile(v, 2.0))
+                vmax = float(np.percentile(v, 98.0))
+                if vmax <= vmin:
+                    vmin, vmax = float(np.min(v)) - 0.05, float(np.max(v)) + 0.05
+            else:
+                vmin, vmax = 0.0, 1.0
+            p, _ = self._add_dark_scatter_panel(
+                row, col, x, y, v, cmap_name,
+                title, "Detector X (px)", "Detector Y (px)", cbar_lbl,
+                vmin=vmin, vmax=vmax, size=4.0, alpha=220,
+                invert_y=True, aspect_equal=True,
+            )
+            p.setRange(xRange=xr, yRange=yr, padding=0.02)
+            QtCore.QTimer.singleShot(
+                0, lambda p_=p, xr_=xr, yr_=yr: p_.setRange(xRange=xr_, yRange=yr_, padding=0.02)
+            )
+            return p
+
+        p_cs = _plot_sensor_scatter(
+            0, 0, cx_s, cy_s, cv_s, "viridis",
+            f"Calibration Sample — Shift ν_B ({n_steps} tilt step(s))", "ν_B (GHz)",
+        )
+        p_ss = _plot_sensor_scatter(
+            0, 1, sx_s, sy_s, sv_s, "viridis",
+            f"Measured Sample — Shift ν_B ({n_steps} tilt step(s))", "ν_B (GHz)",
+        )
+        p_cl = _plot_sensor_scatter(
+            1, 0, cx_l, cy_l, cv_l, "magma",
+            f"Calibration Sample — Linewidth Γ_B ({n_steps} tilt step(s))", "Γ_B (GHz)",
+        )
+        p_sl = _plot_sensor_scatter(
+            1, 1, sx_l, sy_l, sv_l, "magma",
+            f"Measured Sample — Linewidth Γ_B ({n_steps} tilt step(s))", "Γ_B (GHz)",
+        )
+
+        for p_other in (p_ss, p_cl, p_sl):
+            p_other.setXLink(p_cs)
+            p_other.setYLink(p_cs)
+
+        self.lbl_stats.setText(
+            f"Single Point Anisotropy: {n_steps} tilt step(s) combined  |  "
+            f"Calib pts: {cv_s.size}  |  Sample pts: {sv_s.size}"
         )
 
     # ==========================================================================
