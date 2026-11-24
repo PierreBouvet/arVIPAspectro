@@ -1993,9 +1993,11 @@ class AcquisitionSession:
         self,
         study_name: str,
         calib_pos_um: Optional[Dict[str, Optional[float]]] = None,
-        sample_pos_um: Optional[Dict[str, Optional[float]]] = None,
+        sample_points: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        """Persists saved Calibration & Sample stage positions under `Brillouin/<study_name>`."""
+        """Persists saved Calibration & Sample point stage positions under `Brillouin/<study_name>`."""
+        import json as _json
+
         if not self.is_open:
             raise RuntimeError("No HDF5 session file is open.")
         safe_study = study_name.strip().replace("/", "_") or "Anisotropy_01"
@@ -2009,31 +2011,53 @@ class AcquisitionSession:
                 if calib_pos_um and calib_pos_um.get("X") is not None and calib_pos_um.get("Y") is not None:
                     grp.attrs["calib_pos_x_um"] = float(calib_pos_um["X"])
                     grp.attrs["calib_pos_y_um"] = float(calib_pos_um["Y"])
-                if sample_pos_um and sample_pos_um.get("X") is not None and sample_pos_um.get("Y") is not None:
-                    grp.attrs["sample_pos_x_um"] = float(sample_pos_um["X"])
-                    grp.attrs["sample_pos_y_um"] = float(sample_pos_um["Y"])
+                if sample_points is not None:
+                    clean_pts = [
+                        {"name": str(p["name"]), "X": float(p["X"]), "Y": float(p["Y"])}
+                        for p in sample_points
+                    ]
+                    grp.attrs["sample_points_json"] = _json.dumps(clean_pts)
                 f.flush()
         return study_path
 
     def load_anisotropy_study_positions(
         self, study_name: str
-    ) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]]]:
-        """Loads saved Calibration & Sample stage positions from `Brillouin/<study_name>` if present."""
+    ) -> Tuple[Optional[Dict[str, float]], List[Dict[str, Any]]]:
+        """Loads saved Calibration position & Sample points list from `Brillouin/<study_name>`."""
+        import json as _json
+
         if not self.is_open or not self.h5_path or not os.path.exists(self.h5_path):
-            return None, None
+            return None, []
         safe_study = study_name.strip().replace("/", "_") or "Anisotropy_01"
         study_path = f"{self.BRILLOUIN_GROUP}/{safe_study}"
         calib_pos = None
-        sample_pos = None
+        sample_points: List[Dict[str, Any]] = []
         with self._h5_lock:
             with h5py.File(self.h5_path, "r") as f:
                 if study_path in f:
                     attrs = f[study_path].attrs
                     if "calib_pos_x_um" in attrs and "calib_pos_y_um" in attrs:
                         calib_pos = {"X": float(attrs["calib_pos_x_um"]), "Y": float(attrs["calib_pos_y_um"])}
-                    if "sample_pos_x_um" in attrs and "sample_pos_y_um" in attrs:
-                        sample_pos = {"X": float(attrs["sample_pos_x_um"]), "Y": float(attrs["sample_pos_y_um"])}
-        return calib_pos, sample_pos
+                    if "sample_points_json" in attrs:
+                        try:
+                            raw_pts = _json.loads(str(attrs["sample_points_json"]))
+                            if isinstance(raw_pts, list):
+                                sample_points = [
+                                    {"name": str(p["name"]), "X": float(p["X"]), "Y": float(p["Y"])}
+                                    for p in raw_pts
+                                    if isinstance(p, dict) and "name" in p and "X" in p and "Y" in p
+                                ]
+                        except Exception:
+                            pass
+                    elif "sample_pos_x_um" in attrs and "sample_pos_y_um" in attrs:
+                        sample_points = [
+                            {
+                                "name": "Point_01",
+                                "X": float(attrs["sample_pos_x_um"]),
+                                "Y": float(attrs["sample_pos_y_um"]),
+                            }
+                        ]
+        return calib_pos, sample_points
 
     def save_anisotropy_tilt_step(
         self,
@@ -2046,15 +2070,17 @@ class AcquisitionSession:
         rb_res: Dict[str, Any],
         calib_img: np.ndarray,
         calib_fit: Dict[str, Any],
-        sample_img: np.ndarray,
-        sample_fit: Dict[str, Any],
+        sample_results: Dict[str, Dict[str, Any]],
         calib_pos_um: Optional[Dict[str, Optional[float]]] = None,
-        sample_pos_um: Optional[Dict[str, Optional[float]]] = None,
+        sample_points: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Saves one complete VIPA tilt step (`Laser`, `Rb_absorption`, `Calibration_sample`,
-        `Sample`, and fitted DHO/frequency maps) under `Brillouin/<study_name>/<tilt_label>/`.
+        and `Samples/<point_name>` for all measured sample points) under
+        `Brillouin/<study_name>/<tilt_label>/`.
         """
+        import json as _json
+
         if not self.is_open:
             raise RuntimeError("No HDF5 session file is open.")
 
@@ -2116,9 +2142,12 @@ class AcquisitionSession:
                 if calib_pos_um and calib_pos_um.get("X") is not None and calib_pos_um.get("Y") is not None:
                     study_grp.attrs["calib_pos_x_um"] = float(calib_pos_um["X"])
                     study_grp.attrs["calib_pos_y_um"] = float(calib_pos_um["Y"])
-                if sample_pos_um and sample_pos_um.get("X") is not None and sample_pos_um.get("Y") is not None:
-                    study_grp.attrs["sample_pos_x_um"] = float(sample_pos_um["X"])
-                    study_grp.attrs["sample_pos_y_um"] = float(sample_pos_um["Y"])
+                if sample_points is not None:
+                    clean_pts = [
+                        {"name": str(p["name"]), "X": float(p["X"]), "Y": float(p["Y"])}
+                        for p in sample_points
+                    ]
+                    study_grp.attrs["sample_points_json"] = _json.dumps(clean_pts)
 
                 if safe_tilt in study_grp:
                     del study_grp[safe_tilt]
@@ -2143,8 +2172,19 @@ class AcquisitionSession:
                 g_rb.attrs["delta_nu_opt"] = float(rb_res["delta_nu_opt"])
                 g_rb.attrs["xi_elastic"] = float(rb_res["xi_elastic"])
 
-                # Calibration Sample & Measured Sample
+                # Calibration Sample
                 _write_dho_group(tgrp, "Calibration_sample", calib_img, calib_fit, calib_pos_um)
-                _write_dho_group(tgrp, "Sample", sample_img, sample_fit, sample_pos_um)
+
+                # Measured Sample Points
+                g_samples = tgrp.create_group("Samples")
+                for pt_name, pt_data in sample_results.items():
+                    safe_pt = str(pt_name).strip().replace("/", "_") or "Point_01"
+                    _write_dho_group(
+                        g_samples,
+                        safe_pt,
+                        pt_data["img"],
+                        pt_data["fit"],
+                        pt_data.get("pos_um"),
+                    )
                 f.flush()
         return tilt_path

@@ -1112,23 +1112,24 @@ class ImageViewerWidget(QtWidgets.QWidget):
         self,
         tilt_steps_data: List[Dict[str, Any]],
         detector_shape: Tuple[int, int] = (2048, 2048),
+        selected_point_name: Optional[str] = None,
     ):
         """
         Renders 4 linked detector-sensor maps combining all acquired VIPA tilt steps:
           - Top-Left:  Calibration Sample — Shift ν_B (GHz)
-          - Top-Right: Measured Sample — Shift ν_B (GHz)
+          - Top-Right: Measured Sample (selected point) — Shift ν_B (GHz)
           - Bot-Left:  Calibration Sample — Linewidth Γ_B (GHz)
-          - Bot-Right: Measured Sample — Linewidth Γ_B (GHz)
+          - Bot-Right: Measured Sample (selected point) — Linewidth Γ_B (GHz)
         """
         self._last_live_map_state = None
         self._enter_diagnostic_mode()
 
         det_h, det_w = int(detector_shape[0]), int(detector_shape[1])
 
-        def _collect(field_key: str, metric_key: str):
+        def _collect_calib(metric_key: str):
             xs, ys, vs = [], [], []
             for step in tilt_steps_data:
-                fit = step.get(field_key)
+                fit = step.get("calib_fit")
                 if not isinstance(fit, dict) or "dho_results" not in fit:
                     continue
                 dho = fit["dho_results"]
@@ -1144,12 +1145,39 @@ class ImageViewerWidget(QtWidgets.QWidget):
                 return np.array([]), np.array([]), np.array([])
             return np.concatenate(xs), np.concatenate(ys), np.concatenate(vs)
 
-        cx_s, cy_s, cv_s = _collect("calib_fit", "shift_clipped_averaged")
-        sx_s, sy_s, sv_s = _collect("sample_fit", "shift_clipped_averaged")
-        cx_l, cy_l, cv_l = _collect("calib_fit", "linewidth_clipped_averaged")
-        sx_l, sy_l, sv_l = _collect("sample_fit", "linewidth_clipped_averaged")
+        def _collect_sample(metric_key: str):
+            xs, ys, vs = [], [], []
+            for step in tilt_steps_data:
+                s_res = step.get("sample_results")
+                fit = None
+                if isinstance(s_res, dict) and s_res:
+                    pt_entry = s_res.get(selected_point_name) if selected_point_name else next(iter(s_res.values()))
+                    if isinstance(pt_entry, dict):
+                        fit = pt_entry.get("fit")
+                elif isinstance(step.get("sample_fit"), dict):
+                    fit = step.get("sample_fit")
+                if not isinstance(fit, dict) or "dho_results" not in fit:
+                    continue
+                dho = fit["dho_results"]
+                x = np.asarray(dho["x_coords_averaged"], dtype=np.float64).ravel()
+                y = np.asarray(dho["y_coords_averaged"], dtype=np.float64).ravel()
+                v = np.asarray(dho[metric_key], dtype=np.float64).ravel()
+                m = np.isfinite(x) & np.isfinite(y) & np.isfinite(v)
+                if np.any(m):
+                    xs.append(x[m])
+                    ys.append(y[m])
+                    vs.append(v[m])
+            if not xs:
+                return np.array([]), np.array([]), np.array([])
+            return np.concatenate(xs), np.concatenate(ys), np.concatenate(vs)
+
+        cx_s, cy_s, cv_s = _collect_calib("shift_clipped_averaged")
+        sx_s, sy_s, sv_s = _collect_sample("shift_clipped_averaged")
+        cx_l, cy_l, cv_l = _collect_calib("linewidth_clipped_averaged")
+        sx_l, sy_l, sv_l = _collect_sample("linewidth_clipped_averaged")
 
         n_steps = len(tilt_steps_data)
+        pt_lbl = f" [{selected_point_name}]" if selected_point_name else ""
         xr = (-0.5, float(det_w) - 0.5)
         yr = (-0.5, float(det_h) - 0.5)
 
@@ -1179,7 +1207,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         )
         p_ss = _plot_sensor_scatter(
             0, 1, sx_s, sy_s, sv_s, "viridis",
-            f"Measured Sample — Shift ν_B ({n_steps} tilt step(s))", "ν_B (GHz)",
+            f"Measured Sample{pt_lbl} — Shift ν_B ({n_steps} tilt step(s))", "ν_B (GHz)",
         )
         p_cl = _plot_sensor_scatter(
             1, 0, cx_l, cy_l, cv_l, "magma",
@@ -1187,7 +1215,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
         )
         p_sl = _plot_sensor_scatter(
             1, 1, sx_l, sy_l, sv_l, "magma",
-            f"Measured Sample — Linewidth Γ_B ({n_steps} tilt step(s))", "Γ_B (GHz)",
+            f"Measured Sample{pt_lbl} — Linewidth Γ_B ({n_steps} tilt step(s))", "Γ_B (GHz)",
         )
 
         for p_other in (p_ss, p_cl, p_sl):
@@ -1195,7 +1223,7 @@ class ImageViewerWidget(QtWidgets.QWidget):
             p_other.setYLink(p_cs)
 
         self.lbl_stats.setText(
-            f"Single Point Anisotropy: {n_steps} tilt step(s) combined  |  "
+            f"Single Point Anisotropy{pt_lbl}: {n_steps} tilt step(s) combined  |  "
             f"Calib pts: {cv_s.size}  |  Sample pts: {sv_s.size}"
         )
 
