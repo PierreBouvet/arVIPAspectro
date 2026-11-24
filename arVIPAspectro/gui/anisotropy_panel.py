@@ -1,16 +1,17 @@
 """
-Single Point Anisotropy Panel (`SinglePointAnisotropyWidget`) for multi-VIPA-tilt
-measurements across a set of saved sample points paired with a calibration sample point.
+Single Point Anisotropy Panel (`SinglePointAnisotropyWidget`) for multi-configuration
+(multi-VIPA-tilt) measurements across user-defined sample points:
 
-Workflow per VIPA tilt angle:
-  1. Select/create HDF5 file (synchronized with Mapping, Time Evolution, Time Evolution Fit)
-  2. Save the Calibration Sample stage position and a list of Sample Points `(Name, X, Y)`
-  3. Add a VIPA tilt step (after manually tilting the VIPA in the spectrometer)
-  4. Acquire & calibrate full sequence for that tilt angle:
-       Laser -> Rb & Frequency Map -> Calibration Sample (at Calib Pos)
-       -> Acquire & Fit ALL Saved Sample Points (using that tilt's calibration)
-  5. Save tilt step under `Brillouin/<Study_name>/<Tilt_label>/` and update the 2x2
-     detector-sensor maps (Left: Calib Shift & LW; Right: selected Sample Point Shift & LW).
+Loop workflow:
+  1. Define a new Spectrometer Configuration (label + VIPA tilt angle)
+  2. Acquire & calibrate the Calibration Spectra (Laser lines & Rubidium absorption)
+  3. Measure Calibration Sample & Sample Points under that configuration:
+       - '+ Add new position' to record new points on the fly
+       - Select an existing point -> 'Go to position' -> manually fine-tune with Brightfield
+         ('Capture Brightfield' / 'Load BF Reference') -> 'Acquire Current Pos'
+       - Every point acquisition immediately displays the 2x2 detector-sensor maps
+         (Left: Calibration Sample Shift & LW; Right: Measured Point Shift & LW)
+  4. Save configuration to `Brillouin/<Study_name>/<Config_label>/` and repeat from Step 1.
 """
 
 import os
@@ -20,7 +21,7 @@ import numpy as np
 from PySide6 import QtWidgets, QtCore
 
 from .. import config
-from ..hardware import OrcaFlashCamera, MS2000Stage
+from ..hardware import OrcaFlashCamera, MS2000Stage, TeledyneBrightfieldCamera
 from ..acquisition_pipeline import AcquisitionSession
 from .pipeline_panel import (
     CalibrationCaptureWorker,
@@ -29,87 +30,34 @@ from .pipeline_panel import (
 )
 
 
-class _AnisotropyCalibPointWorker(QtCore.QThread):
-    """Moves to the saved Calibration Sample position, snaps a frame, and runs DHO + ellipse fit."""
+class _StageMoveWorker(QtCore.QThread):
+    """Moves the stage to a saved `(X, Y)` position without blocking the GUI."""
 
     sig_log = QtCore.Signal(str)
-    sig_stage_updated = QtCore.Signal()
-    sig_done = QtCore.Signal(object, object)  # (raw_frame, fit_dict)
+    sig_moved = QtCore.Signal()
     sig_error = QtCore.Signal(str, str)
 
-    def __init__(
-        self,
-        session: AcquisitionSession,
-        camera: OrcaFlashCamera,
-        stage: MS2000Stage,
-        target_pos_um: Optional[Dict[str, float]],
-        exposure_ms: float,
-        n_avg: int,
-        fit_params: Dict[str, Any],
-        parent=None,
-    ):
+    def __init__(self, stage: MS2000Stage, x_um: float, y_um: float, label: str, parent=None):
         super().__init__(parent)
-        self.session = session
-        self.camera = camera
         self.stage = stage
-        self.target_pos_um = dict(target_pos_um) if target_pos_um else None
-        self.exposure_ms = float(exposure_ms)
-        self.n_avg = max(1, int(n_avg))
-        self.fit_params = dict(fit_params)
+        self.x_um = float(x_um)
+        self.y_um = float(y_um)
+        self.label = label
 
     def run(self):
         try:
-            if not self.camera.is_connected:
-                raise RuntimeError("Spectrometer camera is not connected.")
-            if self.session.rb_calib_result is None:
-                raise RuntimeError("Rubidium Frequency Map must be calibrated for this VIPA tilt step first.")
-
-            pos = None
-            if self.target_pos_um is not None and self.stage.is_connected:
-                tx, ty = self.target_pos_um.get("X"), self.target_pos_um.get("Y")
-                if tx is not None and ty is not None:
-                    self.sig_log.emit(f"Moving stage to Calibration Sample position ({tx:.2f}, {ty:.2f}) µm...")
-                    pos = self.stage.move_to(x_um=float(tx), y_um=float(ty), wait=True)
-                    self.sig_stage_updated.emit()
-                    time.sleep(0.08)
-            elif self.stage.is_connected:
-                try:
-                    pos = self.stage.get_position()
-                except Exception:
-                    pos = None
-
-            self.camera.set_exposure(self.exposure_ms / 1000.0)
-            self.camera.set_frame_averaging(self.n_avg)
-            self.sig_log.emit(
-                f"Acquiring Calibration Sample spectrum (exp={self.exposure_ms:.1f} ms × {self.n_avg} avg)..."
-            )
-            frame = self.camera.snap_frame(n_frames=self.n_avg, stage_pos_um=pos)
-
-            fit_res = self.session.run_sample_treatment_and_q_calibration(
-                sample_image=frame,
-                bin_val_h=int(self.fit_params.get("bin_val_h", 4)),
-                bin_val_w=int(self.fit_params.get("bin_val_w", 2)),
-                expected_shift_ghz=float(self.fit_params.get("expected_shift_ghz", 5.1)),
-                shift_tol_ghz=float(self.fit_params.get("shift_tol_ghz", 2.0)),
-                expected_lw_ghz=float(self.fit_params.get("expected_lw_ghz", 0.8)),
-                lw_bounds_ghz=tuple(self.fit_params.get("lw_bounds_ghz", (0.4, 1.3))),
-                run_q_calibration=True,
-                refractive_index=float(self.fit_params.get("refractive_index", 1.33)),
-                shift_filter_bounds=tuple(self.fit_params.get("shift_filter_bounds", (4.8, 5.3))),
-                persist_to_ref_group=False,
-            )
-            self.sig_done.emit(frame, fit_res)
+            self.sig_log.emit(f"Moving stage to '{self.label}' ({self.x_um:.2f}, {self.y_um:.2f}) µm...")
+            self.stage.move_to(x_um=self.x_um, y_um=self.y_um, wait=True)
+            self.sig_moved.emit()
         except Exception as exc:
-            self.sig_error.emit("Anisotropy Calibration Sample Error", str(exc))
+            self.sig_error.emit("Stage Move Error", str(exc))
 
 
-class _AnisotropySampleBatchWorker(QtCore.QThread):
-    """Visits every saved sample point sequentially, snaps & fits DHO using the active tilt calibration."""
+class _AnisotropySingleAcquireWorker(QtCore.QThread):
+    """Acquires and fits a single spectrum at the current stage position (for Calibration or Sample Point)."""
 
     sig_log = QtCore.Signal(str)
-    sig_stage_updated = QtCore.Signal()
-    sig_point_done = QtCore.Signal(str, object, object, object)  # (pt_name, frame, fit_dict, pos_um)
-    sig_batch_finished = QtCore.Signal(int)
+    sig_done = QtCore.Signal(str, str, object, object, object)  # (kind, pt_name, frame, fit_dict, pos_um)
     sig_error = QtCore.Signal(str, str)
 
     def __init__(
@@ -117,7 +65,8 @@ class _AnisotropySampleBatchWorker(QtCore.QThread):
         session: AcquisitionSession,
         camera: OrcaFlashCamera,
         stage: MS2000Stage,
-        sample_points: List[Dict[str, Any]],
+        kind: str,  # "calib" or "sample"
+        point_name: str,
         exposure_ms: float,
         n_avg: int,
         fit_params: Dict[str, Any],
@@ -128,61 +77,53 @@ class _AnisotropySampleBatchWorker(QtCore.QThread):
         self.session = session
         self.camera = camera
         self.stage = stage
-        self.sample_points = [dict(p) for p in sample_points]
+        self.kind = kind
+        self.point_name = point_name
         self.exposure_ms = float(exposure_ms)
         self.n_avg = max(1, int(n_avg))
         self.fit_params = dict(fit_params)
         self.q_calib_result = q_calib_result
-        self._stop_requested = False
-
-    def request_stop(self):
-        self._stop_requested = True
 
     def run(self):
-        n_done = 0
         try:
             if not self.camera.is_connected:
                 raise RuntimeError("Spectrometer camera is not connected.")
             if self.session.rb_calib_result is None:
-                raise RuntimeError("Rubidium Frequency Map must be calibrated first.")
+                raise RuntimeError("Rubidium Frequency Map must be calibrated for this configuration first.")
+
+            pos = None
+            if self.stage.is_connected:
+                try:
+                    pos = self.stage.get_position()
+                except Exception:
+                    pos = None
 
             self.camera.set_exposure(self.exposure_ms / 1000.0)
             self.camera.set_frame_averaging(self.n_avg)
+            self.sig_log.emit(
+                f"Acquiring '{self.point_name}' ({self.kind}, exp={self.exposure_ms:.1f} ms × {self.n_avg} avg)..."
+            )
+            frame = self.camera.snap_frame(n_frames=self.n_avg, stage_pos_um=pos)
+
             bin_h = int(self.fit_params.get("bin_val_h", 4))
             bin_w = int(self.fit_params.get("bin_val_w", 2))
-            n_orders = self.session.determine_n_orders(bin_val_h=bin_h, bin_val_w=bin_w)
 
-            points_to_run = self.sample_points if self.sample_points else [{"name": "Point_01", "X": None, "Y": None}]
-
-            for idx, pt in enumerate(points_to_run):
-                if self._stop_requested:
-                    break
-                pt_name = str(pt["name"])
-                pos = None
-                if pt.get("X") is not None and pt.get("Y") is not None and self.stage.is_connected:
-                    tx, ty = float(pt["X"]), float(pt["Y"])
-                    self.sig_log.emit(
-                        f"[{idx + 1}/{len(points_to_run)}] Moving to '{pt_name}' ({tx:.2f}, {ty:.2f}) µm..."
-                    )
-                    pos = self.stage.move_to(x_um=tx, y_um=ty, wait=True)
-                    self.sig_stage_updated.emit()
-                    time.sleep(0.08)
-                elif self.stage.is_connected:
-                    try:
-                        pos = self.stage.get_position()
-                    except Exception:
-                        pos = None
-
-                if self._stop_requested:
-                    break
-
-                self.sig_log.emit(
-                    f"[{idx + 1}/{len(points_to_run)}] Acquiring '{pt_name}' (exp={self.exposure_ms:.1f} ms × {self.n_avg} avg)..."
+            if self.kind == "calib":
+                fit_res = self.session.run_sample_treatment_and_q_calibration(
+                    sample_image=frame,
+                    bin_val_h=bin_h,
+                    bin_val_w=bin_w,
+                    expected_shift_ghz=float(self.fit_params.get("expected_shift_ghz", 5.1)),
+                    shift_tol_ghz=float(self.fit_params.get("shift_tol_ghz", 2.0)),
+                    expected_lw_ghz=float(self.fit_params.get("expected_lw_ghz", 0.8)),
+                    lw_bounds_ghz=tuple(self.fit_params.get("lw_bounds_ghz", (0.4, 1.3))),
+                    run_q_calibration=True,
+                    refractive_index=float(self.fit_params.get("refractive_index", 1.33)),
+                    shift_filter_bounds=tuple(self.fit_params.get("shift_filter_bounds", (4.8, 5.3))),
+                    persist_to_ref_group=False,
                 )
-                frame = self.camera.snap_frame(n_frames=self.n_avg, stage_pos_um=pos)
-                if self._stop_requested:
-                    break
-
+            else:
+                n_orders = self.session.determine_n_orders(bin_val_h=bin_h, bin_val_w=bin_w)
                 fit_res = self.session.treat_single_map_point(
                     frame=frame,
                     bin_val_h=bin_h,
@@ -196,29 +137,29 @@ class _AnisotropySampleBatchWorker(QtCore.QThread):
                     fast_drift_only=bool(self.fit_params.get("fast_drift_only", True)),
                     q_calib_result=self.q_calib_result,
                 )
-                n_done += 1
-                self.sig_point_done.emit(pt_name, frame, fit_res, pos)
 
-            self.sig_batch_finished.emit(n_done)
+            self.sig_done.emit(self.kind, self.point_name, frame, fit_res, pos)
         except Exception as exc:
-            self.sig_error.emit("Anisotropy Sample Batch Error", str(exc))
-            self.sig_batch_finished.emit(n_done)
+            self.sig_error.emit(f"Anisotropy {self.point_name} Error", str(exc))
 
 
 class SinglePointAnisotropyWidget(QtWidgets.QWidget):
     """
     Single Point Anisotropy Tab:
-      - Section 1: HDF5 File (synchronized across tabs)
-      - Section 2: Study Name, Calibration Sample Position, and Sample Points List
-      - Section 3: VIPA Tilt Steps List
-      - Section 4: Active Tilt Step Acquisition (Laser -> Rb -> Calibration Sample -> All Sample Points -> Save & 4-Map View)
+      - HDF5 File & Study Name (synchronized across tabs)
+      - Step 1: Define Spectrometer Configurations (VIPA tilt steps)
+      - Step 2: Acquire & Calibrate Laser + Rb Spectra for Active Configuration
+      - Step 3: Measure Calibration Sample & Sample Points (Add new position, Go to position,
+                Brightfield recentering, Acquire Current Pos -> live 2x2 detector maps)
     """
 
     sig_log = QtCore.Signal(str)
     sig_display_frame = QtCore.Signal(object, object, float, int, int)
     sig_show_laser_diagnostics = QtCore.Signal(object, str)
     sig_show_rb_diagnostics = QtCore.Signal(object, str)
-    sig_show_anisotropy_maps = QtCore.Signal(object, object, object)  # (tilt_steps_list, detector_shape, point_name)
+    sig_show_anisotropy_maps = QtCore.Signal(object, object, object)  # (tilt_steps, det_shape, point_name)
+    sig_set_bf_reference = QtCore.Signal(object, str)
+    sig_open_dual_bf = QtCore.Signal()
     sig_stage_updated = QtCore.Signal()
     sig_camera_updated = QtCore.Signal()
     sig_session_updated = QtCore.Signal()
@@ -229,24 +170,27 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         stage: MS2000Stage,
         session: AcquisitionSession,
         stop_live_callback: Callable[[], None],
+        brightfield_cam: Optional[TeledyneBrightfieldCamera] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.camera = camera
+        self.brightfield_cam = brightfield_cam
         self.stage = stage
         self.session = session
         self._stop_live_cb = stop_live_callback
 
         self._calib_pos_um: Optional[Dict[str, float]] = None
-        self._sample_points: List[Dict[str, Any]] = []
+        self._sample_points: List[Dict[str, Any]] = []  # [{"name", "X", "Y"}]
+        self._point_bf_refs: Dict[str, np.ndarray] = {}  # pt_name -> latest reference BF image
         self._tilt_steps: List[Dict[str, Any]] = []
         self._active_step_idx: int = -1
 
         self._cal_worker: Optional[CalibrationCaptureWorker] = None
         self._laser_calib_worker: Optional[LaserCalibrationWorker] = None
         self._rb_calib_worker: Optional[RbCalibrationWorker] = None
-        self._calib_pt_worker: Optional[_AnisotropyCalibPointWorker] = None
-        self._sample_batch_worker: Optional[_AnisotropySampleBatchWorker] = None
+        self._move_worker: Optional[_StageMoveWorker] = None
+        self._acq_worker: Optional[_AnisotropySingleAcquireWorker] = None
         self._syncing_from_session: bool = False
 
         self._q_smin = 4.8
@@ -287,21 +231,21 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         layout.setSpacing(8)
 
         self.sec_h5 = self._build_h5_card()
-        self.sec_positions = self._build_positions_card()
-        self.sec_tilts = self._build_tilts_card()
-        self.sec_active = self._build_active_tilt_card()
+        self.sec_configs = self._build_configs_card()
+        self.sec_cal_spectra = self._build_cal_spectra_card()
+        self.sec_points = self._build_points_card()
 
         layout.addWidget(self.sec_h5)
-        layout.addWidget(self.sec_positions)
-        layout.addWidget(self.sec_tilts)
-        layout.addWidget(self.sec_active)
+        layout.addWidget(self.sec_configs)
+        layout.addWidget(self.sec_cal_spectra)
+        layout.addWidget(self.sec_points)
         layout.addStretch()
 
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
     def _build_h5_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("1. HDF5 File")
+        box = QtWidgets.QGroupBox("HDF5 File & Study")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(6)
 
@@ -310,80 +254,25 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.btn_open_h5.clicked.connect(self._on_browse_h5)
         layout.addWidget(self.btn_open_h5)
 
+        study_row = QtWidgets.QHBoxLayout()
+        study_row.addWidget(QtWidgets.QLabel("<b>Study Name:</b>"))
+        self.txt_study_name = QtWidgets.QLineEdit("Anisotropy_01")
+        study_row.addWidget(self.txt_study_name, stretch=1)
+        layout.addLayout(study_row)
+
         self.lbl_h5_status = QtWidgets.QLabel("No HDF5 file opened yet. Click 'Choose a HDF5 file' to begin.")
         self.lbl_h5_status.setStyleSheet("font-size: 11px; color: #b0bec5;")
         layout.addWidget(self.lbl_h5_status)
         return box
 
-    def _build_positions_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("2. Study & Saved Stage Positions")
-        layout = QtWidgets.QVBoxLayout(box)
-        layout.setSpacing(6)
-
-        name_row = QtWidgets.QHBoxLayout()
-        name_row.addWidget(QtWidgets.QLabel("<b>Study Name:</b>"))
-        self.txt_study_name = QtWidgets.QLineEdit("Anisotropy_01")
-        name_row.addWidget(self.txt_study_name, stretch=1)
-        layout.addLayout(name_row)
-
-        # Calibration sample position
-        cal_row = QtWidgets.QHBoxLayout()
-        cal_row.addWidget(QtWidgets.QLabel("Calibration Sample Pos:"))
-        self.lbl_calib_pos = QtWidgets.QLabel("Not set")
-        self.lbl_calib_pos.setStyleSheet("font-family: monospace; color: #cfd8dc;")
-        cal_row.addWidget(self.lbl_calib_pos, stretch=1)
-
-        self.btn_set_calib_pos = QtWidgets.QPushButton("Set Current")
-        self.btn_set_calib_pos.clicked.connect(self._on_set_calib_position)
-        cal_row.addWidget(self.btn_set_calib_pos)
-
-        self.btn_goto_calib_pos = QtWidgets.QPushButton("Go To")
-        self.btn_goto_calib_pos.clicked.connect(self._on_goto_calib_position)
-        cal_row.addWidget(self.btn_goto_calib_pos)
-        layout.addLayout(cal_row)
-
-        # Sample points list
-        layout.addWidget(self._make_divider("Saved Sample Points (measured at every VIPA tilt)"))
-
-        pt_ctrl = QtWidgets.QHBoxLayout()
-        pt_ctrl.addWidget(QtWidgets.QLabel("Point Name:"))
-        self.txt_pt_name = QtWidgets.QLineEdit("Point_01")
-        self.txt_pt_name.setMaximumWidth(120)
-        pt_ctrl.addWidget(self.txt_pt_name)
-
-        self.btn_add_sample_pt = QtWidgets.QPushButton("+ Add Current Pos")
-        self.btn_add_sample_pt.setStyleSheet("font-weight: bold;")
-        self.btn_add_sample_pt.clicked.connect(self._on_add_sample_point)
-        pt_ctrl.addWidget(self.btn_add_sample_pt)
-
-        self.btn_goto_sample_pt = QtWidgets.QPushButton("Go To Selected")
-        self.btn_goto_sample_pt.clicked.connect(self._on_goto_selected_sample_point)
-        pt_ctrl.addWidget(self.btn_goto_sample_pt)
-
-        self.btn_rm_sample_pt = QtWidgets.QPushButton("Remove")
-        self.btn_rm_sample_pt.clicked.connect(self._on_remove_sample_point)
-        pt_ctrl.addWidget(self.btn_rm_sample_pt)
-        pt_ctrl.addStretch()
-        layout.addLayout(pt_ctrl)
-
-        self.tbl_sample_pts = QtWidgets.QTableWidget(0, 3)
-        self.tbl_sample_pts.setHorizontalHeaderLabels(["Point Name", "X (µm)", "Y (µm)"])
-        self.tbl_sample_pts.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        self.tbl_sample_pts.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.tbl_sample_pts.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.tbl_sample_pts.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.tbl_sample_pts.setMaximumHeight(110)
-        layout.addWidget(self.tbl_sample_pts)
-        return box
-
-    def _build_tilts_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("3. VIPA Tilt Angles")
+    def _build_configs_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("1. Spectrometer Configurations (VIPA Tilt)")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(6)
 
         add_row = QtWidgets.QHBoxLayout()
-        add_row.addWidget(QtWidgets.QLabel("Label:"))
-        self.txt_tilt_label = QtWidgets.QLineEdit("Tilt_01")
+        add_row.addWidget(QtWidgets.QLabel("Config:"))
+        self.txt_tilt_label = QtWidgets.QLineEdit("Config_01")
         self.txt_tilt_label.setMaximumWidth(120)
         add_row.addWidget(self.txt_tilt_label)
 
@@ -395,7 +284,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.spin_tilt_deg.setSuffix(" °")
         add_row.addWidget(self.spin_tilt_deg)
 
-        self.btn_add_tilt = QtWidgets.QPushButton("+ Add Tilt Step")
+        self.btn_add_tilt = QtWidgets.QPushButton("+ New Configuration")
         self.btn_add_tilt.setStyleSheet("font-weight: bold;")
         self.btn_add_tilt.clicked.connect(self._on_add_tilt_step)
         add_row.addWidget(self.btn_add_tilt)
@@ -408,28 +297,25 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
 
         self.tbl_tilts = QtWidgets.QTableWidget(0, 7)
         self.tbl_tilts.setHorizontalHeaderLabels(
-            ["Tilt Label", "Angle (°)", "Laser", "Rb", "Calib", "Samples", "Saved"]
+            ["Configuration", "Tilt (°)", "Laser", "Rb", "Calib", "Points", "Saved"]
         )
         self.tbl_tilts.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         self.tbl_tilts.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.tbl_tilts.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.tbl_tilts.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.tbl_tilts.setMaximumHeight(125)
+        self.tbl_tilts.setMaximumHeight(120)
         self.tbl_tilts.itemSelectionChanged.connect(self._on_tilt_selection_changed)
         layout.addWidget(self.tbl_tilts)
         return box
 
-    def _build_active_tilt_card(self) -> QtWidgets.QGroupBox:
-        box = QtWidgets.QGroupBox("4. Active Tilt Step — Laser → Rb → Calibration Sample → Sample Points")
+    def _build_cal_spectra_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("2. Calibration Spectra (Laser & Rubidium for Active Configuration)")
         layout = QtWidgets.QVBoxLayout(box)
         layout.setSpacing(6)
 
-        self.lbl_active_tilt = QtWidgets.QLabel("Select or add a VIPA tilt step above to begin.")
+        self.lbl_active_tilt = QtWidgets.QLabel("Create or select a spectrometer configuration in Step 1.")
         self.lbl_active_tilt.setStyleSheet("font-weight: bold; color: #ffca28;")
         layout.addWidget(self.lbl_active_tilt)
-
-        # A. Laser & Rb
-        layout.addWidget(self._make_divider("A. Laser & Rubidium Calibration (for this VIPA tilt)"))
 
         las_row = QtWidgets.QHBoxLayout()
         las_row.addWidget(QtWidgets.QLabel("Laser:"))
@@ -484,9 +370,28 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         rb_row.addWidget(self.lbl_step_rb)
         rb_row.addStretch()
         layout.addLayout(rb_row)
+        return box
 
-        # B. Calibration Sample (at Saved Calib Pos)
-        layout.addWidget(self._make_divider("B. Calibration Sample (at Saved Calibration Position)"))
+    def _build_points_card(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("3. Measure Calibration Sample & Sample Points")
+        layout = QtWidgets.QVBoxLayout(box)
+        layout.setSpacing(6)
+
+        # A. Calibration Sample
+        layout.addWidget(self._make_divider("A. Calibration Sample"))
+
+        cal_pos_row = QtWidgets.QHBoxLayout()
+        cal_pos_row.addWidget(QtWidgets.QLabel("Calib Pos:"))
+        self.lbl_calib_pos = QtWidgets.QLabel("Not set")
+        self.lbl_calib_pos.setStyleSheet("font-family: monospace; color: #cfd8dc;")
+        cal_pos_row.addWidget(self.lbl_calib_pos, stretch=1)
+        self.btn_set_calib_pos = QtWidgets.QPushButton("Set Current")
+        self.btn_set_calib_pos.clicked.connect(self._on_set_calib_position)
+        cal_pos_row.addWidget(self.btn_set_calib_pos)
+        self.btn_goto_calib_pos = QtWidgets.QPushButton("Go to position")
+        self.btn_goto_calib_pos.clicked.connect(self._on_goto_calib_position)
+        cal_pos_row.addWidget(self.btn_goto_calib_pos)
+        layout.addLayout(cal_pos_row)
 
         preset_row = QtWidgets.QHBoxLayout()
         preset_row.addWidget(QtWidgets.QLabel("Sample:"))
@@ -517,35 +422,84 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         preset_row.addStretch()
         layout.addLayout(preset_row)
 
-        cal_s_row = QtWidgets.QHBoxLayout()
-        cal_s_row.addWidget(QtWidgets.QLabel("Exp:"))
+        cal_acq_row = QtWidgets.QHBoxLayout()
+        cal_acq_row.addWidget(QtWidgets.QLabel("Exp:"))
         self.spin_calib_exp = QtWidgets.QDoubleSpinBox()
         self.spin_calib_exp.setDecimals(2)
         self.spin_calib_exp.setRange(0.02, 30000.0)
         self.spin_calib_exp.setValue(500.0)
         self.spin_calib_exp.setSuffix(" ms")
-        cal_s_row.addWidget(self.spin_calib_exp)
-        cal_s_row.addWidget(QtWidgets.QLabel("Avg:"))
+        cal_acq_row.addWidget(self.spin_calib_exp)
+        cal_acq_row.addWidget(QtWidgets.QLabel("Avg:"))
         self.spin_calib_avg = QtWidgets.QSpinBox()
         self.spin_calib_avg.setRange(1, 500)
         self.spin_calib_avg.setValue(1)
-        cal_s_row.addWidget(self.spin_calib_avg)
+        cal_acq_row.addWidget(self.spin_calib_avg)
 
-        self.btn_acq_calib_pt = QtWidgets.QPushButton("Go to Calib Pos & Acquire + Fit")
+        self.btn_acq_calib_pt = QtWidgets.QPushButton("Acquire & Fit Calib Sample")
         self.btn_acq_calib_pt.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
         self.btn_acq_calib_pt.clicked.connect(self._on_acquire_calib_point)
-        cal_s_row.addWidget(self.btn_acq_calib_pt)
+        cal_acq_row.addWidget(self.btn_acq_calib_pt)
 
         self.lbl_step_calib = QtWidgets.QLabel("PENDING")
         self.lbl_step_calib.setAlignment(QtCore.Qt.AlignCenter)
         self.lbl_step_calib.setMinimumWidth(90)
-        cal_s_row.addWidget(self.lbl_step_calib)
-        cal_s_row.addStretch()
-        layout.addLayout(cal_s_row)
+        cal_acq_row.addWidget(self.lbl_step_calib)
+        cal_acq_row.addStretch()
+        layout.addLayout(cal_acq_row)
 
-        # C. Measured Sample Points (all saved points sequentially)
-        layout.addWidget(self._make_divider("C. Measured Sample Points (shared calibration for this VIPA tilt)"))
+        # B. Sample Points (Add new position / Go to position / Brightfield recentering / Acquire Current Pos)
+        layout.addWidget(self._make_divider("B. Sample Points"))
 
+        pt_bar = QtWidgets.QHBoxLayout()
+        pt_bar.addWidget(QtWidgets.QLabel("Point Name:"))
+        self.txt_pt_name = QtWidgets.QLineEdit("Point_01")
+        self.txt_pt_name.setMaximumWidth(120)
+        pt_bar.addWidget(self.txt_pt_name)
+
+        self.btn_add_sample_pt = QtWidgets.QPushButton("Add new position")
+        self.btn_add_sample_pt.setStyleSheet("font-weight: bold;")
+        self.btn_add_sample_pt.clicked.connect(self._on_add_sample_point)
+        pt_bar.addWidget(self.btn_add_sample_pt)
+
+        self.btn_goto_sample_pt = QtWidgets.QPushButton("Go to position")
+        self.btn_goto_sample_pt.setEnabled(False)
+        self.btn_goto_sample_pt.clicked.connect(self._on_goto_selected_sample_point)
+        pt_bar.addWidget(self.btn_goto_sample_pt)
+
+        self.btn_rm_sample_pt = QtWidgets.QPushButton("Remove")
+        self.btn_rm_sample_pt.clicked.connect(self._on_remove_sample_point)
+        pt_bar.addWidget(self.btn_rm_sample_pt)
+        pt_bar.addStretch()
+        layout.addLayout(pt_bar)
+
+        self.tbl_sample_pts = QtWidgets.QTableWidget(0, 5)
+        self.tbl_sample_pts.setHorizontalHeaderLabels(
+            ["Point Name", "X (µm)", "Y (µm)", "BF Ref", "Active Config"]
+        )
+        self.tbl_sample_pts.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.tbl_sample_pts.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.tbl_sample_pts.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.tbl_sample_pts.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.tbl_sample_pts.setMaximumHeight(120)
+        self.tbl_sample_pts.itemSelectionChanged.connect(self._on_sample_point_selection_changed)
+        layout.addWidget(self.tbl_sample_pts)
+
+        # Brightfield recentering row
+        bf_row = QtWidgets.QHBoxLayout()
+        bf_row.addWidget(QtWidgets.QLabel("Brightfield:"))
+        self.btn_capture_bf = QtWidgets.QPushButton("📷 Capture Brightfield")
+        self.btn_capture_bf.setStyleSheet("background-color: #0277bd; color: white; font-weight: bold;")
+        self.btn_capture_bf.clicked.connect(self._on_capture_point_brightfield)
+        bf_row.addWidget(self.btn_capture_bf)
+
+        self.btn_load_bf_ref = QtWidgets.QPushButton("👁 Load BF Reference (Recenter)")
+        self.btn_load_bf_ref.clicked.connect(self._on_load_point_bf_reference)
+        bf_row.addWidget(self.btn_load_bf_ref)
+        bf_row.addStretch()
+        layout.addLayout(bf_row)
+
+        # Acquire Current Pos row
         samp_row = QtWidgets.QHBoxLayout()
         samp_row.addWidget(QtWidgets.QLabel("Exp:"))
         self.spin_samp_exp = QtWidgets.QDoubleSpinBox()
@@ -569,15 +523,10 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.spin_samp_shift.setSuffix(" GHz")
         samp_row.addWidget(self.spin_samp_shift)
 
-        self.btn_acq_all_samples = QtWidgets.QPushButton("Acquire & Fit All Saved Sample Points")
-        self.btn_acq_all_samples.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;")
-        self.btn_acq_all_samples.clicked.connect(self._on_acquire_all_sample_points)
-        samp_row.addWidget(self.btn_acq_all_samples)
-
-        self.lbl_step_sample = QtWidgets.QLabel("0 / 0")
-        self.lbl_step_sample.setAlignment(QtCore.Qt.AlignCenter)
-        self.lbl_step_sample.setMinimumWidth(90)
-        samp_row.addWidget(self.lbl_step_sample)
+        self.btn_acq_current_pt = QtWidgets.QPushButton("Acquire Current Pos")
+        self.btn_acq_current_pt.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;")
+        self.btn_acq_current_pt.clicked.connect(self._on_acquire_current_sample_point)
+        samp_row.addWidget(self.btn_acq_current_pt)
         samp_row.addStretch()
         layout.addLayout(samp_row)
 
@@ -585,8 +534,8 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.chk_fast_drift.setChecked(True)
         layout.addWidget(self.chk_fast_drift)
 
-        # D. Save Tilt Step & Combined 4-Map Sensor View with Display Point selector
-        layout.addWidget(self._make_divider("D. Save Tilt Step & Combined 4-Map Sensor View"))
+        # C. Save Configuration & Combined 4-Map View
+        layout.addWidget(self._make_divider("C. Save Configuration & Combined 4-Map View"))
 
         disp_row = QtWidgets.QHBoxLayout()
         disp_row.addWidget(QtWidgets.QLabel("Display Point:"))
@@ -601,7 +550,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         disp_row.addStretch()
         layout.addLayout(disp_row)
 
-        self.btn_save_tilt = QtWidgets.QPushButton("💾 Save Tilt Step to HDF5 & Update 4-Map View")
+        self.btn_save_tilt = QtWidgets.QPushButton("💾 Save Configuration to HDF5")
         self.btn_save_tilt.setMinimumHeight(32)
         self.btn_save_tilt.setStyleSheet("background-color: #1565c0; color: white; font-weight: bold; padding: 4px 10px;")
         self.btn_save_tilt.clicked.connect(self._on_save_tilt_step)
@@ -706,7 +655,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Save Preset Error", str(exc))
 
     # ==========================================================================
-    # Handlers: HDF5, Positions, Sample Points List, Tilt List
+    # Handlers: HDF5 & Step 1 (Configurations)
     # ==========================================================================
 
     def _on_browse_h5(self):
@@ -728,131 +677,8 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             self.sig_log.emit(f"ERROR opening HDF5: {exc}")
             QtWidgets.QMessageBox.critical(self, "HDF5 Error", str(exc))
 
-    def _persist_positions_to_h5(self):
-        if self.session.is_open:
-            try:
-                self.session.save_anisotropy_study_positions(
-                    self.txt_study_name.text().strip() or "Anisotropy_01",
-                    calib_pos_um=self._calib_pos_um,
-                    sample_points=self._sample_points,
-                )
-            except Exception:
-                pass
-
-    def _on_set_calib_position(self):
-        if not self.stage.is_connected:
-            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
-            return
-        pos = self.stage.get_position()
-        if pos.get("X") is None or pos.get("Y") is None:
-            return
-        self._calib_pos_um = {"X": float(pos["X"]), "Y": float(pos["Y"])}
-        self.sig_log.emit(
-            f"Saved Calibration Sample position: X={self._calib_pos_um['X']:.2f} µm, Y={self._calib_pos_um['Y']:.2f} µm."
-        )
-        self._persist_positions_to_h5()
-        self._refresh_ui_states()
-
-    def _on_goto_calib_position(self):
-        if not self.stage.is_connected:
-            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
-            return
-        if self._calib_pos_um is None:
-            QtWidgets.QMessageBox.information(self, "Position Not Set", "Please set the Calibration Sample position first.")
-            return
-        try:
-            self._stop_live_cb()
-            self.stage.move_to(x_um=self._calib_pos_um["X"], y_um=self._calib_pos_um["Y"], wait=True)
-            self.sig_stage_updated.emit()
-            self.sig_log.emit(
-                f"Moved stage to Calibration Sample position ({self._calib_pos_um['X']:.2f}, {self._calib_pos_um['Y']:.2f}) µm."
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Stage Move Error", str(exc))
-
-    def _on_add_sample_point(self):
-        if not self.stage.is_connected:
-            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
-            return
-        pos = self.stage.get_position()
-        if pos.get("X") is None or pos.get("Y") is None:
-            return
-        pt_name = self.txt_pt_name.text().strip() or f"Point_{len(self._sample_points) + 1:02d}"
-        # Replace if same name exists, else append
-        new_pt = {"name": pt_name, "X": float(pos["X"]), "Y": float(pos["Y"])}
-        replaced = False
-        for i, existing in enumerate(self._sample_points):
-            if existing["name"] == pt_name:
-                self._sample_points[i] = new_pt
-                replaced = True
-                break
-        if not replaced:
-            self._sample_points.append(new_pt)
-        self.txt_pt_name.setText(f"Point_{len(self._sample_points) + 1:02d}")
-        self.sig_log.emit(f"Saved Sample Point '{pt_name}' at ({new_pt['X']:.2f}, {new_pt['Y']:.2f}) µm.")
-        self._persist_positions_to_h5()
-        self._rebuild_sample_points_table()
-        self._rebuild_tilt_table()
-        self._refresh_ui_states()
-
-    def _on_goto_selected_sample_point(self):
-        if not self.stage.is_connected:
-            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
-            return
-        rows = self.tbl_sample_pts.selectionModel().selectedRows()
-        if not rows:
-            return
-        idx = rows[0].row()
-        if 0 <= idx < len(self._sample_points):
-            pt = self._sample_points[idx]
-            try:
-                self._stop_live_cb()
-                self.stage.move_to(x_um=pt["X"], y_um=pt["Y"], wait=True)
-                self.sig_stage_updated.emit()
-                self.sig_log.emit(f"Moved stage to Sample Point '{pt['name']}' ({pt['X']:.2f}, {pt['Y']:.2f}) µm.")
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, "Stage Move Error", str(exc))
-
-    def _on_remove_sample_point(self):
-        rows = self.tbl_sample_pts.selectionModel().selectedRows()
-        if not rows:
-            return
-        idx = rows[0].row()
-        if 0 <= idx < len(self._sample_points):
-            self._sample_points.pop(idx)
-            self._persist_positions_to_h5()
-            self._rebuild_sample_points_table()
-            self._rebuild_tilt_table()
-            self._refresh_ui_states()
-
-    def _rebuild_sample_points_table(self):
-        self.tbl_sample_pts.setRowCount(len(self._sample_points))
-        for i, pt in enumerate(self._sample_points):
-            for c, txt in enumerate((pt["name"], f"{pt['X']:.2f}", f"{pt['Y']:.2f}")):
-                item = QtWidgets.QTableWidgetItem(txt)
-                item.setTextAlignment(QtCore.Qt.AlignCenter)
-                self.tbl_sample_pts.setItem(i, c, item)
-        self._sync_display_point_combo()
-
-    def _sync_display_point_combo(self):
-        prev = self.combo_display_point.currentData()
-        names = [p["name"] for p in self._sample_points]
-        for st in self._tilt_steps:
-            for k in st.get("sample_results", {}).keys():
-                if k not in names:
-                    names.append(k)
-        self.combo_display_point.blockSignals(True)
-        self.combo_display_point.clear()
-        for nm in names:
-            self.combo_display_point.addItem(nm, nm)
-        if prev is not None:
-            idx = self.combo_display_point.findData(prev)
-            if idx >= 0:
-                self.combo_display_point.setCurrentIndex(idx)
-        self.combo_display_point.blockSignals(False)
-
     def _on_add_tilt_step(self):
-        label = self.txt_tilt_label.text().strip() or f"Tilt_{len(self._tilt_steps) + 1:02d}"
+        label = self.txt_tilt_label.text().strip() or f"Config_{len(self._tilt_steps) + 1:02d}"
         angle = float(self.spin_tilt_deg.value())
         step = {
             "label": label,
@@ -863,14 +689,15 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             "rb_res": None,
             "calib_img": None,
             "calib_fit": None,
-            "sample_results": {},  # pt_name -> {"img": frame, "fit": fit_res, "pos_um": pos}
+            "sample_results": {},  # pt_name -> {"img", "fit", "pos_um", "bf_img"}
             "saved": False,
         }
         self._tilt_steps.append(step)
         self._active_step_idx = len(self._tilt_steps) - 1
-        self.txt_tilt_label.setText(f"Tilt_{len(self._tilt_steps) + 1:02d}")
+        self.txt_tilt_label.setText(f"Config_{len(self._tilt_steps) + 1:02d}")
         self._rebuild_tilt_table()
         self.tbl_tilts.selectRow(self._active_step_idx)
+        self._rebuild_sample_points_table()
         self._refresh_ui_states()
 
     def _on_remove_tilt_step(self):
@@ -880,11 +707,13 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             self._rebuild_tilt_table()
             if self._active_step_idx >= 0:
                 self.tbl_tilts.selectRow(self._active_step_idx)
+            self._rebuild_sample_points_table()
             self._refresh_ui_states()
 
     def _on_tilt_selection_changed(self):
         rows = self.tbl_tilts.selectionModel().selectedRows()
         self._active_step_idx = rows[0].row() if rows else -1
+        self._rebuild_sample_points_table()
         self._refresh_ui_states()
 
     def _active_step(self) -> Optional[Dict[str, Any]]:
@@ -895,17 +724,17 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
     def _rebuild_tilt_table(self):
         self.tbl_tilts.blockSignals(True)
         self.tbl_tilts.setRowCount(len(self._tilt_steps))
-        n_target = max(1, len(self._sample_points))
+        n_target = len(self._sample_points)
         for i, st in enumerate(self._tilt_steps):
             n_done = len(st.get("sample_results", {}))
-            samp_txt = f"✓ {n_done}/{n_target}" if n_done >= n_target and n_done > 0 else f"{n_done}/{n_target}"
+            pt_txt = f"{n_done}/{n_target}" if n_target > 0 else f"{n_done}"
             vals = [
                 st["label"],
                 f"{st['angle_deg']:.2f}",
                 "✓" if st["laser_res"] is not None else ("img" if st["laser_img"] is not None else "—"),
                 "✓" if st["rb_res"] is not None else ("img" if st["rb_img"] is not None else "—"),
                 "✓" if st["calib_fit"] is not None else "—",
-                samp_txt,
+                pt_txt,
                 "✓" if st["saved"] else "—",
             ]
             for c, txt in enumerate(vals):
@@ -915,7 +744,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self.tbl_tilts.blockSignals(False)
 
     # ==========================================================================
-    # Handlers: Active Tilt Step Sequence
+    # Handlers: Step 2 (Laser & Rb Calibration for Active Configuration)
     # ==========================================================================
 
     def _on_acquire_cal(self, role: str, exp_ms: float, n_avg: int):
@@ -1021,6 +850,230 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         self._emit_session_changed()
         self.sig_show_rb_diagnostics.emit(res, "fsr_fit")
 
+    # ==========================================================================
+    # Handlers: Step 3 (Positions, Brightfield Recentering & Point Acquisition)
+    # ==========================================================================
+
+    def _persist_positions_to_h5(self):
+        if self.session.is_open:
+            try:
+                self.session.save_anisotropy_study_positions(
+                    self.txt_study_name.text().strip() or "Anisotropy_01",
+                    calib_pos_um=self._calib_pos_um,
+                    sample_points=self._sample_points,
+                )
+            except Exception:
+                pass
+
+    def _move_stage_async(self, x_um: float, y_um: float, label: str):
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
+            return
+        if self._is_busy():
+            return
+        self._stop_live_cb()
+        self._set_busy(True)
+        self._move_worker = _StageMoveWorker(self.stage, x_um, y_um, label, parent=self)
+        self._move_worker.sig_log.connect(self.sig_log.emit)
+        self._move_worker.sig_moved.connect(self.sig_stage_updated.emit)
+        self._move_worker.sig_error.connect(self._on_worker_error)
+        self._move_worker.finished.connect(lambda: self._set_busy(False))
+        self._move_worker.start()
+
+    def _on_set_calib_position(self):
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
+            return
+        pos = self.stage.get_position()
+        if pos.get("X") is None or pos.get("Y") is None:
+            return
+        self._calib_pos_um = {"X": float(pos["X"]), "Y": float(pos["Y"])}
+        self.sig_log.emit(
+            f"Saved Calibration Sample position: X={self._calib_pos_um['X']:.2f} µm, Y={self._calib_pos_um['Y']:.2f} µm."
+        )
+        self._persist_positions_to_h5()
+        self._refresh_ui_states()
+
+    def _on_goto_calib_position(self):
+        if self._calib_pos_um is None:
+            QtWidgets.QMessageBox.information(self, "Position Not Set", "Please set the Calibration Sample position first.")
+            return
+        self._move_stage_async(self._calib_pos_um["X"], self._calib_pos_um["Y"], "Calibration Sample")
+
+    def _selected_sample_point(self) -> Optional[Dict[str, Any]]:
+        rows = self.tbl_sample_pts.selectionModel().selectedRows()
+        if not rows:
+            return None
+        idx = rows[0].row()
+        if 0 <= idx < len(self._sample_points):
+            return self._sample_points[idx]
+        return None
+
+    def _on_add_sample_point(self):
+        if not self.stage.is_connected:
+            QtWidgets.QMessageBox.warning(self, "Stage Not Connected", "Please connect the Plate stage first.")
+            return
+        pos = self.stage.get_position()
+        if pos.get("X") is None or pos.get("Y") is None:
+            return
+        pt_name = self.txt_pt_name.text().strip() or f"Point_{len(self._sample_points) + 1:02d}"
+        new_pt = {"name": pt_name, "X": float(pos["X"]), "Y": float(pos["Y"])}
+        sel_row = len(self._sample_points)
+        replaced = False
+        for i, existing in enumerate(self._sample_points):
+            if existing["name"] == pt_name:
+                self._sample_points[i] = new_pt
+                sel_row = i
+                replaced = True
+                break
+        if not replaced:
+            self._sample_points.append(new_pt)
+        self.txt_pt_name.setText(f"Point_{len(self._sample_points) + 1:02d}")
+        self.sig_log.emit(f"Added sample position '{pt_name}' at ({new_pt['X']:.2f}, {new_pt['Y']:.2f}) µm.")
+        self._persist_positions_to_h5()
+        self._rebuild_sample_points_table()
+        self.tbl_sample_pts.selectRow(sel_row)
+        self._rebuild_tilt_table()
+        self._refresh_ui_states()
+
+    def _on_goto_selected_sample_point(self):
+        pt = self._selected_sample_point()
+        if pt is None:
+            return
+        self._move_stage_async(pt["X"], pt["Y"], pt["name"])
+
+    def _on_remove_sample_point(self):
+        rows = self.tbl_sample_pts.selectionModel().selectedRows()
+        if not rows:
+            return
+        idx = rows[0].row()
+        if 0 <= idx < len(self._sample_points):
+            self._sample_points.pop(idx)
+            self._persist_positions_to_h5()
+            self._rebuild_sample_points_table()
+            self._rebuild_tilt_table()
+            self._refresh_ui_states()
+
+    def _on_sample_point_selection_changed(self):
+        self._refresh_ui_states()
+
+    def _rebuild_sample_points_table(self):
+        sel_pt = self._selected_sample_point()
+        sel_name = sel_pt["name"] if sel_pt is not None else None
+        step = self._active_step()
+
+        self.tbl_sample_pts.blockSignals(True)
+        self.tbl_sample_pts.setRowCount(len(self._sample_points))
+        restore_row = -1
+        for i, pt in enumerate(self._sample_points):
+            nm = pt["name"]
+            if nm == sel_name:
+                restore_row = i
+            has_bf = nm in self._point_bf_refs
+            has_fit = (step is not None) and (nm in step.get("sample_results", {}))
+            vals = [nm, f"{pt['X']:.2f}", f"{pt['Y']:.2f}", "✓" if has_bf else "—", "✓" if has_fit else "—"]
+            for c, txt in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(txt)
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.tbl_sample_pts.setItem(i, c, item)
+        if restore_row >= 0:
+            self.tbl_sample_pts.selectRow(restore_row)
+        self.tbl_sample_pts.blockSignals(False)
+        self._sync_display_point_combo()
+
+    def _sync_display_point_combo(self):
+        prev = self.combo_display_point.currentData()
+        names = [p["name"] for p in self._sample_points]
+        for st in self._tilt_steps:
+            for k in st.get("sample_results", {}).keys():
+                if k not in names:
+                    names.append(k)
+        self.combo_display_point.blockSignals(True)
+        self.combo_display_point.clear()
+        for nm in names:
+            self.combo_display_point.addItem(nm, nm)
+        if prev is not None:
+            idx = self.combo_display_point.findData(prev)
+            if idx >= 0:
+                self.combo_display_point.setCurrentIndex(idx)
+        self.combo_display_point.blockSignals(False)
+
+    def _on_capture_point_brightfield(self):
+        if self.brightfield_cam is None or not self.brightfield_cam.is_connected:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Brightfield Camera Not Connected",
+                "Please connect the Teledyne Brightfield camera in the 'Hardware' tab first.",
+            )
+            return
+        pt = self._selected_sample_point()
+        if pt is None:
+            QtWidgets.QMessageBox.information(
+                self, "No Point Selected", "Please add or select a Sample Point in the table first."
+            )
+            return
+        step = self._active_step()
+        try:
+            self._stop_live_cb()
+            pos = self.stage.get_position() if self.stage.is_connected else None
+            n_avg = self.brightfield_cam.get_frame_averaging()
+            frame = self.brightfield_cam.snap_frame(n_frames=n_avg, stage_pos_um=pos)
+            pt_name = pt["name"]
+            self._point_bf_refs[pt_name] = np.array(frame, copy=True)
+
+            # Save into Calibration group of HDF5 as well for cross-session reference
+            if self.session.is_open:
+                cfg_lbl = step["label"] if step is not None else "Config"
+                role = AcquisitionSession.brightfield_role_for_target(f"{cfg_lbl}_{pt_name}")
+                st_bf = self.brightfield_cam.get_status()
+                self.session.save_brightfield_image(
+                    role=role,
+                    image=frame,
+                    exposure_s=float(st_bf.get("exposure_s") or 0.02),
+                    gain_db=float(st_bf.get("gain_db") or 0.0),
+                    n_avg=n_avg,
+                    stage_pos_um=pos,
+                    extra_attrs={"anisotropy_point": pt_name, "anisotropy_config": cfg_lbl},
+                )
+
+            if step is not None and pt_name in step["sample_results"]:
+                step["sample_results"][pt_name]["bf_img"] = np.array(frame, copy=True)
+
+            self.sig_open_dual_bf.emit()
+            self.sig_set_bf_reference.emit(frame, f"BF Reference: {pt_name}")
+            self.sig_log.emit(f"Captured Brightfield image for '{pt_name}'.")
+            self._rebuild_sample_points_table()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Brightfield Capture Error", str(exc))
+
+    def _on_load_point_bf_reference(self):
+        pt = self._selected_sample_point()
+        if pt is not None and pt["name"] in self._point_bf_refs:
+            img = self._point_bf_refs[pt["name"]]
+            self.sig_open_dual_bf.emit()
+            self.sig_set_bf_reference.emit(img, f"BF Reference: {pt['name']}")
+            self.sig_log.emit(f"Loaded Brightfield reference for '{pt['name']}' for manual recentering.")
+            return
+
+        # Fallback: let user choose any Brightfield image stored in the HDF5 Calibration group
+        items = list(self.session.brightfield_images.keys())
+        if not items:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Brightfield Reference",
+                "No Brightfield reference image has been captured for this point or stored in HDF5 yet.",
+            )
+            return
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self, "Load Brightfield Reference", "Select a saved Brightfield image:", items, 0, False
+        )
+        if ok and choice:
+            img = self.session.brightfield_images.get(choice)
+            if img is not None:
+                self.sig_open_dual_bf.emit()
+                self.sig_set_bf_reference.emit(img, f"BF Reference: {choice}")
+                self.sig_log.emit(f"Loaded Brightfield reference '{choice}' for manual recentering.")
+
     def _on_acquire_calib_point(self):
         step = self._active_step()
         if step is None or step["rb_res"] is None or self._is_busy():
@@ -1045,42 +1098,43 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
 
         self._stop_live_cb()
         self._set_busy(True)
-        self._calib_pt_worker = _AnisotropyCalibPointWorker(
+        self._acq_worker = _AnisotropySingleAcquireWorker(
             session=self.session,
             camera=self.camera,
             stage=self.stage,
-            target_pos_um=self._calib_pos_um,
+            kind="calib",
+            point_name="Calibration_sample",
             exposure_ms=self.spin_calib_exp.value(),
             n_avg=self.spin_calib_avg.value(),
             fit_params=fit_params,
             parent=self,
         )
-        self._calib_pt_worker.sig_log.connect(self.sig_log.emit)
-        self._calib_pt_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
-        self._calib_pt_worker.sig_done.connect(self._on_calib_point_done)
-        self._calib_pt_worker.sig_error.connect(self._on_worker_error)
-        self._calib_pt_worker.finished.connect(lambda: self._set_busy(False))
-        self._calib_pt_worker.start()
+        self._acq_worker.sig_log.connect(self.sig_log.emit)
+        self._acq_worker.sig_done.connect(self._on_acquire_done)
+        self._acq_worker.sig_error.connect(self._on_worker_error)
+        self._acq_worker.finished.connect(lambda: self._set_busy(False))
+        self._acq_worker.start()
 
-    @QtCore.Slot(object, object)
-    def _on_calib_point_done(self, frame, fit_res: dict):
-        step = self._active_step()
-        if step is not None:
-            step["calib_img"] = np.array(frame, copy=True)
-            step["calib_fit"] = fit_res
-            step["saved"] = False
-        self.sig_camera_updated.emit()
-        self._rebuild_tilt_table()
-        self._refresh_ui_states()
-        self._on_show_combined_maps()
-
-    def _on_acquire_all_sample_points(self):
+    def _on_acquire_current_sample_point(self):
         step = self._active_step()
         if step is None or step["rb_res"] is None or step["calib_fit"] is None or self._is_busy():
             return
         if not self.camera.is_connected:
             QtWidgets.QMessageBox.warning(self, "Camera Not Connected", "Please connect the Spectrometer camera first.")
             return
+
+        pt = self._selected_sample_point()
+        if pt is None:
+            # Automatically add current stage position as a new point if none selected
+            if self.stage.is_connected:
+                self._on_add_sample_point()
+                pt = self._selected_sample_point()
+            if pt is None:
+                pt_name = self.txt_pt_name.text().strip() or f"Point_{len(self._sample_points) + 1:02d}"
+            else:
+                pt_name = pt["name"]
+        else:
+            pt_name = pt["name"]
 
         self.session.laser_calib_result = step["laser_res"]
         self.session.rb_calib_result = step["rb_res"]
@@ -1098,46 +1152,54 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
 
         self._stop_live_cb()
         self._set_busy(True)
-        self._sample_batch_worker = _AnisotropySampleBatchWorker(
+        self._acq_worker = _AnisotropySingleAcquireWorker(
             session=self.session,
             camera=self.camera,
             stage=self.stage,
-            sample_points=self._sample_points,
+            kind="sample",
+            point_name=pt_name,
             exposure_ms=self.spin_samp_exp.value(),
             n_avg=self.spin_samp_avg.value(),
             fit_params=fit_params,
             q_calib_result=step["calib_fit"],
             parent=self,
         )
-        self._sample_batch_worker.sig_log.connect(self.sig_log.emit)
-        self._sample_batch_worker.sig_stage_updated.connect(self.sig_stage_updated.emit)
-        self._sample_batch_worker.sig_point_done.connect(self._on_sample_point_done)
-        self._sample_batch_worker.sig_batch_finished.connect(self._on_sample_batch_finished)
-        self._sample_batch_worker.sig_error.connect(self._on_worker_error)
-        self._sample_batch_worker.start()
+        self._acq_worker.sig_log.connect(self.sig_log.emit)
+        self._acq_worker.sig_done.connect(self._on_acquire_done)
+        self._acq_worker.sig_error.connect(self._on_worker_error)
+        self._acq_worker.finished.connect(lambda: self._set_busy(False))
+        self._acq_worker.start()
 
-    @QtCore.Slot(str, object, object, object)
-    def _on_sample_point_done(self, pt_name: str, frame, fit_res: dict, pos):
+    @QtCore.Slot(str, str, object, object, object)
+    def _on_acquire_done(self, kind: str, pt_name: str, frame, fit_res: dict, pos):
         step = self._active_step()
         if step is not None:
-            step["sample_results"][pt_name] = {
-                "img": np.array(frame, copy=True),
-                "fit": fit_res,
-                "pos_um": pos,
-            }
+            if kind == "calib":
+                step["calib_img"] = np.array(frame, copy=True)
+                step["calib_fit"] = fit_res
+            else:
+                step["sample_results"][pt_name] = {
+                    "img": np.array(frame, copy=True),
+                    "fit": fit_res,
+                    "pos_um": pos,
+                    "bf_img": self._point_bf_refs.get(pt_name),
+                }
             step["saved"] = False
-        self._sync_display_point_combo()
-        self._rebuild_tilt_table()
-        self._refresh_ui_states()
 
-    @QtCore.Slot(int)
-    def _on_sample_batch_finished(self, n_done: int):
-        self._set_busy(False)
         self.sig_camera_updated.emit()
         self._rebuild_tilt_table()
+        self._rebuild_sample_points_table()
+
+        # Select the point just measured in Display Point so the 4-map viewer immediately shows Calib + this point!
+        if kind == "sample":
+            idx = self.combo_display_point.findData(pt_name)
+            if idx >= 0:
+                self.combo_display_point.blockSignals(True)
+                self.combo_display_point.setCurrentIndex(idx)
+                self.combo_display_point.blockSignals(False)
+
         self._refresh_ui_states()
-        if n_done > 0:
-            self._on_show_combined_maps()
+        self._on_show_combined_maps()
 
     def _on_save_tilt_step(self):
         step = self._active_step()
@@ -1151,7 +1213,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         ):
             QtWidgets.QMessageBox.warning(
                 self,
-                "Incomplete Tilt Step",
+                "Incomplete Configuration",
                 "Complete Laser, Rb, Calibration Sample, and at least one Sample Point before saving.",
             )
             return
@@ -1172,7 +1234,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             )
             step["saved"] = True
             self.sig_log.emit(
-                f"Saved VIPA tilt step '{step['label']}' ({len(step['sample_results'])} sample point(s)) -> {path}"
+                f"Saved configuration '{step['label']}' ({len(step['sample_results'])} point(s)) -> {path}"
             )
             self._rebuild_tilt_table()
             self._refresh_ui_states()
@@ -1208,8 +1270,7 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
 
     def _refresh_ui_states(self):
         h5_open = self.session.is_open
-        self.sec_positions.setEnabled(h5_open)
-        self.sec_tilts.setEnabled(h5_open)
+        self.sec_configs.setEnabled(h5_open)
 
         if self._calib_pos_um is not None:
             self.lbl_calib_pos.setText(f"X={self._calib_pos_um['X']:.2f}, Y={self._calib_pos_um['Y']:.2f} µm")
@@ -1217,12 +1278,13 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             self.lbl_calib_pos.setText("Not set")
 
         step = self._active_step()
-        self.sec_active.setEnabled(h5_open and step is not None)
+        self.sec_cal_spectra.setEnabled(h5_open and step is not None)
         if step is None:
-            self.lbl_active_tilt.setText("Select or add a VIPA tilt step above to begin.")
+            self.lbl_active_tilt.setText("Create or select a spectrometer configuration in Step 1.")
+            self.sec_points.setEnabled(False)
             return
 
-        self.lbl_active_tilt.setText(f"Active Tilt Step: {step['label']}  ({step['angle_deg']:.2f} °)")
+        self.lbl_active_tilt.setText(f"Active Configuration: {step['label']}  ({step['angle_deg']:.2f} °)")
 
         def _badge(lbl: QtWidgets.QLabel, ok: bool, ok_txt: str = "✓ DONE", bad_txt: str = "PENDING"):
             lbl.setText(ok_txt if ok else bad_txt)
@@ -1237,20 +1299,26 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
         has_rb_img = step["rb_img"] is not None
         has_rb_cal = step["rb_res"] is not None
         has_calib = step["calib_fit"] is not None
-        n_target = max(1, len(self._sample_points))
-        n_done = len(step.get("sample_results", {}))
-        has_samples = n_done > 0
+        has_samples = bool(step.get("sample_results"))
 
         _badge(self.lbl_step_laser, has_l_cal, "✓ CALIB", "IMG ONLY" if has_l_img else "PENDING")
         _badge(self.lbl_step_rb, has_rb_cal, "✓ CALIB", "IMG ONLY" if has_rb_img else "PENDING")
         _badge(self.lbl_step_calib, has_calib, "✓ FITTED", "PENDING")
-        _badge(self.lbl_step_sample, n_done >= n_target and has_samples, f"✓ {n_done}/{n_target}", f"{n_done}/{n_target}")
+
+        self.sec_points.setEnabled(h5_open and has_rb_cal)
 
         busy = self._is_busy()
+        pt_selected = self._selected_sample_point() is not None
+        bf_conn = self.brightfield_cam is not None and self.brightfield_cam.is_connected
+
         self.btn_cal_laser.setEnabled(has_l_img and not busy)
         self.btn_cal_rb.setEnabled(has_l_cal and has_rb_img and not busy)
+        self.btn_goto_calib_pos.setEnabled(self._calib_pos_um is not None and self.stage.is_connected and not busy)
         self.btn_acq_calib_pt.setEnabled(has_rb_cal and not busy)
-        self.btn_acq_all_samples.setEnabled(has_rb_cal and has_calib and not busy)
+        self.btn_goto_sample_pt.setEnabled(pt_selected and self.stage.is_connected and not busy)
+        self.btn_capture_bf.setEnabled(pt_selected and bf_conn and not busy)
+        self.btn_load_bf_ref.setEnabled(not busy)
+        self.btn_acq_current_pt.setEnabled(has_rb_cal and has_calib and not busy)
         self.btn_save_tilt.setEnabled(has_l_cal and has_rb_cal and has_calib and has_samples and not busy)
         any_fit = any(
             (s["calib_fit"] is not None or bool(s.get("sample_results")))
@@ -1267,8 +1335,8 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             self._cal_worker,
             self._laser_calib_worker,
             self._rb_calib_worker,
-            self._calib_pt_worker,
-            self._sample_batch_worker,
+            self._move_worker,
+            self._acq_worker,
         ):
             if w is not None and w.isRunning():
                 return True
@@ -1282,7 +1350,10 @@ class SinglePointAnisotropyWidget(QtWidgets.QWidget):
             self.btn_acq_rb,
             self.btn_cal_rb,
             self.btn_acq_calib_pt,
-            self.btn_acq_all_samples,
+            self.btn_goto_calib_pos,
+            self.btn_goto_sample_pt,
+            self.btn_capture_bf,
+            self.btn_acq_current_pt,
             self.btn_save_tilt,
         ):
             w.setEnabled(not busy)

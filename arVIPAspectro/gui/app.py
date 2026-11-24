@@ -352,6 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
             stage=self.stage,
             session=self.pipeline_panel.session,
             stop_live_callback=self._stop_live_if_running,
+            brightfield_cam=self.brightfield_cam,
             parent=self,
         )
         self.anisotropy_panel.sig_log.connect(self._append_log_slot)
@@ -365,6 +366,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.anisotropy_panel.sig_show_anisotropy_maps.connect(
             self.image_viewer.show_anisotropy_detector_maps
         )
+        self.anisotropy_panel.sig_set_bf_reference.connect(self._on_set_bf_reference)
+        self.anisotropy_panel.sig_open_dual_bf.connect(self._enter_mapping_dual_brightfield)
         self.anisotropy_panel.sig_stage_updated.connect(self._update_stage_ui)
         self.anisotropy_panel.sig_camera_updated.connect(self._update_camera_ui)
         for peer in (self.pipeline_panel, self.time_evolution_panel, self.time_evolution_fit_panel):

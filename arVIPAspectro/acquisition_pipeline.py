@@ -2186,5 +2186,11 @@ class AcquisitionSession:
                         pt_data["fit"],
                         pt_data.get("pos_um"),
                     )
+                    if pt_data.get("bf_img") is not None:
+                        _write_ds(
+                            g_samples[safe_pt],
+                            "brightfield_image",
+                            np.asarray(pt_data["bf_img"], dtype=np.uint16),
+                        )
                 f.flush()
         return tilt_path
